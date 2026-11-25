@@ -527,7 +527,12 @@ func (h *Host) free() api.Resources {
 	// Jobs still uploading or queued have claimed their share: two submits a few seconds apart
 	// must not both see the same idle runner.
 	used := api.Resources{CPU: st.Allocated.CPU + st.Pending.CPU, Mem: st.Allocated.Mem + st.Pending.Mem}
-	return api.Resources{CPU: st.Capacity.CPU - used.CPU, Mem: min(st.Capacity.Mem-used.Mem, st.MemAvailable-st.MemReserve-st.Pending.Mem)}
+	cpu := st.Capacity.CPU - used.CPU
+	if st.CPUOvercommit > 1 {
+		// As the runner admits: past capacity, up to the overbooking limit while cores are idle.
+		cpu = max(cpu, min(st.Capacity.CPU*st.CPUOvercommit-used.CPU, st.CPUIdle-st.Pending.CPU))
+	}
+	return api.Resources{CPU: cpu, Mem: min(st.Capacity.Mem-used.Mem, st.MemAvailable-st.MemReserve-st.Pending.Mem)}
 }
 
 // PickFor chooses a runner for a job spec: like Pick, plus platform and runtime constraints.

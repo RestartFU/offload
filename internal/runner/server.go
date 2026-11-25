@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -38,6 +39,11 @@ type Server struct {
 	cfg     *Config
 	version string
 	self    string // path to this executable, used as the unit wrapper
+
+	// The last sample's busy cores among those offered to jobs (float64 bits) and its time:
+	// written by the sampler without s.mu, read by admission.
+	poolBusy   atomic.Uint64
+	poolBusyAt atomic.Int64
 
 	mu       sync.Mutex
 	jobs     map[string]*job
@@ -726,6 +732,10 @@ func (s *Server) status() api.Status {
 		st.Images = len(s.imageUse)
 	}
 	st.Allocated = s.allocatedLocked()
+	st.CPUOvercommit = s.cfg.Policy.CPUOvercommit
+	if idle, ok := s.cpuIdleLocked(); ok {
+		st.CPUIdle = max(idle, 0)
+	}
 	for _, j := range s.jobs {
 		switch j.State {
 		case api.StateRunning:
@@ -803,6 +813,24 @@ func (s *Server) heldLocked() api.Resources {
 	return a
 }
 
+// cpuIdleLocked is how many of the runner's cores are really idle now: capacity less what the
+// last sample measured busy (offload's and anything else's), less the guarantees of work that
+// started since, which the sample can't show yet. ok is false without a recent sample.
+func (s *Server) cpuIdleLocked() (float64, bool) {
+	at := s.poolBusyAt.Load()
+	if at == 0 || time.Since(time.Unix(0, at)) > 3*api.MetricsStep {
+		return 0, false
+	}
+	idle := s.cfg.Capacity.CPU - math.Float64frombits(s.poolBusy.Load())
+	since := time.Unix(0, at).Add(-time.Second) // a sample spans the step before it
+	for _, j := range s.jobs {
+		if j.State == api.StateRunning && j.StartedAt != nil && j.StartedAt.After(since) {
+			idle -= j.Resources.CPU
+		}
+	}
+	return idle, true
+}
+
 // fitsLocked reports whether r can start now, or why not.
 // neverFitsLocked says why a request can't run here even on an idle runner ("" if it can).
 func (s *Server) neverFitsLocked(r api.Resources) string {
@@ -820,8 +848,16 @@ func (s *Server) neverFitsLocked(r api.Resources) string {
 
 func (s *Server) fitsLocked(r api.Resources) (bool, string) {
 	a := s.allocatedLocked()
-	if a.CPU+r.CPU > s.cfg.Capacity.CPU+1e-9 {
-		return false, fmt.Sprintf("cpu: %.1f of %.1f allocated", a.CPU, s.cfg.Capacity.CPU)
+	if capCPU := s.cfg.Capacity.CPU; a.CPU+r.CPU > capCPU+1e-9 {
+		// Past capacity, guarantees are overbooked: a guarantee is a share under contention, and
+		// a job usually uses far less than it. It starts only while its share is really idle.
+		limit := capCPU * s.cfg.Policy.CPUOvercommit
+		if a.CPU+r.CPU > limit+1e-9 {
+			return false, fmt.Sprintf("cpu: %.1f of %.1f allocated", a.CPU, limit)
+		}
+		if idle, ok := s.cpuIdleLocked(); !ok || idle+1e-9 < r.CPU {
+			return false, fmt.Sprintf("cpu: %.1f of %.1f allocated and only %.1f cores idle", a.CPU, capCPU, max(idle, 0))
+		}
 	}
 	if a.Mem+r.Mem > s.cfg.memCap {
 		return false, "memory: runner capacity allocated"

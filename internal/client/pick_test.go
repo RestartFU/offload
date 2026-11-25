@@ -33,3 +33,16 @@ func TestPickCountsPendingJobs(t *testing.T) {
 		t.Fatalf("picked %s; want the warm vps", h.Name)
 	}
 }
+
+// An overbooking runner with idle cores can start a job past its guaranteed capacity.
+func TestPickOverbookedIdleRunner(t *testing.T) {
+	vps := testHost("vps", 30, api.Resources{CPU: 16}, api.Resources{})
+	vps.Status.CPUOvercommit, vps.Status.CPUIdle = 2, 25
+	if f := vps.free(); f.CPU < 16 {
+		t.Fatalf("free %.1f; want ≥16 with 25 idle cores", f.CPU)
+	}
+	vps.Status.CPUIdle = 5
+	if f := vps.free(); f.CPU >= 16 {
+		t.Fatalf("free %.1f with only 5 idle cores", f.CPU)
+	}
+}

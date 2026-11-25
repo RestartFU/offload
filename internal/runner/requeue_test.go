@@ -1,9 +1,11 @@
 package runner
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/RestartFU/offload/internal/api"
 )
@@ -35,5 +37,57 @@ func TestStatusCountsPendingJobs(t *testing.T) {
 	st := s.status()
 	if st.Pending.CPU != 18 || st.Pending.Mem != 5<<30 || !st.Requeue {
 		t.Fatalf("pending %+v, requeue %v", st.Pending, st.Requeue)
+	}
+}
+
+// Past capacity, CPU guarantees are overbooked only while the cores are really idle, and never
+// beyond the overcommit limit.
+func TestCPUOvercommit(t *testing.T) {
+	cfg := &Config{memCap: 64 << 30}
+	cfg.Capacity.CPU, cfg.Policy.CPUOvercommit = 30, 2
+	long := time.Now().Add(-time.Hour)
+	run := &job{}
+	run.ID, run.State, run.StartedAt, run.Resources = "j-1", api.StateRunning, &long, api.Resources{CPU: 16}
+	s := &Server{cfg: cfg, jobs: map[string]*job{"j-1": run}}
+	want := api.Resources{CPU: 16, Mem: 1 << 20}
+	setBusy := func(cores float64, at time.Time) {
+		s.poolBusy.Store(math.Float64bits(cores))
+		s.poolBusyAt.Store(at.UnixNano())
+	}
+
+	setBusy(2, time.Now()) // the running job's 16 are mostly unused
+	if ok, why := s.fitsLocked(want); !ok {
+		t.Fatalf("idle cores: refused (%s)", why)
+	}
+	setBusy(20, time.Now())
+	if ok, _ := s.fitsLocked(want); ok {
+		t.Fatal("busy host: admitted past capacity")
+	}
+	setBusy(0, time.Now().Add(-time.Minute))
+	if ok, _ := s.fitsLocked(want); ok {
+		t.Fatal("stale sample: admitted past capacity")
+	}
+	// Work started since the sample counts as busy: it can't show in the sample yet.
+	// (A 2-cpu job would still fit in the 12 cores left.)
+	setBusy(2, time.Now().Add(-2*time.Second))
+	now := time.Now()
+	fresh := &job{}
+	fresh.ID, fresh.State, fresh.StartedAt, fresh.Resources = "j-2", api.StateRunning, &now, api.Resources{CPU: 16}
+	s.jobs["j-2"] = fresh
+	if ok, _ := s.fitsLocked(api.Resources{CPU: 14, Mem: 1 << 20}); ok { // 30 - 2 busy - 16 just started = 12 idle
+		t.Fatal("admitted on cores a just-started job holds")
+	}
+	// Never past capacity × overcommit, however idle.
+	delete(s.jobs, "j-2")
+	run.Resources.CPU = 50
+	setBusy(0, time.Now())
+	if ok, _ := s.fitsLocked(want); ok {
+		t.Fatal("admitted past the overcommit limit")
+	}
+	// Within capacity nothing changes: no sample needed.
+	run.Resources.CPU = 4
+	s.poolBusyAt.Store(0)
+	if ok, why := s.fitsLocked(want); !ok {
+		t.Fatalf("within capacity: refused (%s)", why)
 	}
 }

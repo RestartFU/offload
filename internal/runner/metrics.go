@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -174,14 +175,20 @@ func (s *Server) sample(ctx context.Context) (save bool) {
 	}
 	cur := readProcStat()
 	var cpus []api.CPUUsage
+	var poolBusy float64
 	for id, t := range cur {
 		u := api.CPUUsage{ID: id, Reserved: len(offered) > 0 && !offered[id], Owners: owners[id]}
 		if p, ok := m.prevCPU[id]; ok && t.total > p.total {
 			u.Busy = float64(t.busy-p.busy) / float64(t.total-p.total)
 		}
 		pt.CPUBusy += u.Busy
+		if len(offered) == 0 || offered[id] {
+			poolBusy += u.Busy
+		}
 		cpus = append(cpus, u)
 	}
+	s.poolBusy.Store(math.Float64bits(poolBusy))
+	s.poolBusyAt.Store(now.UnixNano())
 	sort.Slice(cpus, func(a, b int) bool { return cpus[a].ID < cpus[b].ID })
 	m.prevCPU = cur
 

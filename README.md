@@ -16,7 +16,10 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
   that runner; tailnet identity alone only discovers runners.
 - **Discovery.** The client probes online tailnet peers on port 7420 and keeps the ones that answer.
 - **Sliced, not exclusive.** Every job asks for a guaranteed CPU share, a burst ceiling and a
-  hard memory limit. Jobs are packed onto runners and queue when nothing fits. Tools see their
+  hard memory limit. Jobs are packed onto runners and queue when nothing fits. CPU guarantees
+  are overbooked up to 2x a runner's cores (`[policy] cpu_overcommit`) while the cores are
+  really idle, since most jobs use far less than they reserve; memory is never overbooked. A
+  queued job moves to another runner that can start it now. Tools see their
   real core count through cpusets plus `CARGO_BUILD_JOBS`, `GOMAXPROCS`, `MAKEFLAGS` and similar.
 - **Warm by default.** Each repository gets persistent workspace slots on the runner. Only
   changed files are uploaded (content hashes), and ignored build output such as `target/` stays

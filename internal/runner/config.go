@@ -72,6 +72,9 @@ type Config struct {
 		SessionGrace string `toml:"session_grace"`
 		IOWeight     int    `toml:"io_weight"`
 		OOMScoreAdj  int    `toml:"oom_score_adjust"`
+		// CPUOvercommit lets guarantees add up to this many times the CPU capacity, for work
+		// that starts while its share of cores is really idle (default 2; 1 turns it off).
+		CPUOvercommit float64 `toml:"cpu_overcommit"`
 	} `toml:"policy"`
 
 	// Derived values.
@@ -244,6 +247,10 @@ func (c *Config) finish() error {
 	if c.Policy.IOWeight <= 0 {
 		c.Policy.IOWeight = 50
 	}
+	if c.Policy.CPUOvercommit == 0 {
+		c.Policy.CPUOvercommit = 2
+	}
+	c.Policy.CPUOvercommit = max(c.Policy.CPUOvercommit, 1)
 	if c.Policy.OOMScoreAdj == 0 {
 		c.Policy.OOMScoreAdj = 900
 	}

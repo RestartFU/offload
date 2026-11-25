@@ -40,7 +40,13 @@
   the signal, and whether the cgroup's OOM killer fired (`memory.events`), and packs artifacts.
   Because of that, the daemon can die or upgrade while jobs keep running.
 - Admission counts guarantees against capacity and also checks live host `MemAvailable`
-  against a reserve. Smaller jobs may skip ahead in the queue unless the job at the head has
+  against a reserve. Past capacity, CPU guarantees may add up to `cpu_overcommit` (default 2)
+  times it, but such a job starts only while the last 5s sample shows its guarantee's worth of
+  idle cores (less guarantees of work started since that sample). The guarantee stays its
+  `CPUWeight`, so under contention every job still gets its share. Memory is never
+  overbooked. Runners report jobs still uploading or queued (`pending`) so routing counts them,
+  and an attached `offload run` moves a job queued for 10s to a runner that can start it now
+  (`DELETE /v1/jobs/{id}?moved=1` cancels it only while it is still queued). Smaller jobs may skip ahead in the queue unless the job at the head has
   waited more than two minutes.
 
 ## Source sync
