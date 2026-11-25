@@ -2,14 +2,17 @@ package runner
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RestartFU/offload/internal/api"
 )
@@ -124,4 +127,72 @@ func TestEnvPlan(t *testing.T) {
 	if !strings.HasPrefix(v3, "e") {
 		t.Fatalf("standalone variant %s", v3)
 	}
+}
+
+// A job that turns a synced directory into a symlink must not make the next sync delete (or
+// write) files outside the workspace.
+func TestSlotSyncStaysInside(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(dir, "outside")
+	os.MkdirAll(outside, 0o755)
+	os.WriteFile(filepath.Join(outside, "f"), []byte("precious"), 0o644)
+	sl := &slot{Key: "k", Dir: filepath.Join(dir, "ws")}
+	f, fb := entry("d/f", "inside")
+	if err := sl.apply([]api.FileEntry{f}, []string{"d/f"}, tarOf(t, map[string][]byte{"d/f": fb}, []string{"d/f"})); err != nil {
+		t.Fatal(err)
+	}
+	os.RemoveAll(filepath.Join(sl.Dir, "d"))
+	os.Symlink(outside, filepath.Join(sl.Dir, "d")) // what a malicious or careless job could do
+	if err := sl.apply(nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(outside, "f")); err != nil || string(b) != "precious" {
+		t.Fatalf("file outside the workspace was touched: %q %v", b, err)
+	}
+	g, gb := entry("d/g", "new")
+	if err := sl.apply([]api.FileEntry{g}, []string{"d/g"}, tarOf(t, map[string][]byte{"d/g": gb}, []string{"d/g"})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "g")); err == nil {
+		t.Fatal("write went through the symlink")
+	}
+}
+
+// The wrapper deduplicates stdin frames: a retried frame (same seq) is acknowledged, not re-sent.
+func TestSessionFramesDeduplicate(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "in.sock")
+	outFile := filepath.Join(dir, "stdout")
+	done := make(chan int, 1)
+	go func() { done <- RunPipe(dir, sock, "", []string{"cat"}) }()
+	var c net.Conn
+	var err error
+	for i := 0; i < 50; i++ {
+		if c, err = net.Dial("unix", sock); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := bufio.NewReader(c)
+	for _, f := range []struct {
+		seq  int64
+		body string
+	}{{1, "one\n"}, {1, "one\n"}, {2, "two\n"}} {
+		if err := sendFrame(c, r, f.seq, []byte(f.body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, _ := os.ReadFile(outFile); string(b) == "one\ntwo\n" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	b, _ := os.ReadFile(outFile)
+	t.Fatalf("stdout = %q, want each frame once", b)
 }

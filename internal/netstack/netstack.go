@@ -15,9 +15,9 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
+	"github.com/RestartFU/offload/internal/streamio"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -88,7 +88,7 @@ func Start(dial Dialer) error {
 			return
 		}
 		r.Complete(false)
-		splice(gonet.NewTCPConn(&wq, cep), up)
+		go streamio.Splice(gonet.NewTCPConn(&wq, cep), up)
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 
@@ -105,13 +105,6 @@ func Start(dial Dialer) error {
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 	return nil
-}
-
-func splice(a, b io.ReadWriteCloser) {
-	var once sync.Once
-	closeBoth := func() { a.Close(); b.Close() }
-	go func() { io.Copy(a, b); once.Do(closeBoth) }()
-	go func() { io.Copy(b, a); once.Do(closeBoth) }()
 }
 
 // relayUDP carries one UDP flow (one source, one destination) over a framed stream, until it has

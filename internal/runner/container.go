@@ -44,7 +44,8 @@ type envBuild struct {
 	err     error
 	waiters map[string]*job
 	logPath string
-	sent    map[string]int64 // bytes of the log already copied to each waiter
+	read    int64 // bytes of the log already copied to the waiters
+	slot    *slot // the workspace slot a COPY/ADD build reads (leased until the build ends)
 }
 
 func hash12(parts ...string) string {
@@ -104,28 +105,31 @@ func imageExists(tag string) bool {
 // ensureImageLocked returns true when the job's image is ready. Otherwise it starts (or joins) a
 // build in the background and the job stays queued; a failed build fails the job.
 func (s *Server) ensureImageLocked(j *job) bool {
-	if j.contextBuilt {
-		return true
-	}
 	tag, cf, _ := envPlan(j.Spec.Environment)
-	j.Image = tag
 	ctxDir := ""
 	if j.Spec.Environment != nil && usesContext(cf) && j.slot != nil {
 		ctxDir = filepath.Join(j.slot.Dir, filepath.FromSlash(j.Spec.Environment.ContextDir))
+		// The image depends on the workspace content too: only identical contexts share it.
+		tag = imageRepo + "/env:" + hash12(tag, j.ContextDigest)
 	}
+	j.Image = tag
 	if b := s.builds[tag]; b != nil {
 		b.waiters[j.ID] = j
 		return false
 	}
-	if ctxDir == "" && s.readyImages[tag] {
+	if s.readyImages[tag] {
 		return true
 	}
-	if ctxDir == "" && imageExists(tag) && s.bootstrapped(tag) {
+	if imageExists(tag) && s.bootstrapped(tag) {
 		s.readyImages[tag] = true
 		s.touchImage(tag)
 		return true
 	}
-	b := &envBuild{tag: tag, waiters: map[string]*job{j.ID: j}, sent: map[string]int64{}}
+	b := &envBuild{tag: tag, waiters: map[string]*job{j.ID: j}}
+	if ctxDir != "" {
+		b.slot = j.slot
+		b.slot.leases++
+	}
 	s.builds[tag] = b
 	name := "base"
 	if j.Spec.Environment != nil {
@@ -143,31 +147,32 @@ func (s *Server) build(b *envBuild, cf, ctxDir string) {
 	_ = os.MkdirAll(dir, 0o755)
 	b.logPath = filepath.Join(dir, "build.log")
 	_ = os.WriteFile(b.logPath, nil, 0o644)
-	stop := make(chan struct{})
-	go s.pumpBuildLog(b, stop)
+	stop, pumped := make(chan struct{}), make(chan struct{})
+	go func() { s.pumpBuildLog(b, stop); close(pumped) }()
 	var err error
 	if strings.Contains(cf, baseTag()) && b.tag != baseTag() && !imageExists(baseTag()) {
 		err = s.runBuild(baseTag(), baseContainerfile, "", dir, b.logPath)
 	}
-	if err == nil && (ctxDir != "" || !imageExists(b.tag)) {
+	if err == nil && !imageExists(b.tag) {
 		err = s.runBuild(b.tag, cf, ctxDir, dir, b.logPath)
 	}
 	if err == nil && !s.bootstrapped(b.tag) {
 		err = s.runBootstrap(b.tag, b.logPath)
 	}
 	close(stop)
+	<-pumped // the pump owns b.read until it has stopped
+	s.copyBuildLog(b)
 	s.mu.Lock()
-	s.copyBuildLogLocked(b)
 	b.done, b.err = true, err
 	delete(s.builds, b.tag) // a failed build is retried by the next job that needs it
-	if err == nil {
-		s.readyImages[b.tag] = ctxDir == ""
-		s.touchImage(b.tag)
-		if ctxDir != "" {
-			for _, j := range b.waiters {
-				j.contextBuilt = true // built from this job's own context; start it
-			}
+	if b.slot != nil {
+		if b.slot.leases--; b.slot.leases == 0 && b.slot.releaseAfterBuild {
+			s.releaseSlotLocked(b.slot, !s.cfg.persistent)
 		}
+	}
+	if err == nil {
+		s.readyImages[b.tag] = true
+		s.touchImage(b.tag)
 	} else {
 		s.buildErrs[b.tag] = err
 		for _, j := range b.waiters {
@@ -263,8 +268,20 @@ func (s *Server) cacheMounts() []string {
 	return out
 }
 
+// lastLines returns the last n lines of a file, reading at most its final 16 KiB.
 func lastLines(path string, n int) string {
-	b, _ := os.ReadFile(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	b := make([]byte, 16<<10)
+	off := int64(0)
+	if fi, err := f.Stat(); err == nil && fi.Size() > int64(len(b)) {
+		off = fi.Size() - int64(len(b))
+	}
+	k, _ := f.ReadAt(b, off)
+	b = b[:k]
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
@@ -279,30 +296,35 @@ func (s *Server) pumpBuildLog(b *envBuild, stop chan struct{}) {
 			return
 		case <-time.After(500 * time.Millisecond):
 		}
-		s.mu.Lock()
-		s.copyBuildLogLocked(b)
-		s.mu.Unlock()
+		s.copyBuildLog(b)
 	}
 }
 
-// copyBuildLogLocked appends new build output to every waiting job's stderr.
-func (s *Server) copyBuildLogLocked(b *envBuild) {
-	data, err := os.ReadFile(b.logPath)
+// copyBuildLog appends new build output (at most 1 MiB per call, read outside s.mu) to the
+// stderr of every job waiting on the build. Jobs that join mid-build see output from then on.
+func (s *Server) copyBuildLog(b *envBuild) {
+	f, err := os.Open(b.logPath)
 	if err != nil {
 		return
 	}
-	for id, j := range b.waiters {
-		from := b.sent[id]
-		if int64(len(data)) <= from {
-			continue
+	chunk := make([]byte, 1<<20)
+	n, _ := f.ReadAt(chunk, b.read)
+	f.Close()
+	if n == 0 {
+		return
+	}
+	b.read += int64(n)
+	s.mu.Lock()
+	var dirs []string
+	for _, j := range b.waiters {
+		dirs = append(dirs, j.dir)
+	}
+	s.mu.Unlock()
+	for _, d := range dirs {
+		if f, err := os.OpenFile(filepath.Join(d, "stderr.log"), os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+			f.Write(chunk[:n])
+			f.Close()
 		}
-		f, err := os.OpenFile(filepath.Join(j.dir, "stderr.log"), os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			continue
-		}
-		f.Write(data[from:])
-		f.Close()
-		b.sent[id] = int64(len(data))
 	}
 }
 
@@ -319,7 +341,7 @@ func (s *Server) prebuildBase() {
 		s.mu.Unlock()
 		return
 	}
-	b := &envBuild{tag: baseTag(), waiters: map[string]*job{}, sent: map[string]int64{}}
+	b := &envBuild{tag: baseTag(), waiters: map[string]*job{}}
 	s.builds[baseTag()] = b
 	s.mu.Unlock()
 	log.Printf("building base environment %s", baseTag())
@@ -360,7 +382,6 @@ func (s *Server) podmanRun(r runSpec) []string {
 		// (runner inner writes resolv.conf and hosts; podman refuses --dns with --network=none)
 		a = append(a, "--network=none", "--device", "/dev/net/tun", "--cap-add", "NET_ADMIN")
 		if r.Env != nil {
-			r.Env["OFFLOAD_RUNNER_SOCK"] = unixSocketPath()
 			if len(r.DNSSearch) > 0 {
 				r.Env["OFFLOAD_DNS_SEARCH"] = strings.Join(r.DNSSearch, " ")
 			}
@@ -377,8 +398,8 @@ func (s *Server) podmanRun(r runSpec) []string {
 		// container owns, not the host's.
 		a = append(a, "--security-opt", "unmask=ALL", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN", "--cap-add", "NET_ADMIN")
 	}
-	same := append(r.Same, runtimeDir()) // relay sockets, runner socket, secrets
-	for _, p := range same {
+	// Only this workload's own paths: never the runner's main socket or the shared runtime dir.
+	for _, p := range r.Same {
 		if _, err := os.Stat(p); err == nil {
 			a = append(a, "-v", p+":"+p)
 		}
@@ -418,7 +439,7 @@ func (s *Server) podmanRun(r runSpec) []string {
 // containerArgv wraps a job command in podman run.
 func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets string) []string {
 	r := runSpec{Name: "offload-" + j.ID, Image: j.Image, Workdir: workdir, CPUs: j.AllowedCPUs,
-		Secrets: secrets, Mem: j.Resources.Mem, Env: env, Argv: j.Spec.Argv, Same: []string{j.dir}}
+		Secrets: secrets, Mem: j.Resources.Mem, Env: env, Argv: j.Spec.Argv, Same: append([]string{j.dir}, j.mounts...)}
 	if j.slot != nil {
 		r.Same = append(r.Same, j.slot.Dir, s.sharedGit(j.Spec.WorkspaceKey))
 	}
@@ -447,7 +468,7 @@ func (s *Server) sessionImageLocked(def *api.EnvDef) (string, bool, error) {
 		s.readyImages[tag] = true
 		return tag, true, nil
 	}
-	b := &envBuild{tag: tag, waiters: map[string]*job{}, sent: map[string]int64{}}
+	b := &envBuild{tag: tag, waiters: map[string]*job{}}
 	s.builds[tag] = b
 	go s.build(b, cf, "")
 	return tag, false, nil

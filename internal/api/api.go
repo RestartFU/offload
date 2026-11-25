@@ -111,6 +111,9 @@ type Job struct {
 	// Runtime is "container" or "host"; Image is the environment image when containerized.
 	Runtime string `json:"runtime,omitempty"`
 	Image   string `json:"image,omitempty"`
+	// ContextDigest identifies the workspace content a COPY/ADD environment is built from, so
+	// only jobs with identical build contexts share an image.
+	ContextDigest string `json:"context_digest,omitempty"`
 	// MemFrom says where the memory limit came from: "requested", "learned", "profile", "default".
 	MemFrom string `json:"mem_from,omitempty"`
 	// Needed lists the manifest paths the client must upload. Only set in the create response.
@@ -203,6 +206,7 @@ type Session struct {
 	Attached   int        `json:"attached"`
 	Runtime    string     `json:"runtime,omitempty"`
 	Image      string     `json:"image,omitempty"`
+	Network    string     `json:"network,omitempty"` // "client": the attached client must serve dial callbacks
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	ExitCode   *int       `json:"exit_code,omitempty"`
 	Reason     string     `json:"reason,omitempty"`

@@ -30,13 +30,32 @@ func dataLock(name string) *sync.Mutex {
 
 // planData lists manifest paths whose content differs from what was last synced. Unlike a
 // workspace, local changes on the runner don't trigger a re-upload.
-func (sl *slot) planData(manifest []api.FileEntry) ([]string, error) {
+// changed reports manifest-only differences (deletions, symlinks, modes) that need an apply
+// even when no file content has to be uploaded.
+func (sl *slot) planData(manifest []api.FileEntry) (needed []string, changed bool, err error) {
 	rec := sl.load()
-	var needed []string
+	root, err := sl.openTree()
+	if err != nil {
+		return nil, false, err
+	}
+	defer root.Close()
+	seen := map[string]bool{}
 	for _, e := range manifest {
-		p, err := cleanRel(e.Path)
-		if err != nil {
-			return nil, err
+		seen[e.Path] = true
+		old, ok := rec.Files[e.Path]
+		if !ok || old.Link != e.Link || (e.Link == "" && old.Mode != e.Mode) {
+			changed = true
+		}
+	}
+	for p := range rec.Files {
+		if !seen[p] {
+			changed = true
+		}
+	}
+	for _, e := range manifest {
+		p, perr := cleanRel(e.Path)
+		if perr != nil {
+			return nil, false, perr
 		}
 		if e.Link != "" {
 			continue
@@ -46,11 +65,11 @@ func (sl *slot) planData(manifest []api.FileEntry) ([]string, error) {
 			needed = append(needed, p)
 			continue
 		}
-		if _, err := os.Lstat(filepath.Join(sl.Dir, filepath.FromSlash(p))); err != nil {
+		if _, err := root.Lstat(p); err != nil {
 			needed = append(needed, p) // deleted on the runner: restore it
 		}
 	}
-	return needed, nil
+	return needed, changed || len(needed) > 0, nil
 }
 
 func (s *Server) handleDataPlan(w http.ResponseWriter, r *http.Request) {
@@ -64,12 +83,12 @@ func (s *Server) handleDataPlan(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	needed, err := s.dataSlot(name).planData(plan.Manifest)
+	needed, changed, err := s.dataSlot(name).planData(plan.Manifest)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, map[string]any{"needed": needed})
+	writeJSON(w, map[string]any{"needed": needed, "changed": changed})
 }
 
 // handleDataUpload applies a manifest (multipart: "manifest" JSON, then "files" tar.gz).
@@ -105,7 +124,7 @@ func (s *Server) handleDataUpload(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, 400, err.Error())
 				return
 			}
-			if needed, err = sl.planData(plan.Manifest); err != nil {
+			if needed, _, err = sl.planData(plan.Manifest); err != nil {
 				writeErr(w, 400, err.Error())
 				return
 			}

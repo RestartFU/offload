@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -12,7 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
+	"path"
 	"strings"
 	"sync"
 	"syscall"
@@ -441,6 +442,11 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, quiet
 	if err != nil {
 		return err
 	}
+	tree, err := os.OpenRoot(root) // confined: symlinks in the tree can't redirect writes outside it
+	if err != nil {
+		return err
+	}
+	defer tree.Close()
 	tr := tar.NewReader(gz)
 	var wrote, skipped []string
 	for {
@@ -455,32 +461,14 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, quiet
 		if !ok || hd.Typeflag != tar.TypeReg {
 			return fmt.Errorf("unexpected write-back entry %q", hd.Name)
 		}
-		local := filepath.Join(root, filepath.FromSlash(c.Path))
-		if !strings.HasPrefix(local, filepath.Clean(root)+string(filepath.Separator)) {
-			return fmt.Errorf("write-back path escapes the tree: %q", c.Path)
+		if err := checkRel(c.Path); err != nil {
+			return err
 		}
-		if cur, err := hashLocal(local); err != nil || cur != c.BaseHash {
+		if cur, err := hashIn(tree, c.Path); err != nil || cur != c.BaseHash {
 			skipped = append(skipped, c.Path)
 			continue
 		}
-		tmp := local + ".offload-tmp"
-		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(c.Mode).Perm())
-		if err != nil {
-			return err
-		}
-		hash := sha256.New()
-		_, err = io.Copy(io.MultiWriter(f, hash), tr)
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-		if err == nil && hex.EncodeToString(hash.Sum(nil)) != c.Hash {
-			err = fmt.Errorf("%s: corrupted in transfer", c.Path)
-		}
-		if err == nil {
-			err = os.Rename(tmp, local)
-		}
-		if err != nil {
-			os.Remove(tmp)
+		if err := writeIn(tree, c.Path, tr, os.FileMode(c.Mode).Perm(), c.Hash); err != nil {
 			return err
 		}
 		wrote = append(wrote, c.Path)
@@ -494,8 +482,24 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, quiet
 	return nil
 }
 
-func hashLocal(p string) (string, error) {
-	f, err := os.Open(p)
+// checkRel accepts only clean, relative, slash-separated paths that stay inside their tree.
+func checkRel(p string) error {
+	if p == "" || p == "." || path.IsAbs(p) || strings.HasPrefix(p, "../") || p == ".." || path.Clean(p) != p || strings.Contains(p, "\x00") {
+		return fmt.Errorf("unsafe path %q", p)
+	}
+	return nil
+}
+
+// hashIn returns the sha256 of a regular file inside root (never following a final symlink).
+func hashIn(root *os.Root, rel string) (string, error) {
+	fi, err := root.Lstat(rel)
+	if err != nil {
+		return "", err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file", rel)
+	}
+	f, err := root.Open(rel)
 	if err != nil {
 		return "", err
 	}
@@ -505,6 +509,36 @@ func hashLocal(p string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// writeIn replaces rel inside root with r's content via an exclusively created temporary file
+// and an atomic rename; wantHash, when set, must match.
+func writeIn(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHash string) error {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	tmp := path.Join(path.Dir(rel), ".offload-"+hex.EncodeToString(b))
+	f, err := root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	h := sha256.New()
+	_, err = io.Copy(io.MultiWriter(f, h), r)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && wantHash != "" && hex.EncodeToString(h.Sum(nil)) != wantHash {
+		err = fmt.Errorf("%s: corrupted in transfer", rel)
+	}
+	if err == nil {
+		err = root.Chmod(tmp, mode)
+	}
+	if err == nil {
+		err = root.Rename(tmp, rel)
+	}
+	if err != nil {
+		_ = root.Remove(tmp)
+	}
+	return err
 }
 
 func firstN(s []string, n int) []string {
@@ -525,6 +559,14 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string) error {
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return err
+	}
+	tree, err := os.OpenRoot(dest) // confined: entries (and symlinks they create) can't escape dest
+	if err != nil {
+		return err
+	}
+	defer tree.Close()
 	tr := tar.NewReader(gz)
 	n := 0
 	for {
@@ -535,33 +577,26 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string) error {
 		if err != nil {
 			return err
 		}
-		name := filepath.Clean(filepath.FromSlash(hd.Name))
-		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+		name := path.Clean(hd.Name)
+		if err := checkRel(name); err != nil {
 			return fmt.Errorf("refusing artifact path %q", hd.Name)
 		}
-		p := filepath.Join(dest, name)
 		switch hd.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(p, 0o755); err != nil {
+			if err := tree.MkdirAll(name, 0o755); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			if err := tree.MkdirAll(path.Dir(name), 0o755); err != nil {
 				return err
 			}
-			f, err := os.OpenFile(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hd.Mode).Perm())
-			if err != nil {
-				return err
-			}
-			_, err = io.Copy(f, tr)
-			f.Close()
-			if err != nil {
+			if err := writeIn(tree, name, tr, os.FileMode(hd.Mode).Perm(), ""); err != nil {
 				return err
 			}
 			n++
 		case tar.TypeSymlink:
-			_ = os.Remove(p)
-			if err := os.Symlink(hd.Linkname, p); err != nil {
+			_ = tree.Remove(name)
+			if err := tree.Symlink(hd.Linkname, name); err != nil {
 				return err
 			}
 		}

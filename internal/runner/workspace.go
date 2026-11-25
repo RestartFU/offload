@@ -3,6 +3,7 @@ package runner
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,7 +12,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -27,6 +27,11 @@ type slot struct {
 	Dir      string `json:"-"`
 	LastUsed time.Time
 	inUse    string // job or session id holding it
+
+	// leases counts environment builds reading this slot as their context. Its job may end
+	// meanwhile; the slot is only released once no build reads it (releaseAfterBuild).
+	leases            int
+	releaseAfterBuild bool
 }
 
 func (s *slot) id() string { return fmt.Sprintf("%s/%d", s.Key, s.Index) }
@@ -99,31 +104,40 @@ func cleanRel(p string) (string, error) {
 	return c, nil
 }
 
-// safePath joins rel under root, replacing any symlink or file found where a parent directory
-// must be, so writes can never escape the workspace through a stale symlink.
-func safePath(root, rel string) (string, error) {
+// openTree opens the slot as an os.Root: every operation below is confined to it, so a symlink a
+// previous job left behind (say, a parent directory pointing at /etc) can never redirect a write,
+// rename or delete outside the workspace.
+func (s *slot) openTree() (*os.Root, error) {
+	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
+		return nil, err
+	}
+	return os.OpenRoot(s.Dir)
+}
+
+// prepareParents makes every parent of rel a real directory, replacing files or symlinks that
+// stand where a directory must be.
+func prepareParents(root *os.Root, rel string) error {
 	parts := strings.Split(rel, "/")
-	cur := root
-	for _, p := range parts[:len(parts)-1] {
-		cur = filepath.Join(cur, p)
-		fi, err := os.Lstat(cur)
+	for i := 1; i < len(parts); i++ {
+		dir := strings.Join(parts[:i], "/")
+		fi, err := root.Lstat(dir)
 		switch {
 		case errors.Is(err, os.ErrNotExist):
-			if err := os.Mkdir(cur, 0o755); err != nil {
-				return "", err
+			if err := root.Mkdir(dir, 0o755); err != nil {
+				return err
 			}
 		case err != nil:
-			return "", err
+			return err
 		case !fi.IsDir():
-			if err := os.RemoveAll(cur); err != nil {
-				return "", err
+			if err := root.RemoveAll(dir); err != nil { // removes a symlink itself, never its target
+				return err
 			}
-			if err := os.Mkdir(cur, 0o755); err != nil {
-				return "", err
+			if err := root.Mkdir(dir, 0o755); err != nil {
+				return err
 			}
 		}
 	}
-	return filepath.Join(cur, parts[len(parts)-1]), nil
+	return nil
 }
 
 // plan compares a client manifest with what the slot holds and returns the paths the client
@@ -131,6 +145,11 @@ func safePath(root, rel string) (string, error) {
 // edited them) are re-requested.
 func (s *slot) plan(manifest []api.FileEntry) ([]string, error) {
 	rec := s.load()
+	root, err := s.openTree()
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
 	var needed []string
 	seen := map[string]bool{}
 	for _, e := range manifest {
@@ -150,7 +169,7 @@ func (s *slot) plan(manifest []api.FileEntry) ([]string, error) {
 			needed = append(needed, p)
 			continue
 		}
-		fi, err := os.Lstat(filepath.Join(s.Dir, filepath.FromSlash(p)))
+		fi, err := root.Lstat(p)
 		if err != nil || !fi.Mode().IsRegular() || fi.Size() != old.Size || fi.ModTime().UnixNano() != old.MTime {
 			needed = append(needed, p)
 		}
@@ -163,13 +182,24 @@ func (s *slot) plan(manifest []api.FileEntry) ([]string, error) {
 // Untracked build output (target/, node_modules/…) is left alone; that's the point of a slot.
 func (s *slot) apply(manifest []api.FileEntry, needed []string, upload io.Reader) error {
 	rec := s.load()
+	root, err := s.openTree()
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 	want := map[string]api.FileEntry{}
 	for _, e := range manifest {
-		want[e.Path] = e
+		p, err := cleanRel(e.Path)
+		if err != nil {
+			return err
+		}
+		want[p] = e
 	}
 	for p := range rec.Files {
 		if _, ok := want[p]; !ok {
-			_ = os.Remove(filepath.Join(s.Dir, filepath.FromSlash(p)))
+			if _, err := cleanRel(p); err == nil {
+				_ = root.Remove(p) // confined: a symlinked parent can't redirect this outside
+			}
 			delete(rec.Files, p)
 		}
 	}
@@ -177,38 +207,38 @@ func (s *slot) apply(manifest []api.FileEntry, needed []string, upload io.Reader
 	for _, p := range needed {
 		pending[p] = true
 	}
-	if err := s.extract(upload, want, pending, rec); err != nil {
+	if err := extract(root, upload, want, pending, rec); err != nil {
 		return err
 	}
-	if len(pending) > 0 {
-		for p := range pending {
-			return fmt.Errorf("upload is missing %q (and %d more)", p, len(pending)-1)
-		}
+	for p := range pending {
+		return fmt.Errorf("upload is missing %q (and %d more)", p, len(pending)-1)
 	}
 	for _, e := range manifest {
-		full, err := safePath(s.Dir, e.Path)
-		if err != nil {
-			return err
+		if err := prepareParents(root, e.Path); err != nil {
+			return fmt.Errorf("%s: %w", e.Path, err)
 		}
 		if e.Link != "" {
-			if cur, err := os.Readlink(full); err != nil || cur != e.Link {
-				_ = os.RemoveAll(full)
-				if err := os.Symlink(e.Link, full); err != nil {
+			if cur, err := root.Readlink(e.Path); err != nil || cur != e.Link {
+				_ = root.RemoveAll(e.Path)
+				if err := root.Symlink(e.Link, e.Path); err != nil {
 					return err
 				}
 			}
 			rec.Files[e.Path] = slotEntry{Link: e.Link}
 			continue
 		}
-		fi, err := os.Lstat(full)
+		fi, err := root.Lstat(e.Path)
 		if err != nil {
 			return fmt.Errorf("%s: %w", e.Path, err)
 		}
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("%s: not a regular file on the runner; sync again with --fresh", e.Path)
+		}
 		if fi.Mode().Perm() != os.FileMode(e.Mode).Perm() {
-			if err := os.Chmod(full, os.FileMode(e.Mode).Perm()); err != nil {
+			if err := root.Chmod(e.Path, os.FileMode(e.Mode).Perm()); err != nil {
 				return err
 			}
-			fi, _ = os.Lstat(full)
+			fi, _ = root.Lstat(e.Path)
 		}
 		ent := rec.Files[e.Path]
 		ent.Hash, ent.Mode, ent.Link = e.Hash, e.Mode, ""
@@ -219,7 +249,9 @@ func (s *slot) apply(manifest []api.FileEntry, needed []string, upload io.Reader
 	return s.save(rec)
 }
 
-func (s *slot) extract(upload io.Reader, want map[string]api.FileEntry, pending map[string]bool, rec slotRecord) error {
+// extract writes the uploaded files (verifying each hash) through the confined root, each via an
+// exclusively created temporary file and an atomic rename.
+func extract(root *os.Root, upload io.Reader, want map[string]api.FileEntry, pending map[string]bool, rec slotRecord) error {
 	if upload == nil || len(pending) == 0 {
 		return nil
 	}
@@ -247,39 +279,51 @@ func (s *slot) extract(upload io.Reader, want map[string]api.FileEntry, pending 
 		if !ok || !pending[p] || h.Typeflag != tar.TypeReg {
 			return fmt.Errorf("upload: unexpected entry %q", h.Name)
 		}
-		full, err := safePath(s.Dir, p)
-		if err != nil {
+		if err := prepareParents(root, p); err != nil {
 			return err
 		}
-		if fi, err := os.Lstat(full); err == nil && !fi.Mode().IsRegular() {
-			if err := os.RemoveAll(full); err != nil {
+		if fi, err := root.Lstat(p); err == nil && !fi.Mode().IsRegular() {
+			if err := root.RemoveAll(p); err != nil {
 				return err
 			}
 		}
-		tmp, err := os.CreateTemp(filepath.Dir(full), ".offload-*")
-		if err != nil {
-			return err
-		}
-		hash := sha256.New()
-		_, err = io.Copy(io.MultiWriter(tmp, hash), tr)
-		cerr := tmp.Close()
-		if err == nil {
-			err = cerr
-		}
-		if err == nil && hex.EncodeToString(hash.Sum(nil)) != e.Hash {
-			err = fmt.Errorf("upload: %s: hash mismatch", p)
-		}
-		if err == nil {
-			err = os.Chmod(tmp.Name(), os.FileMode(e.Mode).Perm())
-		}
-		if err == nil {
-			err = os.Rename(tmp.Name(), full)
-		}
-		if err != nil {
-			_ = os.Remove(tmp.Name())
+		if err := writeConfined(root, p, tr, os.FileMode(e.Mode).Perm(), e.Hash); err != nil {
 			return err
 		}
 		delete(pending, p)
 		rec.Files[p] = slotEntry{Hash: e.Hash, Mode: e.Mode}
 	}
+}
+
+// writeConfined writes r to rel inside root via a fresh temporary file, checking its sha256.
+func writeConfined(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHash string) error {
+	tmp := path.Join(path.Dir(rel), ".offload-"+randomSuffix())
+	f, err := root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	hash := sha256.New()
+	_, err = io.Copy(io.MultiWriter(f, hash), r)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && hex.EncodeToString(hash.Sum(nil)) != wantHash {
+		err = fmt.Errorf("upload: %s: hash mismatch", rel)
+	}
+	if err == nil {
+		err = root.Chmod(tmp, mode)
+	}
+	if err == nil {
+		err = root.Rename(tmp, rel)
+	}
+	if err != nil {
+		_ = root.Remove(tmp)
+	}
+	return err
+}
+
+func randomSuffix() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }

@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -11,9 +12,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/RestartFU/offload/internal/api"
 )
@@ -45,6 +49,7 @@ type relay struct {
 	polling  int
 	lastPoll time.Time
 	agent    net.Listener
+	ctl      net.Listener // the workload's own control socket (see startControl)
 }
 
 func newRelay() *relay {
@@ -82,21 +87,60 @@ func (r *relay) ask(kind string, data []byte, timeout time.Duration) ([]byte, er
 func (r *relay) close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.agent != nil {
-		r.agent.Close()
-		_ = os.Remove(r.agent.Addr().String())
-		r.agent = nil
+	for _, ln := range []*net.Listener{&r.agent, &r.ctl} {
+		if *ln != nil {
+			(*ln).Close()
+			_ = os.Remove((*ln).Addr().String())
+			*ln = nil
+		}
 	}
+}
+
+// startControl gives one job or session its own unix socket that serves only its own credential
+// and dial requests. Containers get this socket mounted, never the runner's main socket (whose
+// callers are fully trusted) or the shared runtime directory (other workloads' sockets and secrets).
+func (s *Server) startControl(rl *relay, kind, id string) (string, error) {
+	path := filepath.Join(workloadDir(id), "ctl")
+	_ = os.MkdirAll(filepath.Dir(path), 0o700)
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return "", err
+	}
+	_ = os.Chmod(path, 0o600)
+	own := func(h http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.PathValue("id") != id {
+				writeErr(w, 403, "this socket only serves "+id)
+				return
+			}
+			h(w, r)
+		}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/"+kind+"/{id}/credential", own(s.handleCredential))
+	mux.HandleFunc("POST /v1/"+kind+"/{id}/dial", own(s.handleDial))
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 30 * time.Second,
+		ConnContext: func(c context.Context, _ net.Conn) context.Context { return context.WithValue(c, unixMarker{}, true) }}
+	go srv.Serve(ln)
+	rl.mu.Lock()
+	rl.ctl = ln
+	rl.mu.Unlock()
+	return path, nil
 }
 
 func runtimeDir() string { return filepath.Dir(unixSocketPath()) }
 
 func secretsDir(id string) string { return filepath.Join(runtimeDir(), "secrets", id) }
 
+// workloadDir holds one job's or session's relay sockets. Containers mount the directory (not
+// the socket files), so sockets re-created after a runner restart are visible inside.
+func workloadDir(id string) string { return filepath.Join(runtimeDir(), "w", id) }
+
 // startAgent serves an SSH agent socket for the job that relays every message to the client.
 // The agent protocol is strict request/response with 4-byte length framing.
 func (r *relay) startAgent(id string) (string, error) {
-	path := filepath.Join(runtimeDir(), id+".agent")
+	path := filepath.Join(workloadDir(id), "agent")
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)
 	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)
@@ -148,7 +192,21 @@ func (r *relay) serveAgent(c net.Conn) {
 
 // setupCredentials prepares relays and secrets for a job about to start and adds their env.
 // It returns the secrets directory to hand to the wrapper ("" if none).
+// For a containerized job it also records in j.mounts the only runtime paths the container may see.
 func (s *Server) setupCredentials(j *job, env map[string]string) string {
+	container := j.Runtime == "container"
+	sock := unixSocketPath()
+	if j.relay != nil && container && (j.Spec.Network == "client" || slices.Contains(j.Spec.Relay, "git")) {
+		ctl, err := s.startControl(j.relay, "jobs", j.ID)
+		if err != nil {
+			s.note(j, "control socket unavailable: "+err.Error())
+		} else {
+			sock = ctl
+		}
+	}
+	if j.Spec.Network == "client" {
+		env["OFFLOAD_RUNNER_SOCK"] = sock
+	}
 	if j.relay != nil {
 		for _, kind := range j.Spec.Relay {
 			switch kind {
@@ -163,13 +221,13 @@ func (s *Server) setupCredentials(j *job, env map[string]string) string {
 					env["GIT_SSH_COMMAND"] = "ssh -o StrictHostKeyChecking=accept-new"
 				}
 			case "git":
-				if !s.listensUnix() {
+				if !container && !s.listensUnix() {
 					s.note(j, "git credential relay needs the runner's unix socket (listen = [..., \"unix\"])")
 					continue
 				}
 				addGitConfig(env, "credential.helper", "") // drop the runner's own helpers
 				addGitConfig(env, "credential.helper", "!'"+s.self+"' runner credential")
-				env["OFFLOAD_RUNNER_SOCK"] = unixSocketPath()
+				env["OFFLOAD_RUNNER_SOCK"] = sock
 			}
 		}
 	}
@@ -179,6 +237,14 @@ func (s *Server) setupCredentials(j *job, env map[string]string) string {
 	dir, err := writeSecrets(j.ID, j.secrets, j.secretFiles)
 	if err != nil {
 		s.note(j, "secrets unavailable: "+err.Error())
+	}
+	if dir != "" {
+		j.mounts = append(j.mounts, dir)
+	}
+	if container {
+		if _, err := os.Stat(workloadDir(j.ID)); err == nil {
+			j.mounts = append(j.mounts, workloadDir(j.ID))
+		}
 	}
 	j.secrets, j.secretFiles = nil, nil // from here on they only exist in the tmpfs directory
 	return dir
@@ -193,6 +259,16 @@ func writeSecrets(id string, vars map[string]string, files map[string][]byte) (s
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
+	if !memoryBacked(dir) {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("%s is not on tmpfs/ramfs; refusing to write secrets to disk (run the runner as a systemd user service so XDG_RUNTIME_DIR is set)", dir)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.RemoveAll(dir) // no partial secrets left behind
+		}
+	}()
 	all := map[string]string{}
 	for k, v := range vars {
 		all[k] = v
@@ -210,7 +286,17 @@ func writeSecrets(id string, vars map[string]string, files map[string][]byte) (s
 	if err := os.WriteFile(filepath.Join(dir, "env.json"), b, 0o600); err != nil {
 		return "", err
 	}
+	ok = true
 	return dir, nil
+}
+
+// memoryBacked reports whether path lives on tmpfs or ramfs (never written to disk).
+func memoryBacked(path string) bool {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return false
+	}
+	return st.Type == unix.TMPFS_MAGIC || st.Type == unix.RAMFS_MAGIC
 }
 
 // addGitConfig appends one GIT_CONFIG_KEY_n/VALUE_n pair (git's env-based config).
@@ -227,6 +313,7 @@ func (s *Server) cleanupCredentials(j *job) {
 	if j.relay != nil {
 		j.relay.close()
 	}
+	_ = os.RemoveAll(workloadDir(j.ID))
 	j.secrets, j.secretFiles = nil, nil
 	_ = os.RemoveAll(secretsDir(j.ID))
 }

@@ -315,6 +315,7 @@ func (s *Server) loop(ctx context.Context) {
 		}
 		s.checkRunning()
 		s.checkSessions()
+		s.reapUploads()
 		s.admit()
 		if time.Since(lastGC) > 10*time.Minute {
 			lastGC = time.Now()
@@ -484,6 +485,32 @@ func newID(prefix string) string {
 	b := make([]byte, 5)
 	_, _ = rand.Read(b)
 	return prefix + hex.EncodeToString(b)
+}
+
+// reply holds a handler's response until s.mu is released, so a client that stops reading can
+// never stall the scheduler while it holds the lock.
+type reply struct {
+	code  int
+	body  any
+	empty bool
+}
+
+func (r *reply) json(v any) { r.code, r.body, r.empty = http.StatusOK, v, false }
+func (r *reply) err(code int, msg string) {
+	r.code, r.body, r.empty = code, api.Error{Error: msg}, false
+}
+func (r *reply) noContent() { r.code, r.empty = http.StatusNoContent, true }
+
+func (r *reply) send(w http.ResponseWriter) {
+	switch {
+	case r.code == 0:
+	case r.empty:
+		w.WriteHeader(r.code)
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(r.code)
+		_ = json.NewEncoder(w).Encode(r.body)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

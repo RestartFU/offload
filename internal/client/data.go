@@ -232,12 +232,13 @@ func SyncData(ctx context.Context, h *Host, name string, cfg DataSetConfig, quie
 		return fmt.Errorf("data set %s: %w", name, err)
 	}
 	var plan struct {
-		Needed []string `json:"needed"`
+		Needed  []string `json:"needed"`
+		Changed bool     `json:"changed"` // deletions, symlinks or modes changed: apply even with no files
 	}
 	if err := h.do(ctx, "POST", "/v1/data/"+name, api.DataPlan{Manifest: manifest}, &plan); err != nil {
 		return fmt.Errorf("data set %s: %w", name, err)
 	}
-	if len(plan.Needed) == 0 {
+	if len(plan.Needed) == 0 && !plan.Changed {
 		return nil
 	}
 	var size int64

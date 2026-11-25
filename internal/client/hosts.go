@@ -27,10 +27,13 @@ import (
 
 // Config is ~/.config/offload/client.toml.
 type Config struct {
-	Discover *bool        `toml:"discover"` // probe tailnet peers for runners (default true)
-	Port     int          `toml:"port"`
-	Local    *bool        `toml:"local"` // use a runner on this machine if one is running (default true)
-	Hosts    []HostConfig `toml:"host"`
+	Discover *bool `toml:"discover"` // probe tailnet peers for runners (default true)
+	// TrustTags are tailnet tags whose devices may receive work. Untagged devices of your own
+	// tailnet user are always trusted; everyone else's never are.
+	TrustTags []string     `toml:"trust_tags"`
+	Port      int          `toml:"port"`
+	Local     *bool        `toml:"local"` // use a runner on this machine if one is running (default true)
+	Hosts     []HostConfig `toml:"host"`
 
 	Credentials CredentialsConfig        `toml:"credentials"`
 	Data        map[string]DataSetConfig `toml:"data"`
@@ -68,6 +71,24 @@ type Host struct {
 	Priority int
 	Status   *api.Status
 	http     *http.Client
+	sock     string // unix socket path for a local runner
+}
+
+// dialRaw opens a plain connection to the runner (for stream upgrades).
+func (h *Host) dialRaw(ctx context.Context) (net.Conn, error) {
+	var d net.Dialer
+	d.Timeout = 10 * time.Second
+	if h.sock != "" {
+		return d.DialContext(ctx, "unix", h.sock)
+	}
+	return d.DialContext(ctx, "tcp", strings.TrimPrefix(h.URL, "http://"))
+}
+
+func (h *Host) hostHeader() string {
+	if h.sock != "" {
+		return "local"
+	}
+	return strings.TrimPrefix(h.URL, "http://")
 }
 
 func configDir() string {
@@ -107,7 +128,7 @@ func localSocket() string {
 func newHost(name, url, token string, prio int) *Host {
 	h := &Host{Name: name, URL: strings.TrimRight(url, "/"), Token: token, Priority: prio}
 	if sock, ok := strings.CutPrefix(url, "unix://"); ok {
-		h.URL = "http://local"
+		h.URL, h.sock = "http://local", sock
 		h.http = &http.Client{Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
@@ -168,7 +189,49 @@ func saveHostCache(hosts []*Host) {
 	_ = os.WriteFile(hostCachePath(), b, 0o600)
 }
 
-// Discover returns every reachable runner with its status, highest priority first.
+// trustedPeers lists online tailnet peers that may receive work: devices of this node's own
+// user, plus tagged devices whose tags are in trust_tags. Another user's device that happens to
+// answer on the runner port never gets source or secrets.
+func trustedPeers(ctx context.Context, cfg *Config) map[string]string {
+	tctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	st, err := tsapi.GetStatus(tctx)
+	cancel()
+	out := map[string]string{} // tailscale IP -> name
+	if err != nil || st.Self == nil {
+		return out
+	}
+	for _, p := range st.Peer {
+		if !p.Online || len(p.TailscaleIPs) == 0 {
+			continue
+		}
+		trusted := len(p.Tags) == 0 && p.UserID == st.Self.UserID
+		for _, t := range p.Tags {
+			for _, want := range cfg.TrustTags {
+				trusted = trusted || t == want
+			}
+		}
+		if !trusted {
+			continue
+		}
+		name := strings.Split(p.DNSName, ".")[0]
+		if name == "" {
+			name = p.HostName
+		}
+		out[p.TailscaleIPs[0]] = name
+	}
+	return out
+}
+
+func hostIP(u string) string {
+	host, _, err := net.SplitHostPort(strings.TrimPrefix(u, "http://"))
+	if err != nil {
+		return ""
+	}
+	return strings.Trim(host, "[]")
+}
+
+// Discover returns every reachable runner with its status, highest priority first. Explicitly
+// configured hosts are always candidates; tailnet runners only when trustedPeers allows them.
 func Discover(ctx context.Context, cfg *Config) []*Host {
 	var fixed []*Host
 	for _, hc := range cfg.Hosts {
@@ -182,11 +245,15 @@ func Discover(ctx context.Context, cfg *Config) []*Host {
 		}
 	}
 	scan := cfg.Discover == nil || *cfg.Discover
+	var trusted map[string]string
 	if scan {
+		trusted = trustedPeers(ctx, cfg)
 		if c := loadHostCache(); c != nil {
 			var cached []*Host
 			for _, ch := range c.Hosts {
-				cached = append(cached, newHost(ch.Name, ch.URL, "", 0))
+				if _, ok := trusted[hostIP(ch.URL)]; ok { // re-checked every time, not just when cached
+					cached = append(cached, newHost(ch.Name, ch.URL, "", 0))
+				}
 			}
 			found := probe(ctx, append(append([]*Host(nil), fixed...), cached...))
 			for _, h := range found {
@@ -197,22 +264,8 @@ func Discover(ctx context.Context, cfg *Config) []*Host {
 		}
 	}
 	cands := append([]*Host(nil), fixed...)
-	if scan {
-		tctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		st, err := tsapi.GetStatus(tctx)
-		cancel()
-		if err == nil {
-			for _, p := range st.Peer {
-				if !p.Online || len(p.TailscaleIPs) == 0 {
-					continue
-				}
-				name := strings.Split(p.DNSName, ".")[0]
-				if name == "" {
-					name = p.HostName
-				}
-				cands = append(cands, newHost(name, fmt.Sprintf("http://%s", net.JoinHostPort(p.TailscaleIPs[0], fmt.Sprint(cfg.Port))), "", 0))
-			}
-		}
+	for ip, name := range trusted {
+		cands = append(cands, newHost(name, fmt.Sprintf("http://%s", net.JoinHostPort(ip, fmt.Sprint(cfg.Port))), "", 0))
 	}
 	found := probe(ctx, cands)
 	if scan {

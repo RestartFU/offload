@@ -1,7 +1,9 @@
 package runner
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -31,9 +33,9 @@ type session struct {
 
 	relay *relay // client networking requests, when the session uses network = "client"
 
-	inMu    sync.Mutex // serializes stdin writes
-	conn    net.Conn
-	lastSeq int64
+	inMu  sync.Mutex // serializes stdin writes
+	conn  net.Conn
+	connR *bufio.Reader
 }
 
 func (se *session) save() {
@@ -56,6 +58,10 @@ func (s *Server) restoreSessions() {
 		se.Attached = 0 // no client connection survives a runner restart
 		if !api.Terminal(se.State) {
 			se.LastSeen = time.Now()
+			if se.Network == "client" {
+				se.relay = newRelay()
+				_, _ = s.startControl(se.relay, "sessions", se.ID)
+			}
 			if c, ok := s.unitCPUs(se.dir); ok {
 				se.cpus = c
 				for _, x := range c {
@@ -77,41 +83,43 @@ func (s *Server) unitCPUs(dir string) ([]int, bool) {
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	var out reply // written after s.mu is released (deferred first, so it runs last)
+	defer out.send(w)
 	var spec api.SessionSpec
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&spec); err != nil {
-		writeErr(w, 400, "bad session spec: "+err.Error())
+		out.err(400, "bad session spec: "+err.Error())
 		return
 	}
 	prof := s.cfg.loadProfiles()[spec.Profile]
 	if spec.Def != nil {
 		// Defined by the client: build a profile from it. Data sets must have been synced.
 		if len(spec.Def.Command) == 0 {
-			writeErr(w, 400, "session definition has no command")
+			out.err(400, "session definition has no command")
 			return
 		}
 		prof = &Profile{Name: spec.Profile, Kind: "session", Command: spec.Def.Command, Env: spec.Def.Env,
 			Devices: spec.Def.Devices, Runtime: "container", NestedSandbox: spec.Def.NestedSandbox, Network: spec.Def.Network}
 		for name, ctr := range spec.Def.Data {
 			if !validKey(name) {
-				writeErr(w, 400, "invalid data set name "+strconv.Quote(name))
+				out.err(400, "invalid data set name "+strconv.Quote(name))
 				return
 			}
 			if _, err := os.Stat(s.dataPath(name)); err != nil {
-				writeErr(w, 400, "data set "+name+" was never synced to this runner")
+				out.err(400, "data set "+name+" was never synced to this runner")
 				return
 			}
 			prof.Volumes = append(prof.Volumes, s.dataPath(name)+":"+ctr)
 		}
 		for name, ctr := range spec.Def.Volumes {
 			if !validKey(name) {
-				writeErr(w, 400, "invalid volume name "+strconv.Quote(name))
+				out.err(400, "invalid volume name "+strconv.Quote(name))
 				return
 			}
 			prof.Volumes = append(prof.Volumes, s.volumePath(name)+":"+ctr)
 		}
 	}
 	if prof == nil || prof.Kind != "session" || len(prof.Command) == 0 {
-		writeErr(w, 400, "no session profile named "+strconv.Quote(spec.Profile))
+		out.err(400, "no session profile named "+strconv.Quote(spec.Profile))
 		return
 	}
 	if spec.Client == "" {
@@ -129,14 +137,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if rt == "container" && !s.containersAvailable() {
-		writeErr(w, 400, "containers are not available on this runner (install podman)")
+		out.err(400, "containers are not available on this runner (install podman)")
 		return
 	}
 	def := spec.Environment
 	if def == nil && prof.Containerfile != "" {
 		b, err := os.ReadFile(filepath.Join(s.cfg.ProfilesDir, prof.Containerfile))
 		if err != nil {
-			writeErr(w, 500, "profile environment: "+err.Error())
+			out.err(500, "profile environment: "+err.Error())
 			return
 		}
 		def = &api.EnvDef{Name: prof.Containerfile, Containerfile: string(b)}
@@ -148,11 +156,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if rt == "container" {
 		tag, ready, err := s.sessionImageLocked(def)
 		if err != nil {
-			writeErr(w, 500, "environment build failed: "+err.Error())
+			out.err(500, "environment build failed: "+err.Error())
 			return
 		}
 		if !ready {
-			writeErr(w, http.StatusConflict, "building environment "+strings.TrimPrefix(tag, imageRepo+"/")+"; retry shortly")
+			out.err(http.StatusConflict, "building environment "+strings.TrimPrefix(tag, imageRepo+"/")+"; retry shortly")
 			return
 		}
 		image = tag
@@ -164,11 +172,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if live >= s.cfg.Policy.MaxSessions {
-		writeErr(w, http.StatusServiceUnavailable, fmt.Sprintf("session limit reached (%d)", live))
+		out.err(http.StatusServiceUnavailable, fmt.Sprintf("session limit reached (%d)", live))
 		return
 	}
 	if ok, why := s.fitsLocked(res); !ok {
-		writeErr(w, http.StatusServiceUnavailable, "no capacity: "+why)
+		out.err(http.StatusServiceUnavailable, "no capacity: "+why)
 		return
 	}
 	now := time.Now()
@@ -178,15 +186,16 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}}
 	if prof.Network == "client" {
 		if rt != "container" {
-			writeErr(w, 400, "network = \"client\" needs the container runtime")
+			out.err(400, "network = \"client\" needs the container runtime")
 			return
 		}
 		se.relay = newRelay()
 		se.relay.lastPoll = now // the client starts polling right after creating the session
+		se.Network = "client"
 	}
 	se.dir = filepath.Join(s.cfg.StateDir, "sessions", se.ID)
 	if err := os.MkdirAll(filepath.Join(se.dir, "tmp"), 0o700); err != nil {
-		writeErr(w, 500, err.Error())
+		out.err(500, err.Error())
 		return
 	}
 	for _, f := range []string{"stdout", "stderr.log"} {
@@ -208,7 +217,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	secrets, err := writeSecrets(se.ID, spec.Secrets, spec.SecretFiles)
 	if err != nil {
 		s.releaseCPUsLocked(se.cpus)
-		writeErr(w, 500, "secrets: "+err.Error())
+		out.err(500, "secrets: "+err.Error())
 		return
 	}
 	command := prof.Command
@@ -233,6 +242,21 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			cenv["TZ"] = s.tz
 		}
 		cenv["TMPDIR"], cenv["OFFLOAD_SESSION"] = env["TMPDIR"], se.ID
+		same := []string{se.dir}
+		if secrets != "" {
+			same = append(same, secrets)
+		}
+		if se.relay != nil {
+			ctl, err := s.startControl(se.relay, "sessions", se.ID)
+			if err != nil {
+				s.releaseCPUsLocked(se.cpus)
+				_ = os.RemoveAll(secretsDir(se.ID))
+				out.err(500, "control socket: "+err.Error())
+				return
+			}
+			cenv["OFFLOAD_RUNNER_SOCK"] = ctl
+			same = append(same, workloadDir(se.ID))
+		}
 		devices := append([]string(nil), prof.Devices...)
 		if def != nil {
 			devices = append(devices, def.Devices...)
@@ -249,7 +273,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		}
 		command = s.podmanRun(runSpec{Name: "offload-" + se.ID, Image: image, Workdir: se.dir, CPUs: allowed,
 			Secrets: secrets, Mem: res.Mem, Env: cenv, Interactive: true, Argv: prof.Command, ClientNet: prof.Network == "client", DNSSearch: dnsSearch,
-			Same: []string{se.dir}, Volumes: volumes, Devices: devices, NestedSandbox: prof.NestedSandbox})
+			Same: same, Volumes: volumes, Devices: devices, NestedSandbox: prof.NestedSandbox})
 		unitEnv = map[string]string{}
 		s.touchImage(image)
 	} else if secrets != "" {
@@ -265,16 +289,23 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if s.features["io"] {
 		u.IOWeight = s.cfg.Policy.IOWeight
 	}
-	if err := startUnit(contextBG(), u); err != nil {
-		s.releaseCPUsLocked(se.cpus)
-		_ = os.RemoveAll(secretsDir(se.ID))
-		_ = os.RemoveAll(se.dir)
-		writeErr(w, 500, err.Error())
-		return
-	}
+	// Recorded before systemd starts the unit, so a runner that dies right after the start still
+	// finds the session on restore (and keeps accounting for and reaping it).
 	s.sessions[se.ID] = se
 	se.save()
-	writeJSON(w, se.Session)
+	if err := startUnit(contextBG(), u); err != nil {
+		delete(s.sessions, se.ID)
+		s.releaseCPUsLocked(se.cpus)
+		if se.relay != nil {
+			se.relay.close()
+		}
+		_ = os.RemoveAll(workloadDir(se.ID))
+		_ = os.RemoveAll(secretsDir(se.ID))
+		_ = os.RemoveAll(se.dir)
+		out.err(500, err.Error())
+		return
+	}
+	out.json(se.Session)
 }
 
 func (s *Server) getSession(w http.ResponseWriter, r *http.Request) *session {
@@ -288,10 +319,12 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) *session {
 }
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
+	var out reply // written after s.mu is released (deferred first, so it runs last)
+	defer out.send(w)
 	if se := s.getSession(w, r); se != nil {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		writeJSON(w, se.Session)
+		out.json(se.Session)
 	}
 }
 
@@ -328,10 +361,9 @@ func (s *Server) handleSessionStdin(w http.ResponseWriter, r *http.Request) {
 	seq, _ := strconv.ParseInt(r.URL.Query().Get("seq"), 10, 64)
 	se.inMu.Lock()
 	defer se.inMu.Unlock()
-	if seq > 0 && seq <= se.lastSeq {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
+	// The wrapper (which outlives runner restarts) deduplicates by seq and acknowledges each
+	// frame once the process has it, so a retry after a lost acknowledgement is never replayed.
+	// Deadlines keep a process that stopped reading from wedging this handler.
 	for attempt := 0; ; attempt++ {
 		if se.conn == nil {
 			se.conn, err = dialRetry(sessionSock(se.ID), 15*time.Second)
@@ -339,22 +371,41 @@ func (s *Server) handleSessionStdin(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, http.StatusBadGateway, "session stdin: "+err.Error())
 				return
 			}
+			se.connR = bufio.NewReader(se.conn)
 		}
-		if _, err = se.conn.Write(body); err == nil {
+		err = sendFrame(se.conn, se.connR, seq, body)
+		if err == nil {
 			break
 		}
 		se.conn.Close()
-		se.conn = nil
-		if attempt > 0 {
-			writeErr(w, http.StatusBadGateway, "session stdin: "+err.Error())
+		se.conn, se.connR = nil, nil
+		if attempt > 0 || errors.Is(err, os.ErrDeadlineExceeded) {
+			writeErr(w, http.StatusGatewayTimeout, "session stdin: "+err.Error())
 			return
 		}
 	}
-	if seq > 0 {
-		se.lastSeq = seq
-	}
 	s.touch(se, 0)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// sendFrame writes "<seq> <len>\n<payload>" to the wrapper and waits for its "ok".
+func sendFrame(c net.Conn, r *bufio.Reader, seq int64, body []byte) error {
+	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
+	defer c.SetDeadline(time.Time{})
+	if _, err := fmt.Fprintf(c, "%d %d\n", seq, len(body)); err != nil {
+		return err
+	}
+	if _, err := c.Write(body); err != nil {
+		return err
+	}
+	ack, err := r.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if ack != "ok\n" {
+		return fmt.Errorf("wrapper: %s", strings.TrimSpace(ack))
+	}
+	return nil
 }
 
 // sessionSock is where a session's wrapper accepts stdin. It lives in the runtime directory
@@ -408,6 +459,8 @@ func (s *Server) streamSession(w http.ResponseWriter, r *http.Request, file stri
 }
 
 func (s *Server) handleStopSession(w http.ResponseWriter, r *http.Request) {
+	var out reply // written after s.mu is released (deferred first, so it runs last)
+	defer out.send(w)
 	se := s.getSession(w, r)
 	if se == nil {
 		return
@@ -418,7 +471,7 @@ func (s *Server) handleStopSession(w http.ResponseWriter, r *http.Request) {
 		se.Reason = "stopped by client"
 		stopUnit(se.Unit)
 	}
-	writeJSON(w, se.Session)
+	out.json(se.Session)
 }
 
 // checkSessions finishes sessions whose process ended and stops ones idle past the grace period.
@@ -433,9 +486,17 @@ func (s *Server) checkSessions() {
 	s.mu.Unlock()
 	for _, se := range live {
 		rec, err := readExit(filepath.Join(se.dir, "exit.json"))
-		active := err != nil && unitActive(se.Unit)
+		active, known := true, true
+		if err != nil {
+			active, known = unitActive(se.Unit)
+		}
 		s.mu.Lock()
+		if active {
+			se.inactive = 0
+		}
 		switch {
+		case err != nil && !known:
+			// systemd didn't answer: no conclusion.
 		case err == nil:
 			code := rec.Code
 			reason := se.Reason
@@ -462,6 +523,10 @@ func (s *Server) finishSessionLocked(se *session, code *int, reason string) {
 	now := time.Now()
 	se.State, se.ExitCode, se.Reason, se.FinishedAt = api.StateExited, code, reason, &now
 	_ = os.RemoveAll(secretsDir(se.ID))
+	if se.relay != nil {
+		se.relay.close()
+	}
+	_ = os.RemoveAll(workloadDir(se.ID))
 	s.releaseCPUsLocked(se.cpus)
 	se.cpus = nil
 	go func() {

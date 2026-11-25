@@ -61,3 +61,42 @@ func TestDataFiles(t *testing.T) {
 		t.Fatal("versionLess")
 	}
 }
+
+func TestCredentialRequest(t *testing.T) {
+	r, err := parseCredentialRequest([]byte("protocol=https\nhost=github.com\ncapability[]=authtype\n\n"))
+	if err != nil || r.Host != "github.com" || string(r.canonical()) != "protocol=https\nhost=github.com\n\n" {
+		t.Fatalf("plain request: %+v %v", r, err)
+	}
+	for _, bad := range []string{
+		"protocol=https\nhost=github.com\nhost=evil.example\n\n",
+		"protocol=https\nhost=github.com\nurl=https://evil.example/\n\n",
+		"host=github.com\n\n",
+	} {
+		if _, err := parseCredentialRequest([]byte(bad)); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}
+
+func TestWriteInRefusesSymlinkEscape(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "tree"), 0o755)
+	os.MkdirAll(filepath.Join(dir, "outside"), 0o755)
+	os.Symlink(filepath.Join(dir, "outside"), filepath.Join(dir, "tree", "link"))
+	root, err := os.OpenRoot(filepath.Join(dir, "tree"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := writeIn(root, "link/pwned", strings.NewReader("x"), 0o644, ""); err == nil {
+		t.Fatal("wrote through a symlink to outside the tree")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "outside", "pwned")); err == nil {
+		t.Fatal("file appeared outside the tree")
+	}
+	for _, bad := range []string{"../x", "/etc/passwd", "a/../../b", ""} {
+		if checkRel(bad) == nil {
+			t.Errorf("checkRel accepted %q", bad)
+		}
+	}
+}

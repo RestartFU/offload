@@ -134,7 +134,7 @@ func MCP(o MCPOptions) error {
 		break
 	}
 	fmt.Fprintf(os.Stderr, "offload: session %s:%s (%s)\n", h.Name, se.ID, profile)
-	if spec.Def != nil && spec.Def.Network == "client" {
+	if se.Network == "client" { // the runner says so, whether the profile is ours or the runner's
 		go serveCallbacks(ctx, h, "/v1/sessions/"+se.ID, cfg, true)
 	}
 	defer func() {

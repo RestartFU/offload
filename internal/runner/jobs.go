@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -33,8 +36,8 @@ type job struct {
 	queuedAt    time.Time
 	inactive    int       // consecutive checks the unit was gone without an exit record
 	checked     time.Time // last time systemd was asked whether the unit is active
+	mounts      []string  // runtime paths (sockets, secrets) this job's container may see
 
-	contextBuilt bool // its environment (which COPYs from the workspace) was built for it
 }
 
 // exitRecord is written by the unit wrapper when the command ends.
@@ -46,6 +49,22 @@ type exitRecord struct {
 	PeakMem   int64          `json:"peak_mem,omitempty"`
 	Artifact  bool           `json:"artifacts,omitempty"`
 	WriteBack *api.WriteBack `json:"write_back,omitempty"`
+}
+
+// manifestDigest identifies a synced tree's content (paths, hashes, modes, links).
+func manifestDigest(m []api.FileEntry) string {
+	h := sha256.New()
+	for _, e := range m {
+		fmt.Fprintf(h, "%s\x00%s\x00%o\x00%s\n", e.Path, e.Hash, e.Mode, e.Link)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// view is the job as returned to clients: without the (possibly huge) source manifest.
+func (j *job) view() api.Job {
+	v := j.Job
+	v.Spec.Manifest = nil
+	return v
 }
 
 func (j *job) save() {
@@ -98,8 +117,16 @@ func (s *Server) restore() {
 				j.save()
 			}
 		case api.StateRunning:
-			if len(j.Spec.Relay) > 0 {
-				j.relay = newRelay() // the SSH agent socket is gone, but git relaying resumes
+			if len(j.Spec.Relay) > 0 || j.Spec.Network == "client" {
+				// Re-create the job's relay sockets in its workload dir (still mounted in its
+				// container), so ssh-agent, git credentials and client networking keep working.
+				j.relay = newRelay()
+				if slices.Contains(j.Spec.Relay, "ssh-agent") {
+					_, _ = j.relay.startAgent(j.ID)
+				}
+				if j.Runtime == "container" && (j.Spec.Network == "client" || slices.Contains(j.Spec.Relay, "git")) {
+					_, _ = s.startControl(j.relay, "jobs", j.ID)
+				}
 			}
 			if j.AllowedCPUs != "" {
 				j.cpus, _ = units.ParseCPUList(j.AllowedCPUs)
@@ -159,18 +186,20 @@ func (s *Server) acquireSlotLocked(key, owner string) (*slot, error) {
 }
 
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
+	var out reply // written after s.mu is released (deferred first, so it runs last)
+	defer out.send(w)
 	var spec api.JobSpec
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<20)).Decode(&spec); err != nil {
-		writeErr(w, 400, "bad job spec: "+err.Error())
+		out.err(400, "bad job spec: "+err.Error())
 		return
 	}
 	if len(spec.Argv) == 0 {
-		writeErr(w, 400, "argv is empty")
+		out.err(400, "argv is empty")
 		return
 	}
 	if spec.Dir != "" {
 		if _, err := cleanRel(spec.Dir); err != nil && spec.Dir != "." {
-			writeErr(w, 400, err.Error())
+			out.err(400, err.Error())
 			return
 		}
 	}
@@ -178,7 +207,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	var prof *Profile
 	if spec.Profile != "" {
 		if prof = profiles[spec.Profile]; prof == nil {
-			writeErr(w, 400, "unknown profile "+spec.Profile)
+			out.err(400, "unknown profile "+spec.Profile)
 			return
 		}
 	} else if prof = matchProfile(profiles, spec.Argv); prof != nil {
@@ -188,22 +217,22 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		spec.Client = r.Header.Get("X-Offload-Caller")
 	}
 	if spec.Platform != "" && spec.Platform != goruntime.GOOS+"/"+goruntime.GOARCH {
-		writeErr(w, 400, "this runner is "+goruntime.GOOS+"/"+goruntime.GOARCH+", not "+spec.Platform)
+		out.err(400, "this runner is "+goruntime.GOOS+"/"+goruntime.GOARCH+", not "+spec.Platform)
 		return
 	}
 	rt := "host"
 	switch {
 	case spec.Runtime == "container" && !s.containersAvailable():
-		writeErr(w, 400, "containers are not available on this runner (install podman)")
+		out.err(400, "containers are not available on this runner (install podman)")
 		return
 	case spec.Runtime == "container", spec.Runtime == "" && s.containersAvailable():
 		rt = "container"
 	case spec.Runtime != "" && spec.Runtime != "host":
-		writeErr(w, 400, "runtime must be host or container")
+		out.err(400, "runtime must be host or container")
 		return
 	}
 	if rt == "host" && spec.Environment != nil {
-		writeErr(w, 400, "this job has a container environment but runs on the host; drop --host or install podman")
+		out.err(400, "this job has a container environment but runs on the host; drop --host or install podman")
 		return
 	}
 	j := &job{Job: api.Job{
@@ -225,7 +254,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(j.Spec.SecretNames)
 	if spec.Network == "client" && rt != "container" {
-		writeErr(w, 400, "--network client needs the container runtime on the runner")
+		out.err(400, "--network client needs the container runtime on the runner")
 		return
 	}
 	if len(spec.Relay) > 0 || spec.Network == "client" {
@@ -247,16 +276,16 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}
 	if j.Resources.Mem > s.cfg.memCap {
-		writeErr(w, 400, fmt.Sprintf("job asks for %s memory; this runner hands out at most %s", units.FormatSize(j.Resources.Mem), units.FormatSize(s.cfg.memCap)))
+		out.err(400, fmt.Sprintf("job asks for %s memory; this runner hands out at most %s", units.FormatSize(j.Resources.Mem), units.FormatSize(s.cfg.memCap)))
 		return
 	}
 	if err := os.MkdirAll(filepath.Join(j.dir, "tmp"), 0o700); err != nil {
-		writeErr(w, 500, err.Error())
+		out.err(500, err.Error())
 		return
 	}
 	for _, f := range []string{"output.log", "stderr.log"} {
 		if err := os.WriteFile(filepath.Join(j.dir, f), nil, 0o600); err != nil {
-			writeErr(w, 500, err.Error())
+			out.err(500, err.Error())
 			return
 		}
 	}
@@ -265,13 +294,13 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	if spec.WorkspaceKey == "" {
 		if err := os.MkdirAll(filepath.Join(j.dir, "work"), 0o755); err != nil {
-			writeErr(w, 500, err.Error())
+			out.err(500, err.Error())
 			return
 		}
 		j.State, j.queuedAt = api.StateQueued, time.Now()
 	} else {
 		if !validKey(spec.WorkspaceKey) {
-			writeErr(w, 400, "invalid workspace key")
+			out.err(400, "invalid workspace key")
 			return
 		}
 		slotKey := spec.WorkspaceKey
@@ -282,13 +311,13 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		sl, err := s.acquireSlotLocked(slotKey, j.ID)
 		if err != nil {
 			_ = os.RemoveAll(j.dir)
-			writeErr(w, http.StatusConflict, err.Error())
+			out.err(http.StatusConflict, err.Error())
 			return
 		}
 		if spec.Fresh {
 			if err := sl.wipe(); err != nil {
 				sl.inUse = ""
-				writeErr(w, 500, err.Error())
+				out.err(500, err.Error())
 				return
 			}
 		}
@@ -296,7 +325,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			sl.inUse = ""
 			_ = os.RemoveAll(j.dir)
-			writeErr(w, 400, err.Error())
+			out.err(400, err.Error())
 			return
 		}
 		j.slot, j.Slot = sl, sl.id()
@@ -305,7 +334,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			if !validGitRef(spec.Git) {
 				sl.inUse = ""
 				_ = os.RemoveAll(j.dir)
-				writeErr(w, 400, "invalid git ref")
+				out.err(400, "invalid git ref")
 				return
 			}
 			var err error
@@ -317,7 +346,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 	s.jobs[j.ID] = j
 	j.save()
-	writeJSON(w, j.Job)
+	out.json(j.view())
 	j.Needed, j.GitHave = nil, nil
 	s.kick()
 }
@@ -345,7 +374,14 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "job is not waiting for git history")
 		return
 	}
-	defer func() { s.mu.Lock(); j.syncing = false; s.mu.Unlock() }()
+	defer func() {
+		s.mu.Lock()
+		j.syncing = false
+		if j.cancel && j.State == api.StateUploading { // cancelled while the bundle was arriving
+			s.finishLocked(j, api.StateCancelled, nil, "cancelled")
+		}
+		s.mu.Unlock()
+	}()
 	tmp, err := os.CreateTemp(j.dir, "bundle-*")
 	if err == nil {
 		_, err = tmp.ReadFrom(http.MaxBytesReader(w, r.Body, 16<<30))
@@ -369,16 +405,18 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	var out reply // written after s.mu is released (deferred first, so it runs last)
+	defer out.send(w)
 	s.mu.Lock()
 	j := s.jobs[r.PathValue("id")]
 	if j == nil {
 		s.mu.Unlock()
-		writeErr(w, 404, "no such job")
+		out.err(404, "no such job")
 		return
 	}
 	if j.State != api.StateUploading || j.slot == nil || j.syncing {
 		s.mu.Unlock()
-		writeErr(w, 409, "job is not waiting for source")
+		out.err(409, "job is not waiting for source")
 		return
 	}
 	j.syncing = true
@@ -406,19 +444,35 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	j.syncing = false
 	if j.cancel {
 		s.finishLocked(j, api.StateCancelled, nil, "cancelled")
-		writeErr(w, 409, "job was cancelled during upload")
+		out.err(409, "job was cancelled during upload")
 		return
 	}
 	if err != nil {
 		s.finishLocked(j, api.StateFailed, nil, "source sync: "+err.Error())
-		writeErr(w, 400, "source sync: "+err.Error())
+		out.err(400, "source sync: "+err.Error())
 		return
 	}
 	j.State, j.queuedAt = api.StateQueued, time.Now()
+	j.ContextDigest = manifestDigest(manifest)
 	j.Spec.Manifest = nil // synced; no need to keep it on disk
 	j.save()
-	writeJSON(w, j.Job)
+	out.json(j.view())
 	s.kick()
+}
+
+// uploadTimeout bounds how long a created job may wait for its source (or git history) upload.
+const uploadTimeout = 10 * time.Minute
+
+// reapUploads fails jobs whose client created them but never finished uploading, so their
+// workspace slot doesn't stay reserved forever.
+func (s *Server) reapUploads() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, j := range s.jobs {
+		if j.State == api.StateUploading && !j.syncing && time.Since(j.CreatedAt) > uploadTimeout {
+			s.finishLocked(j, api.StateFailed, nil, "source upload abandoned")
+		}
+	}
 }
 
 // admit starts queued jobs that fit, oldest first. Small jobs may pass a big one, unless the
@@ -508,6 +562,7 @@ func (s *Server) startJobLocked(j *job) error {
 	dir := s.workDir(j)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		s.releaseCPUsLocked(j.cpus)
+		j.cpus = nil // released exactly once: finishLocked must not release them again
 		return err
 	}
 	j.Unit = "offload-" + j.ID + ".service"
@@ -543,15 +598,18 @@ func (s *Server) startJobLocked(j *job) error {
 	if s.features["io"] {
 		u.IOWeight = s.cfg.Policy.IOWeight
 	}
+	// Record "running" with the unit name before systemd starts it: if the runner dies right after
+	// the start, restore sees a running job and watches its unit instead of starting it again.
+	now := time.Now()
+	j.State, j.StartedAt = api.StateRunning, &now
+	j.save()
 	if err := startUnit(contextBG(), u); err != nil {
 		s.releaseCPUsLocked(j.cpus)
 		s.cleanupCredentials(j)
 		j.cpus, j.AllowedCPUs, j.Unit = nil, "", ""
+		j.State, j.StartedAt = api.StateQueued, nil
 		return err
 	}
-	now := time.Now()
-	j.State, j.StartedAt = api.StateRunning, &now
-	j.save()
 	return nil
 }
 
@@ -579,9 +637,14 @@ func (s *Server) checkRunning() {
 			continue // asking systemd is slower; once a second is plenty for crashed units
 		}
 		j.checked = time.Now()
-		active := err != nil && unitActive(j.Unit)
+		active, known := true, true
+		if err != nil {
+			active, known = unitActive(j.Unit)
+		}
 		s.mu.Lock()
 		switch {
+		case err != nil && !known:
+			// systemd didn't answer: no conclusion, keep the job's resources.
 		case err == nil:
 			state, reason := api.StateExited, rec.Error
 			if rec.OOM {
@@ -630,15 +693,22 @@ func (s *Server) finishLocked(j *job, state string, code *int, reason string) {
 	s.releaseCPUsLocked(j.cpus)
 	j.cpus = nil
 	if j.slot != nil {
-		j.slot.inUse = ""
-		j.slot.LastUsed = now
-		if !s.cfg.persistent || j.Spec.Ephemeral {
-			s.dropSlotLocked(j.slot)
+		if j.slot.leases > 0 {
+			j.slot.releaseAfterBuild = true // a build still reads it; the build releases it
+		} else {
+			s.releaseSlotLocked(j.slot, !s.cfg.persistent || j.Spec.Ephemeral)
 		}
 		j.slot = nil
 	}
 	j.save()
 	s.kick()
+}
+
+func (s *Server) releaseSlotLocked(sl *slot, drop bool) {
+	sl.inUse, sl.LastUsed, sl.releaseAfterBuild = "", time.Now(), false
+	if drop {
+		s.dropSlotLocked(sl)
+	}
 }
 
 func (s *Server) dropSlotLocked(sl *slot) {
@@ -658,11 +728,13 @@ func (s *Server) dropSlotLocked(sl *slot) {
 }
 
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	var out reply // written after s.mu is released (deferred first, so it runs last)
+	defer out.send(w)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	j := s.jobs[r.PathValue("id")]
 	if j == nil {
-		writeErr(w, 404, "no such job")
+		out.err(404, "no such job")
 		return
 	}
 	switch j.State {
@@ -676,18 +748,20 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		j.cancel = true
 		stopUnit(j.Unit)
 	}
-	writeJSON(w, j.Job)
+	out.json(j.view())
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
+	var out reply // written after s.mu is released (deferred first, so it runs last)
+	defer out.send(w)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	j := s.jobs[r.PathValue("id")]
 	if j == nil {
-		writeErr(w, 404, "no such job")
+		out.err(404, "no such job")
 		return
 	}
-	writeJSON(w, j.Job)
+	out.json(j.view())
 }
 
 func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {

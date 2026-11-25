@@ -4,13 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/RestartFU/offload/internal/streamio"
 )
 
 // Client side of network = "client": the runner asks us to dial a destination for the job; we
@@ -93,44 +94,23 @@ func serveDial(ctx context.Context, h *Host, data []byte) string {
 	if req.Proto == "udp" {
 		go relayDatagrams(stream, conn)
 	} else {
-		go spliceConns(stream, conn)
+		go streamio.Splice(stream, conn)
 	}
 	return "ok"
 }
 
-// openStream connects our leg of a dial to the runner (an HTTP upgrade to a raw stream).
-func openStream(ctx context.Context, h *Host, id string) (io.ReadWriteCloser, error) {
-	req, err := newRequest(context.WithoutCancel(ctx), h, "POST", "/v1/streams/"+id, nil)
+// openStream connects our leg of a dial to the runner: an HTTP upgrade on a raw connection, so
+// half-closes can travel through it.
+func openStream(ctx context.Context, h *Host, id string) (net.Conn, error) {
+	c, err := h.dialRaw(ctx)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", "offload-stream")
-	resp, err := h.http.Do(req)
-	if err != nil {
-		return nil, err
+	hdr := http.Header{}
+	if h.Token != "" {
+		hdr.Set("Authorization", "Bearer "+h.Token)
 	}
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		resp.Body.Close()
-		return nil, fmt.Errorf("stream: %s %s", resp.Status, strings.TrimSpace(string(b)))
-	}
-	rwc, ok := resp.Body.(io.ReadWriteCloser)
-	if !ok {
-		resp.Body.Close()
-		return nil, fmt.Errorf("stream: not upgradable")
-	}
-	return rwc, nil
-}
-
-func spliceConns(a io.ReadWriteCloser, b net.Conn) {
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(a, b); done <- struct{}{} }()
-	go func() { io.Copy(b, a); done <- struct{}{} }()
-	<-done
-	a.Close()
-	b.Close()
-	<-done
+	return streamio.Upgrade(c, h.hostHeader(), "/v1/streams/"+id, hdr)
 }
 
 // relayDatagrams carries a UDP flow: frames from the stream (2-byte length + payload) become

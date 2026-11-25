@@ -92,13 +92,20 @@ func systemctl(ctx context.Context, args ...string) (string, error) {
 }
 
 // unitActive reports whether a user unit is still loaded and not finished.
-func unitActive(unit string) bool {
-	out, _ := systemctl(context.Background(), "show", "-p", "ActiveState", "--value", unit)
+// unitActive reports whether a user unit is still running. known is false when systemd could
+// not be asked: callers must not treat that as an exit (it would release a live job's resources).
+func unitActive(unit string) (active, known bool) {
+	out, err := systemctl(context.Background(), "show", "-p", "ActiveState", "--value", unit)
+	if err != nil {
+		return false, false
+	}
 	switch out {
 	case "active", "activating", "deactivating", "reloading":
-		return true
+		return true, true
+	case "inactive", "failed":
+		return false, true // includes units systemd no longer knows (they show as inactive)
 	}
-	return false
+	return false, false
 }
 
 // unitSpec is what we hand to systemd-run.

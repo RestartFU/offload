@@ -4,12 +4,13 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/RestartFU/offload/internal/streamio"
 )
 
 // Client networking: a job or session with network = "client" runs in its own network namespace,
@@ -34,22 +35,36 @@ func (h *streamHub) expect(id string) chan net.Conn {
 	return ch
 }
 
+// forget ends a pairing. A client leg that was delivered but never taken (the dial gave up) is
+// closed here, so no upgraded connection is left behind.
 func (h *streamHub) forget(id string) {
-	h.mu.Lock()
-	delete(h.pending, id)
-	h.mu.Unlock()
-}
-
-func (h *streamHub) deliver(id string, c net.Conn) bool {
 	h.mu.Lock()
 	ch := h.pending[id]
 	delete(h.pending, id)
 	h.mu.Unlock()
 	if ch == nil {
+		return
+	}
+	select {
+	case c := <-ch:
+		c.Close()
+	default:
+	}
+}
+
+func (h *streamHub) deliver(id string, c net.Conn) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ch := h.pending[id]
+	if ch == nil {
 		return false
 	}
-	ch <- c
-	return true
+	select {
+	case ch <- c: // stays registered until the dial takes it or forget closes it
+		return true
+	default:
+		return false
+	}
 }
 
 // upgrade hijacks the request's connection and answers 101, leaving a raw stream.
@@ -69,14 +84,6 @@ func upgrade(w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
 	}
 	return c, rw, rw.Flush()
 }
-
-// bufferedConn reads first from the hijacked buffer (bytes the peer sent right after the request).
-type bufferedConn struct {
-	net.Conn
-	r io.Reader
-}
-
-func (b bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
 
 // dialRequest is what the client receives (callback kind "dial").
 type dialRequest struct {
@@ -119,6 +126,9 @@ func (s *Server) handleDial(w http.ResponseWriter, r *http.Request) {
 	var remote net.Conn
 	select {
 	case remote = <-ch:
+		hub.mu.Lock()
+		delete(hub.pending, req.Stream) // taken: forget has nothing left to close
+		hub.mu.Unlock()
 	case <-time.After(15 * time.Second):
 		writeErr(w, http.StatusGatewayTimeout, "client did not connect the stream")
 		return
@@ -128,7 +138,7 @@ func (s *Server) handleDial(w http.ResponseWriter, r *http.Request) {
 		remote.Close()
 		return
 	}
-	pipe(bufferedConn{local, rw.Reader}, remote)
+	streamio.Splice(streamio.Buffered{Conn: local, R: rw.Reader}, remote)
 }
 
 // handleStream is the client's leg of a dial: it is paired with the waiting container leg.
@@ -145,18 +155,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if !hub.deliver(id, bufferedConn{c, rw.Reader}) {
+	if !hub.deliver(id, streamio.Buffered{Conn: c, R: rw.Reader}) {
 		c.Close()
 	}
-}
-
-// pipe copies both ways until either side closes, then closes both.
-func pipe(a, b net.Conn) {
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(a, b); done <- struct{}{} }()
-	go func() { io.Copy(b, a); done <- struct{}{} }()
-	<-done
-	a.Close()
-	b.Close()
-	<-done
 }

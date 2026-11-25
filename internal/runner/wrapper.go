@@ -2,6 +2,7 @@ package runner
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -231,7 +232,11 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 	if err != nil {
 		return fail(err)
 	}
+	// Frames are "<seq> <len>\n<payload>"; each is acknowledged with "ok\n" once written to the
+	// process. lastSeq lives here, in the process that owns stdin, so a frame retried after a
+	// runner restart or a lost acknowledgement is skipped instead of delivered twice.
 	var mu sync.Mutex
+	var lastSeq int64
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -240,18 +245,36 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
-				buf := make([]byte, 64<<10)
+				r := bufio.NewReader(c)
 				for {
-					n, err := c.Read(buf)
-					if n > 0 {
-						mu.Lock()
-						_, werr := pw.Write(buf[:n])
-						mu.Unlock()
-						if werr != nil {
-							return
+					var seq int64
+					var n int
+					hdr, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if _, err := fmt.Sscanf(hdr, "%d %d", &seq, &n); err != nil || n < 0 || n > 64<<20 {
+						fmt.Fprintf(c, "bad frame\n")
+						return
+					}
+					payload := make([]byte, n)
+					if _, err := io.ReadFull(r, payload); err != nil {
+						return
+					}
+					mu.Lock()
+					var werr error
+					if seq == 0 || seq > lastSeq {
+						_, werr = pw.Write(payload)
+						if seq > 0 && werr == nil {
+							lastSeq = seq
 						}
 					}
-					if err != nil {
+					mu.Unlock()
+					if werr != nil {
+						fmt.Fprintf(c, "stdin closed\n")
+						return
+					}
+					if _, err := io.WriteString(c, "ok\n"); err != nil {
 						return
 					}
 				}

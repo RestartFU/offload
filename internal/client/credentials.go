@@ -284,9 +284,12 @@ func serveCallbacks(ctx context.Context, h *Host, base string, cfg *Config, quie
 				answer = agentRequest(cb.Data)
 				announce("ssh", "the job is using this machine's ssh-agent")
 			case "git-credential":
-				host := credentialField(cb.Data, "host")
-				if allowedHost(cfg.Credentials.GitHosts, host) {
-					answer = gitCredentialFill(cb.Data)
+				req, err := parseCredentialRequest(cb.Data)
+				host := req.Host
+				if err != nil {
+					announce("git-bad", "refused a malformed git credential request: "+err.Error())
+				} else if allowedHost(cfg.Credentials.GitHosts, host) {
+					answer = gitCredentialFill(req.canonical())
 					if len(answer) > 0 {
 						announce("git:"+host, "lent git credentials for "+host+" to the job")
 					}
@@ -328,6 +331,65 @@ func agentRequest(msg []byte) []byte {
 		return nil
 	}
 	return out
+}
+
+// credentialRequest is a git credential request reduced to the fields we authorize on. Git lets a
+// later "host=" (or a "url=") override an earlier one, so the job's raw text is never passed on:
+// git gets a request rebuilt from exactly the fields that were checked.
+type credentialRequest struct {
+	Protocol, Host, Path, Username string
+}
+
+func parseCredentialRequest(data []byte) (credentialRequest, error) {
+	var r credentialRequest
+	seen := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if line == "" {
+			break // end of request
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || strings.ContainsAny(v, "\x00\r") {
+			return r, fmt.Errorf("bad line")
+		}
+		switch k {
+		case "protocol", "host", "path", "username":
+			if seen[k] {
+				return r, fmt.Errorf("duplicate %s", k)
+			}
+			seen[k] = true
+		case "url":
+			return r, fmt.Errorf("url= requests are not relayed")
+		default:
+			continue // capability[], wwwauth[] and the like are dropped
+		}
+		switch k {
+		case "protocol":
+			r.Protocol = v
+		case "host":
+			r.Host = v
+		case "path":
+			r.Path = v
+		case "username":
+			r.Username = v
+		}
+	}
+	if r.Host == "" || r.Protocol == "" {
+		return r, fmt.Errorf("missing protocol or host")
+	}
+	return r, nil
+}
+
+func (r credentialRequest) canonical() []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, "protocol=%s\nhost=%s\n", r.Protocol, r.Host)
+	if r.Path != "" {
+		fmt.Fprintf(&b, "path=%s\n", r.Path)
+	}
+	if r.Username != "" {
+		fmt.Fprintf(&b, "username=%s\n", r.Username)
+	}
+	b.WriteString("\n")
+	return []byte(b.String())
 }
 
 func credentialField(data []byte, key string) string {
