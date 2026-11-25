@@ -77,10 +77,11 @@ func LoadSessionConfig(name string) (*SessionConfig, error) {
 func globRE(pattern string) *regexp.Regexp {
 	var b strings.Builder
 	b.WriteString("^")
-	for i := 0; i < len(pattern); i++ {
-		switch c := pattern[i]; c {
+	rs := []rune(pattern) // characters, not bytes: "été" is three of them
+	for i := 0; i < len(rs); i++ {
+		switch c := rs[i]; c {
 		case '*':
-			if i+1 < len(pattern) && pattern[i+1] == '*' {
+			if i+1 < len(rs) && rs[i+1] == '*' {
 				b.WriteString(".*")
 				i++
 			} else {

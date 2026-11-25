@@ -236,14 +236,17 @@ pick:
 	go func() { errDone <- pumpOut(ctx, h, se.ID, "stderr", os.Stderr) }()
 	// When the session ends, stderr is read to its end too (its last lines are often the
 	// diagnostic), within a bound; a failure there is reported, not swallowed.
+	// Reports are best-effort: if whoever reads our stderr stopped, writing must not hang us.
+	warn := func(msg string) { go fmt.Fprintln(os.Stderr, msg) }
 	drainStderr := func() {
 		select {
 		case err := <-errDone:
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "offload: the session's stderr didn't arrive completely: %v\n", err)
+				warn("offload: the session's stderr didn't arrive completely: " + err.Error())
 			}
+		case <-ctx.Done():
 		case <-time.After(30 * time.Second):
-			fmt.Fprintf(os.Stderr, "offload: gave up waiting for the rest of the session's stderr\n")
+			warn("offload: gave up waiting for the rest of the session's stderr")
 		}
 	}
 	if o.Prepare {

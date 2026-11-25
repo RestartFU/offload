@@ -184,6 +184,13 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		out.err(http.StatusUnprocessableEntity, why)
 		return
 	}
+	// A launch still waiting for its image keeps that build alive (see expireBuildsLocked),
+	// even while it can't start yet for lack of capacity.
+	if rt == "container" {
+		if tag, _, _ := envPlan(def); s.builds[tag] != nil {
+			s.builds[tag].sessionAsked = time.Now()
+		}
+	}
 	// Capacity first: a full runner says so at once (503), and the client tries another.
 	live := 0
 	for _, x := range s.sessions {

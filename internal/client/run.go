@@ -561,9 +561,9 @@ func saveBaseline(ws *Workspace) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	if old, err := os.ReadDir(dir); err == nil { // a week is longer than runners keep jobs
+	if old, err := os.ReadDir(dir); err == nil { // two months: longer than runners keep jobs
 		for _, e := range old {
-			if fi, err := e.Info(); err == nil && fi.Mode().IsRegular() && time.Since(fi.ModTime()) > 7*24*time.Hour {
+			if fi, err := e.Info(); err == nil && fi.Mode().IsRegular() && time.Since(fi.ModTime()) > 60*24*time.Hour {
 				_ = os.Remove(filepath.Join(dir, e.Name()))
 			}
 		}
@@ -617,6 +617,9 @@ func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, 
 		if bl == nil {
 			if j.WriteBackError != "" {
 				return &collectError{j.WriteBackError}
+			}
+			if j.WriteBack != nil && len(j.WriteBack.Modified) > 0 {
+				return fmt.Errorf("the job changed %d file(s), but this machine has no record of what it sent (started elsewhere, or already applied): not writing them back", len(j.WriteBack.Modified))
 			}
 			return nil
 		}
@@ -830,6 +833,10 @@ func snapshotArtifacts(paths []string) map[string]fileSig {
 		if checkRel(p) != nil {
 			continue
 		}
+		if fi, err := tree.Lstat(p); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			snap[p] = sigOf(tree, p, fi) // the link itself, never what it points at
+			continue
+		}
 		_ = fs.WalkDir(tree.FS(), p, func(rel string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil
@@ -1013,6 +1020,9 @@ func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string,
 			if tree.Symlink(c.Link, tmp) == nil {
 				if tree.Rename(tmp, c.Path) == nil {
 					wrote = append(wrote, c.Path)
+					if fi, err := tree.Lstat(c.Path); err == nil && written != nil {
+						written[c.Path] = sigOf(tree, c.Path, fi)
+					}
 					continue
 				}
 				_ = tree.Remove(tmp)
@@ -1028,11 +1038,17 @@ func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string,
 				saved = cand
 			}
 		}
-		if saved == "" {
-			skipped = append(skipped, c.Path+" (the job made it a link to "+c.Link+")")
-		} else {
-			skipped = append(skipped, c.Path+" (job's version: "+saved+")")
+		if saved == "" { // its directory moved: keep it with this job's other kept versions
+			cand := path.Join(incomingDir, j.ID, c.Path)
+			if err := mkdirReal(tree, path.Dir(cand)); err != nil {
+				return fmt.Errorf("%s: saving the job's link (to %s): %w", c.Path, c.Link, err)
+			}
+			if err := tree.Symlink(c.Link, cand); err != nil {
+				return fmt.Errorf("%s: saving the job's link (to %s): %w", c.Path, c.Link, err)
+			}
+			saved = cand
 		}
+		skipped = append(skipped, c.Path+" (job's version: "+saved+")")
 	}
 	if len(wrote) > 0 {
 		logf(quiet, "wrote back %d file(s) the job changed: %s", len(wrote), strings.Join(firstN(wrote, 8), ", "))
@@ -1233,14 +1249,14 @@ func firstN(s []string, n int) []string {
 // unchangedSinceSnap reports whether rel is as the snapshot saw it (or absent both times, or
 // deleted here since: nothing to lose).
 func unchangedSinceSnap(tree *os.Root, rel string, snap map[string]fileSig) bool {
+	before, had := snap[rel]
 	fi, err := tree.Lstat(rel)
 	if errors.Is(err, os.ErrNotExist) {
-		return true
+		return !had // absent then and now; deleted here meanwhile is a local change to keep
 	}
 	if err != nil {
 		return false
 	}
-	before, had := snap[rel]
 	return had && sigOf(tree, rel, fi) == before
 }
 

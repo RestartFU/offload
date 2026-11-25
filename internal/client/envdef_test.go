@@ -206,3 +206,12 @@ func TestGitFilesTrackedFileBecameDirectory(t *testing.T) {
 		t.Fatalf("files = %v, want [a/b]", files)
 	}
 }
+
+func TestGlobMatchUnicode(t *testing.T) {
+	if !globMatch("captures/été/**", "captures/été/a.png") {
+		t.Fatal("accented directory not matched")
+	}
+	if !globMatch("caf?.txt", "café.txt") {
+		t.Fatal("? must match one character, not one byte")
+	}
+}
