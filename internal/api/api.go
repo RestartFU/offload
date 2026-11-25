@@ -262,6 +262,7 @@ type ProfileInfo struct {
 
 // Status is the body of GET /v1/status.
 type Status struct {
+	ID           string                 `json:"id,omitempty"` // stable per runner (machine and state dir)
 	Name         string                 `json:"name"`
 	Version      string                 `json:"version"`
 	Hostname     string                 `json:"hostname"`

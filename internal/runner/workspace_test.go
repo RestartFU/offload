@@ -422,6 +422,8 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 	write("vendor/mod/x.go", "package mod // go mod vendor, on the runner")
 	write("local-out/bin", "ignored only by the client's .git/info/exclude")
 	os.MkdirAll(filepath.Join(dir, "vendor2", "deep"), 0o755) // left empty by an aborted job
+	write("gen/.gitignore", "*\n")                            // a job's own ignore rule, hiding what it generated
+	write("gen/stale.go", "package gen")
 	write("generated-tools/helper.sh", "a job's git clone")
 	if out, err := exec.Command("git", "-C", filepath.Join(dir, "generated-tools"), "init", "-q").CombinedOutput(); err != nil {
 		t.Fatalf("nested git init: %v %s", err, out)
@@ -441,6 +443,9 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "generated-tools")); !os.IsNotExist(err) {
 		t.Fatal("a job's nested git checkout survived")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "gen")); !os.IsNotExist(err) {
+		t.Fatal("a job-made .gitignore kept its generated files")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "web", "node_modules", "empty-pkg")); err != nil {
 		t.Fatal("pruning entered an ignored directory")

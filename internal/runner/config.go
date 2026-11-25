@@ -292,6 +292,9 @@ func (c *Config) effective(req api.Resources, p *Profile) api.Resources {
 		pr := p.resources()
 		if r.CPU == 0 {
 			r.CPU = pr.CPU
+			if req.CPUMax > 0 && r.CPU > req.CPUMax {
+				r.CPU = req.CPUMax // an inherited guarantee never lifts an explicit ceiling
+			}
 		}
 		if r.CPUMax == 0 {
 			r.CPUMax = pr.CPUMax
@@ -302,6 +305,9 @@ func (c *Config) effective(req api.Resources, p *Profile) api.Resources {
 	}
 	if r.CPU <= 0 {
 		r.CPU = c.Defaults.CPU
+		if req.CPUMax > 0 && r.CPU > req.CPUMax {
+			r.CPU = req.CPUMax
+		}
 	}
 	if r.Mem <= 0 {
 		r.Mem = c.defMem

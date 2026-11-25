@@ -303,15 +303,27 @@ func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.Fi
 		return gitCmdCtx(ctx, sl.Dir, append([]string{"--git-dir=" + scratch, "--work-tree=.", "-c", "core.excludesFile=" + excludes,
 			"ls-files", "-z", "--others", "--exclude-standard", "--exclude=/.git"}, extra...)...)
 	}
-	out, err := lsFiles()
-	if err != nil {
-		return
-	}
 	sent := make(map[string]bool, len(manifest))
 	for _, e := range manifest {
 		sent[e.Path] = true
 	}
-
+	// Ignore rules come from the client only: a .gitignore a job created (hiding the vendor/ it
+	// made) is removed before the rules are read, like any other file the client didn't send.
+	if gi, err := gitCmdCtx(ctx, sl.Dir, "--git-dir="+scratch, "--work-tree=.", "ls-files", "-z", "--others",
+		"--exclude=/.git", "--", ":(glob).gitignore", ":(glob)**/.gitignore"); err == nil && gi != "" {
+		if r, err := os.OpenRoot(sl.Dir); err == nil {
+			for _, p := range strings.Split(gi, "\x00") {
+				if p != "" && !sent[p] && parentsState(r, p) == parentsReal {
+					_ = r.Remove(p)
+				}
+			}
+			r.Close()
+		}
+	}
+	out, err := lsFiles()
+	if err != nil {
+		return
+	}
 	root, err := os.OpenRoot(sl.Dir)
 	if err != nil {
 		return

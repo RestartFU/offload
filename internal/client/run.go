@@ -454,7 +454,12 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 	for {
 		resp, err := h.request(ctx, "GET", fmt.Sprintf("/v1/jobs/%s/logs?follow=1&stream=%s&offset=%d", id, stream, offset), nil)
 		if err == nil {
-			n, cerr := io.Copy(w, resp.Body)
+			rw := &recordingWriter{w: w}
+			n, cerr := io.Copy(rw, resp.Body)
+			if rw.err != nil { // our own output failed (disk full, closed pipe): not a network matter
+				resp.Body.Close()
+				return fmt.Errorf("writing the job's %s: %w", stream, rw.err)
+			}
 			resp.Body.Close()
 			offset += n
 			if n > 0 {

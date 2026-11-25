@@ -69,6 +69,11 @@ func (sl *slot) planData(manifest []api.FileEntry) (needed []string, changed boo
 			needed = append(needed, p)
 			continue
 		}
+		if old.Mode != e.Mode { // the client changed it (its mode): a copy the runner deleted comes back
+			if _, err := root.Lstat(p); err != nil {
+				needed = append(needed, p)
+			}
+		}
 		// Unchanged on the client but gone on the runner: the session deleted it (a cleared
 		// credential cache); that stays deleted until the client's copy changes.
 

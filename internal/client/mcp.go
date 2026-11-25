@@ -96,7 +96,7 @@ func MCP(o MCPOptions) error {
 	var pinned *Host
 	if on == "" && sc != nil && len(sc.Volumes) > 0 && !o.Prepare {
 		if url := preparedURL(profile); url != "" {
-			pinned = newHost("", url, "", 0)
+			pinned = pinHost(cfg, url)
 			if found := probe(ctx, []*Host{pinned}); len(found) == 0 {
 				return fmt.Errorf("session %s was prepared on %s, which isn't reachable now; wait for it, or run it elsewhere with --on NAME (and --prepare there)", profile, url)
 			}
@@ -181,7 +181,7 @@ pick:
 				}
 				if err := SyncData(ctx, h, name, dc, false); err != nil {
 					var ae *APIError
-					if errors.As(err, &ae) && ae.Code == 403 && on == "" {
+					if errors.As(err, &ae) && ae.Code == 403 && on == "" && pinned == nil {
 						fmt.Fprintf(os.Stderr, "offload: %s: %s; trying another runner\n", h.Name, ae.Msg)
 						refused[h.URL] = true
 						continue pick
@@ -205,7 +205,7 @@ pick:
 				}
 				continue
 			}
-			if errors.As(err, &ae) && (ae.Code == 403 || ae.Code == 422) && on == "" {
+			if errors.As(err, &ae) && (ae.Code == 403 || ae.Code == 422) && on == "" && pinned == nil {
 				// Not paired any more, or the session can never fit there: another runner.
 				fmt.Fprintf(os.Stderr, "offload: %s: %s; trying another runner\n", h.Name, ae.Msg)
 				refused[h.URL] = true
@@ -397,8 +397,27 @@ func (e *ExitError) Error() string { return fmt.Sprintf("%s exited with status %
 func preparedPath(profile string) string { return filepath.Join(stateDir(), "prepared", profile) }
 
 func rememberPrepared(profile string, h *Host) {
+	endpoint := h.URL
+	if h.sock != "" {
+		endpoint = "unix://" + h.sock // the local runner: its socket, not the synthetic URL
+	}
 	_ = os.MkdirAll(filepath.Dir(preparedPath(profile)), 0o700)
-	_ = os.WriteFile(preparedPath(profile), []byte(h.URL+"\n"), 0o600)
+	_ = os.WriteFile(preparedPath(profile), []byte(endpoint+"\n"), 0o600)
+}
+
+// pinHost builds the host for a saved endpoint, with the token client.toml gives that endpoint
+// (if any; the paired token otherwise).
+func pinHost(cfg *Config, endpoint string) *Host {
+	if endpoint == "http://local" { // saved by an older version for the local runner
+		endpoint = "unix://" + localSocket()
+	}
+	token := ""
+	for _, hc := range cfg.Hosts {
+		if strings.TrimRight(hc.URL, "/") == endpoint {
+			token = hc.Token
+		}
+	}
+	return newHost("", endpoint, token, 0)
 }
 
 func preparedURL(profile string) string {
@@ -415,7 +434,7 @@ func preparedOn(profile string, hosts []*Host) *Host {
 		return nil
 	}
 	for _, h := range hosts {
-		if h.URL == url {
+		if h.URL == url || (h.sock != "" && url == "unix://"+h.sock) {
 			return h
 		}
 	}

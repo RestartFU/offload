@@ -421,6 +421,7 @@ func probe(ctx context.Context, cands []*Host) []*Host {
 			pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
 			var st api.Status
+			h.Status = nil // only what this probe sees counts
 			if err := h.do(pctx, "GET", "/v1/status", nil, &st); err == nil {
 				h.Status = &st
 				if st.Name != "" && h.Name != "local" && !h.named {
@@ -647,12 +648,15 @@ func FindHost(hosts []*Host, name string) (*Host, error) {
 			found = append(found, h)
 		}
 	}
-	// One machine can be listed twice (pinned by DNS name, discovered by tailnet IP): the same
-	// advertised name and hostname are one runner, the pinned entry preferred.
+	// One runner can be listed twice (pinned by DNS name, discovered by tailnet IP): the same
+	// runner ID is one runner, the pinned entry preferred. Distinct runners stay distinct.
 	byMachine := map[string]*Host{}
 	var machines []*Host
 	for _, h := range found {
-		k := h.Status.Name + "\x00" + h.Status.Hostname
+		k := h.Status.ID
+		if k == "" {
+			k = h.URL
+		}
 		if cur, ok := byMachine[k]; !ok {
 			byMachine[k] = h
 			machines = append(machines, h)

@@ -446,6 +446,12 @@ func NewPairCode(tokensFile string) (string, error) {
 	return code, nil
 }
 
+// runnerID identifies this runner across addresses and names: its machine and state dir.
+func runnerID(stateDir string) string {
+	mid, _ := os.ReadFile("/etc/machine-id")
+	return hash12(strings.TrimSpace(string(mid)), stateDir)
+}
+
 // checkClientProto refuses requests from clients of another protocol version, except the ones
 // that bring versions back in step (status, pairing, binary upgrades).
 func checkClientProto(next http.Handler) http.Handler {
@@ -675,7 +681,7 @@ func (s *Server) status() api.Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := api.Status{
-		Name: s.cfg.Name, Version: s.version,
+		ID: runnerID(s.cfg.StateDir), Name: s.cfg.Name, Version: s.version,
 		Capacity:     api.Resources{CPU: s.cfg.Capacity.CPU, CPUMax: float64(len(s.cfg.cpus)), Mem: s.cfg.memCap},
 		Defaults:     api.Resources{CPU: s.cfg.Defaults.CPU, Mem: s.cfg.defMem},
 		MemAvailable: memAvailable(), MemReserve: s.cfg.memReserve, Load1: load1(),
