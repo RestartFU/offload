@@ -647,6 +647,25 @@ func FindHost(hosts []*Host, name string) (*Host, error) {
 			found = append(found, h)
 		}
 	}
+	// One machine can be listed twice (pinned by DNS name, discovered by tailnet IP): the same
+	// advertised name and hostname are one runner, the pinned entry preferred.
+	byMachine := map[string]*Host{}
+	var machines []*Host
+	for _, h := range found {
+		k := h.Status.Name + "\x00" + h.Status.Hostname
+		if cur, ok := byMachine[k]; !ok {
+			byMachine[k] = h
+			machines = append(machines, h)
+		} else if h.named && !cur.named {
+			byMachine[k] = h
+			for i := range machines {
+				if machines[i] == cur {
+					machines[i] = h
+				}
+			}
+		}
+	}
+	found = machines
 	switch len(found) {
 	case 1:
 		return found[0], nil

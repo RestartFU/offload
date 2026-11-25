@@ -1099,12 +1099,19 @@ func (s *Server) gcContainersLocked() {
 		delete(s.readyImages, tag)
 	}
 	_ = writeFileJSON(s.imagesPath(), s.imageUse)
-	out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-j-", "--filter", "label="+s.ownerLabel(), "--format", "{{.Names}}")
+	// Our containers whose workload is over (a killed unit can leave its --rm undone), jobs and
+	// sessions alike; removing one podman already removed is fine.
+	out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-[js]-", "--filter", "label="+s.ownerLabel(), "--format", "{{.Names}}")
 	if err == nil && out != "" {
-		for _, name := range strings.Split(out, "\n") {
-			if j := s.jobs[strings.TrimPrefix(name, "offload-")]; j == nil || j.State != api.StateRunning {
-				_, _ = podman(context.Background(), "rm", "-f", name)
+		for _, name := range strings.Fields(out) {
+			id := strings.TrimPrefix(name, "offload-")
+			if j := s.jobs[id]; j != nil && j.State == api.StateRunning {
+				continue
 			}
+			if se := s.sessions[id]; se != nil && !api.Terminal(se.State) {
+				continue
+			}
+			_, _ = podman(context.Background(), "rm", "-f", "--ignore", name)
 		}
 	}
 	// Only dangling layers of our own images (they all carry the base's label): never images

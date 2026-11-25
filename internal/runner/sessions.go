@@ -145,6 +145,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		out.err(400, err.Error())
 		return
 	}
+	if spec.Resources.CPU > s.cfg.Capacity.CPU+1e-9 {
+		out.err(http.StatusUnprocessableEntity, fmt.Sprintf("session asks for %.1f cpu; this runner guarantees at most %.1f", spec.Resources.CPU, s.cfg.Capacity.CPU))
+		return
+	}
 	res := s.cfg.effective(spec.Resources, prof)
 	rt := spec.Runtime
 	if rt == "" {

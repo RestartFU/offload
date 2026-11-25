@@ -323,17 +323,33 @@ func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.Fi
 			sentDirs[d] = true
 		}
 	}
+	// Git lists a nested repository (a job's `git clone` of a helper) as one opaque entry. Its
+	// metadata goes either way; then, if the client sent files inside it, the listing is redone
+	// so the rest of it is pruned file by file like anything else.
+	relist := false
+	for _, p := range strings.Split(out, "\x00") {
+		d, ok := strings.CutSuffix(p, "/")
+		if !ok || d == "" || parentsState(root, d) != parentsReal {
+			continue
+		}
+		if sentDirs[d] {
+			_ = root.RemoveAll(path.Join(d, ".git"))
+			relist = true
+		} else {
+			_ = root.RemoveAll(d)
+		}
+	}
+	if relist {
+		if out, err = lsFiles(); err != nil {
+			return
+		}
+	}
 	for _, p := range strings.Split(out, "\x00") {
 		if p == "" || sent[p] || strings.HasPrefix(p, ".git/") {
 			continue
 		}
-		if d, ok := strings.CutSuffix(p, "/"); ok {
-			// Git lists a nested repository (a job's `git clone` of a helper) as one opaque
-			// entry: it goes as a whole, unless the client sent something inside it.
-			if !sentDirs[d] && parentsState(root, d) == parentsReal {
-				_ = root.RemoveAll(d)
-			}
-			continue
+		if strings.HasSuffix(p, "/") {
+			continue // handled above
 		}
 		if _, err := cleanRel(p); err == nil && parentsState(root, p) == parentsReal {
 			if root.Remove(p) == nil {

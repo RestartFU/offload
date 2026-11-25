@@ -69,13 +69,9 @@ func (sl *slot) planData(manifest []api.FileEntry) (needed []string, changed boo
 			needed = append(needed, p)
 			continue
 		}
-		if _, err := root.Lstat(p); err != nil {
-			// Deleted on the runner: restore it, unless the runner replaced a directory above it
-			// with a file of its own (a migration): unchanged client data doesn't undo that.
-			if parentsState(root, p) != parentsAliased {
-				needed = append(needed, p)
-			}
-		}
+		// Unchanged on the client but gone on the runner: the session deleted it (a cleared
+		// credential cache); that stays deleted until the client's copy changes.
+
 	}
 	// An interrupted apply may have left any marked path half-done: apply again to repair it.
 	// A file the client changed below an ancestor the runner turned into a file: apply moves

@@ -397,6 +397,7 @@ func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bo
 	}
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
+	streamCtx, stopStreams := context.WithCancel(ctx)
 	for i, s := range []struct {
 		name string
 		w    io.Writer
@@ -404,10 +405,14 @@ func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bo
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = streamLog(ctx, h, id, s.name, s.w, quiet && s.name == "stderr")
+			errs[i] = streamLog(streamCtx, h, id, s.name, s.w, quiet && s.name == "stderr")
+			if errs[i] != nil {
+				stopStreams() // one stream's terminal error (not paired any more, gone, …) ends both
+			}
 		}()
 	}
 	wg.Wait()
+	stopStreams()
 	if ctx.Err() != nil {
 		if cancelOnInterrupt {
 			logf(quiet, "cancelling %s:%s", h.Name, id)
@@ -416,7 +421,7 @@ func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bo
 		return 130, nil, nil
 	}
 	for _, err := range errs {
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) { // the cause, not the sibling's cancel
 			return 1, nil, err
 		}
 	}

@@ -44,10 +44,19 @@ var skipDirs = map[string]bool{".git": true, "target": true, "node_modules": tru
 // manifest is every tracked file plus untracked files that aren't ignored, so build output
 // (already ignored) stays on the runner and is never uploaded.
 func LoadWorkspace(cwd string) (*Workspace, error) {
+	// Physical paths on both sides: entered through a symlink (~/src -> /data/src), the logical
+	// cwd and git's physical root would otherwise give a "../" relative path.
+	if real, err := filepath.EvalSymlinks(cwd); err == nil {
+		cwd = real
+	}
 	ws := &Workspace{Root: cwd}
 	var files []string
 	if top, err := git(cwd, "rev-parse", "--show-toplevel"); err == nil {
-		ws.Root, ws.GitTree = strings.TrimSpace(top), true
+		top = strings.TrimSpace(top)
+		if real, err := filepath.EvalSymlinks(top); err == nil {
+			top = real
+		}
+		ws.Root, ws.GitTree = top, true
 		shallow, _ := git(ws.Root, "rev-parse", "--is-shallow-repository")
 		if strings.TrimSpace(shallow) == "true" {
 			// A bundle of a shallow clone can't be fetched into an empty store (its boundary

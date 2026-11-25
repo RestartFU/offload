@@ -238,6 +238,10 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		out.err(400, "bad job spec: "+err.Error())
 		return
 	}
+	if spec.Resources.CPU > s.cfg.Capacity.CPU+1e-9 { // an explicit guarantee is never shrunk quietly
+		out.err(400, fmt.Sprintf("job asks for %.1f cpu; this runner guarantees at most %.1f", spec.Resources.CPU, s.cfg.Capacity.CPU))
+		return
+	}
 	if len(spec.Argv) == 0 {
 		out.err(400, "argv is empty")
 		return

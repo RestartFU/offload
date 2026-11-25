@@ -91,13 +91,15 @@ func MCP(o MCPOptions) error {
 			return err
 		}
 	}
+	// A session prepared on a runner stays there (its volumes are filled there): pinned by
+	// that runner's address, probed directly (not via discovery or names), waited for if busy.
+	var pinned *Host
 	if on == "" && sc != nil && len(sc.Volumes) > 0 && !o.Prepare {
 		if url := preparedURL(profile); url != "" {
-			p := preparedOn(profile, Discover(ctx, cfg))
-			if p == nil { // its volumes are filled there: never start empty on another runner
+			pinned = newHost("", url, "", 0)
+			if found := probe(ctx, []*Host{pinned}); len(found) == 0 {
 				return fmt.Errorf("session %s was prepared on %s, which isn't reachable now; wait for it, or run it elsewhere with --on NAME (and --prepare there)", profile, url)
 			}
-			on = p.Name
 		}
 	}
 	var h *Host
@@ -115,7 +117,12 @@ pick:
 			}
 		}
 		hosts = avail
-		if on != "" {
+		if pinned != nil {
+			h, err = pinned, nil
+			if len(probe(ctx, []*Host{pinned})) == 0 { // fresh status for every attempt
+				err = fmt.Errorf("the runner session %s was prepared on (%s) went away", profile, pinned.URL)
+			}
+		} else if on != "" {
 			h, err = FindHost(hosts, on)
 		} else if sc != nil {
 			// Client-defined sessions run in a container unless --host: only runners that can
@@ -209,7 +216,7 @@ pick:
 				// Full right now (capacity, session limit, upgrading): try the next runner, or
 				// with --on wait for this one.
 				fmt.Fprintf(os.Stderr, "offload: %s: %s\n", h.Name, ae.Msg)
-				if on == "" {
+				if on == "" && pinned == nil {
 					excluded[h.URL] = true
 				} else {
 					select {
@@ -276,8 +283,12 @@ pick:
 		}
 		return err
 	case err := <-inDone:
+		var ended *remoteEnded
+		if err != nil && !errors.As(err, &ended) {
+			return err // a local input problem (a message over the limit, a read error): at once
+		}
 		if err != nil {
-			// Often the server closed its input on its way out: its exit status is the real
+			// The server closed its input, often on its way out: its exit status is the real
 			// result, if it arrives soon.
 			select {
 			case derr := <-done:
@@ -477,9 +488,16 @@ func readLineMax(r *bufio.Reader, max int) ([]byte, error) {
 	}
 }
 
+// remoteEnded is the session's input closing on the runner's side (the server closed its
+// stdin, or the session is gone): not a local problem.
+type remoteEnded struct{ msg string }
+
+func (e *remoteEnded) Error() string { return "session ended: " + e.msg }
+
 func sendEOF(ctx context.Context, h *Host, id string, seq int64) error {
 	err := sendFrameReq(ctx, h, fmt.Sprintf("/v1/sessions/%s/stdin?seq=%d&eof=1", id, seq), nil)
-	if err != nil && strings.HasPrefix(err.Error(), "session ended") {
+	var ended *remoteEnded
+	if errors.As(err, &ended) {
 		return nil // its input was already closed, or it is gone: nothing left to close
 	}
 	return err
@@ -497,7 +515,7 @@ func sendFrameReq(ctx context.Context, h *Host, url string, line []byte) error {
 		}
 		var ae *APIError
 		if errors.As(err, &ae) && (ae.Code == 403 || ae.Code == 404 || ae.Code == 410 || ae.Code == 412) {
-			return fmt.Errorf("session ended: %s", ae.Msg)
+			return &remoteEnded{ae.Msg}
 		}
 		if ctx.Err() != nil || attempt > 120 {
 			return err

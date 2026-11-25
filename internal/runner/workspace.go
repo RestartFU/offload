@@ -418,6 +418,9 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		}
 		fi, err := root.Lstat(e.Path)
 		if err != nil {
+			if keepRunner && !written[e.Path] && errors.Is(err, fs.ErrNotExist) {
+				continue // deleted on the runner, and the client sent no new content: stays deleted
+			}
 			return fmt.Errorf("%s: %w", e.Path, err)
 		}
 		if !fi.Mode().IsRegular() {
