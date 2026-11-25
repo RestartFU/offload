@@ -172,8 +172,23 @@ func Get(ref, dest string) error {
 	if err != nil {
 		return err
 	}
-	_, err = fetchArtifacts(ctx, h, id, dest, nil)
-	return err
+	var j api.Job
+	if err := h.do(ctx, "GET", "/v1/jobs/"+id, nil, &j); err != nil {
+		return err
+	}
+	if !j.HasArtifact {
+		if len(j.ArtifactsMissing) > 0 {
+			return fmt.Errorf("the job produced none of its artifacts (%s)", strings.Join(j.ArtifactsMissing, ", "))
+		}
+		return fmt.Errorf("the job has no artifacts (did it run with --get, and has it finished?)")
+	}
+	if _, err := fetchArtifacts(ctx, h, id, dest, nil); err != nil {
+		return err
+	}
+	if len(j.ArtifactsMissing) > 0 {
+		return fmt.Errorf("the job didn't produce %s (the other artifacts were downloaded)", strings.Join(j.ArtifactsMissing, ", "))
+	}
+	return nil
 }
 
 // Upgrade pushes a binary (this one by default) to runners, which swap it in and restart; running

@@ -318,7 +318,7 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 // uploadGit sends the commits the runner is missing. The first job of a repository on a runner
 // sends the whole history once; later ones send only new commits.
 func uploadGit(ctx context.Context, h *Host, j api.Job, ws *Workspace, quiet bool) error {
-	path, err := gitBundle(ctx, ws.Root, j.GitHave)
+	path, err := gitBundle(ctx, ws.Root, j.GitHave, ws.Git.Tags)
 	if err != nil {
 		return err
 	}
@@ -574,7 +574,13 @@ func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, 
 		return err
 	}
 	if j.WriteBack == nil { // finished with nothing to write back (or cancelled): just forget it
-		return os.Remove(baselinePath(j.ID))
+		if err := os.Remove(baselinePath(j.ID)); err != nil {
+			return err
+		}
+		if j.WriteBackError != "" {
+			return fmt.Errorf("the runner couldn't collect the job's edits: %s", j.WriteBackError)
+		}
+		return nil
 	}
 	if err := applyWriteBackLocked(ctx, h, j, bl.Root, bl.Manifest, quiet, written); err != nil {
 		return err

@@ -37,9 +37,17 @@ func gitCmd(dir string, args ...string) (string, error) {
 // gitCmdCtx runs git in its own process group, killed as a whole (index-pack and other helpers
 // included) when ctx ends or after five minutes.
 func gitCmdCtx(ctx context.Context, dir string, args ...string) (string, error) {
+	return gitCmdIn(ctx, dir, "", args...)
+}
+
+// gitCmdIn is gitCmdCtx with stdin.
+func gitCmdIn(ctx context.Context, dir, stdin string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = 5 * time.Second
@@ -72,12 +80,12 @@ func (s *Server) ensureShared(key string) (string, error) {
 
 // gitPlan reports whether the store lacks head, and which commits it has (newest first) so
 // the client can build a minimal bundle.
-func (s *Server) gitPlan(key, head string) (needed bool, have []string, err error) {
+func (s *Server) gitPlan(key, head string, tags map[string]string) (needed bool, have []string, err error) {
 	shared, err := s.ensureShared(key)
 	if err != nil {
 		return false, nil, err
 	}
-	if _, err := gitCmd(shared, "cat-file", "-e", head+"^{commit}"); err == nil {
+	if _, err := gitCmd(shared, "cat-file", "-e", head+"^{commit}"); err == nil && len(missingObjects(shared, tags)) == 0 {
 		return false, nil, nil
 	}
 	out, err := gitCmd(shared, "for-each-ref", "--sort=-committerdate", "--count=64", "--format=%(objectname)", "refs/offload/")
@@ -99,8 +107,20 @@ func (s *Server) gitReceive(ctx context.Context, key, head, bundle string) error
 	if _, err := gitCmdCtx(ctx, shared, "bundle", "verify", "-q", bundle); err != nil {
 		return err
 	}
-	if _, err := gitCmdCtx(ctx, shared, "fetch", "-q", "--no-tags", bundle, "+HEAD:refs/offload/"+head); err != nil {
+	// HEAD is in the bundle unless the store already had it (then only tags are new).
+	refspecs := []string{"+refs/tags/*:refs/tags/*"}
+	if heads, err := gitCmdCtx(ctx, shared, "bundle", "list-heads", bundle); err == nil {
+		for _, line := range strings.Split(heads, "\n") {
+			if strings.HasSuffix(line, " HEAD") {
+				refspecs = append(refspecs, "+HEAD:refs/offload/"+head)
+			}
+		}
+	}
+	if _, err := gitCmdCtx(ctx, shared, append([]string{"fetch", "-q", "--no-tags", bundle}, refspecs...)...); err != nil {
 		return err
+	}
+	if _, err := gitCmdCtx(ctx, shared, "update-ref", "refs/offload/"+head, head); err != nil {
+		return fmt.Errorf("bundle did not contain %s", head)
 	}
 	if _, err := gitCmdCtx(ctx, shared, "cat-file", "-e", head+"^{commit}"); err != nil {
 		return fmt.Errorf("bundle did not contain %s", head)
@@ -168,8 +188,51 @@ func (s *Server) gitCheckout(ctx context.Context, sl *slot, key string, g *api.G
 	if _, err := gitCmdCtx(ctx, sl.Dir, "read-tree", "HEAD"); err != nil {
 		return err
 	}
+	// The client's tags (those reachable from HEAD), for `git describe`; ones whose objects
+	// never arrived are left out rather than failing the checkout.
+	if len(g.Tags) > 0 {
+		missing := map[string]bool{}
+		for _, id := range missingObjects(shared, g.Tags) {
+			missing[id] = true
+		}
+		var cmds strings.Builder
+		for name, id := range g.Tags {
+			if !missing[id] && validTagName(name) {
+				fmt.Fprintf(&cmds, "create refs/tags/%s %s\n", name, id)
+			}
+		}
+		if cmds.Len() > 0 {
+			_, _ = gitCmdIn(ctx, sl.Dir, cmds.String(), "update-ref", "--stdin")
+		}
+	}
 	_, _ = gitCmdCtx(ctx, sl.Dir, "update-index", "-q", "--refresh")
 	return nil
+}
+
+// missingObjects returns the tag object ids not in the store.
+func missingObjects(shared string, tags map[string]string) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	var in strings.Builder
+	for _, id := range tags {
+		in.WriteString(id + "\n")
+	}
+	out, err := gitCmdIn(context.Background(), shared, in.String(), "cat-file", "--batch-check=%(objectname)")
+	if err != nil {
+		return []string{"?"}
+	}
+	var missing []string
+	for _, line := range strings.Split(out, "\n") {
+		if id, ok := strings.CutSuffix(strings.TrimSpace(line), " missing"); ok {
+			missing = append(missing, id)
+		}
+	}
+	return missing
+}
+
+func validTagName(n string) bool {
+	return n != "" && !strings.ContainsAny(n, " \t\n\x00~^:?*[\\") && !strings.Contains(n, "..") && !strings.HasPrefix(n, "/") && !strings.HasPrefix(n, "-")
 }
 
 // pruneUntracked removes files a previous job created in the slot that git doesn't ignore and

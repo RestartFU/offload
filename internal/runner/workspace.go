@@ -148,7 +148,11 @@ func (s *slot) openTree() (*os.Root, error) {
 
 // prepareParents makes every parent of rel a real directory, replacing files or symlinks that
 // stand where a directory must be.
-func prepareParents(root *os.Root, rel string) error {
+func prepareParents(root *os.Root, rel string) error { return prepareParentsMode(root, rel, false) }
+
+// prepareParentsMode makes rel's parents real directories. In a data set (keepRunner) a file the
+// runner put where a directory belongs is moved aside, not deleted.
+func prepareParentsMode(root *os.Root, rel string, keepRunner bool) error {
 	parts := strings.Split(rel, "/")
 	for i := 1; i < len(parts); i++ {
 		dir := strings.Join(parts[:i], "/")
@@ -161,7 +165,13 @@ func prepareParents(root *os.Root, rel string) error {
 		case err != nil:
 			return err
 		case !fi.IsDir():
-			if err := root.RemoveAll(dir); err != nil { // removes a symlink itself, never its target
+			if keepRunner && fi.Mode().IsRegular() {
+				aside := fmt.Sprintf("%s.offload-displaced-%d", dir, time.Now().UnixNano())
+				if err := root.Rename(dir, aside); err != nil {
+					return err
+				}
+				log.Printf("data set: the runner's file %s is in the way of the client's directory; kept as %s", dir, aside)
+			} else if err := root.RemoveAll(dir); err != nil { // removes a symlink itself, never its target
 				return err
 			}
 			if err := root.Mkdir(dir, 0o755); err != nil {
@@ -295,8 +305,21 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		rec.Rev++ // save bumped the stored revision; keep ours in step
 	}
 	written := map[string]bool{}
+	// Directories the client replaced by a file or symlink are moved aside first (in a data
+	// set), before anything below them is deleted: they may hold what only the runner has.
+	if keepRunner {
+		for p, e := range want {
+			if fi, err := root.Lstat(p); err == nil && fi.IsDir() && parentsState(root, p) == parentsReal {
+				if e.Link != "" || staged[p] != "" {
+					if err := clearForReplacement(root, p, fi, true); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
 	for p, tmp := range staged {
-		if err := prepareParents(root, p); err != nil {
+		if err := prepareParentsMode(root, p, keepRunner); err != nil {
 			return err
 		}
 		if fi, err := root.Lstat(p); err == nil && !fi.Mode().IsRegular() {
@@ -362,7 +385,7 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		if keepRunner && had && !written[e.Path] && !dirtyBefore[e.Path] && old.Link == e.Link && (e.Link != "" || (old.Hash == e.Hash && old.Mode == e.Mode)) {
 			continue // unchanged on the client: leave the runner's copy alone
 		}
-		if err := prepareParents(root, e.Path); err != nil {
+		if err := prepareParentsMode(root, e.Path, keepRunner); err != nil {
 			return fmt.Errorf("%s: %w", e.Path, err)
 		}
 		if e.Link != "" {

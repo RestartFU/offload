@@ -88,68 +88,86 @@ func MCP(o MCPOptions) error {
 	if o.Host {
 		spec.Runtime, spec.Environment = "host", nil
 	}
-	hosts := Discover(ctx, cfg)
 	var h *Host
-	if on != "" {
-		h, err = FindHost(hosts, on)
-	} else if sc != nil {
-		// Client-defined sessions run in a container unless --host: only runners that can
-		// start one are candidates, warm data sets decide among those.
-		want := api.JobSpec{Resources: res, Environment: spec.Environment, Runtime: "container", Network: sc.Network}
-		if o.Host {
-			want.Runtime = "host"
-		}
-		fit, _ := eligible(hosts, want)
-		if len(fit) == 0 {
-			fit = hosts // PickFor explains why none fits
-		}
-		// Warm data wins among runners that can take the session now; otherwise any that can.
-		if h, err = PickFor(preferData(fit, sc.Data), want, ""); err != nil {
-			h, err = PickFor(fit, want, "")
-		}
-	} else {
-		h, err = Pick(hosts, res, profile, "", "session")
-	}
-	if err == nil {
-		err = checkProto(h)
-	}
-	if err != nil {
-		return err
-	}
-	if sc != nil {
-		names := make([]string, 0, len(sc.Data))
-		for name := range sc.Data {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			dc, ok := cfg.Data[name]
-			if !ok {
-				return fmt.Errorf("session %s uses data set %q, which client.toml doesn't define ([data.%s])", profile, name, name)
-			}
-			if err := SyncData(ctx, h, name, dc, false); err != nil {
-				return err
-			}
-		}
-	}
 	var se api.Session
-	for announced := false; ; {
-		err := h.do(ctx, "POST", "/v1/sessions", spec, &se)
-		var ae *APIError
-		if errors.As(err, &ae) && ae.Code == 409 { // the environment is being built
-			if !announced {
-				fmt.Fprintf(os.Stderr, "offload: %s: %s\n", h.Name, ae.Msg)
-				announced = true
+	excluded := map[string]bool{}
+pick:
+	for {
+		hosts := Discover(ctx, cfg)
+		var avail []*Host
+		for _, x := range hosts {
+			if !excluded[x.URL] {
+				avail = append(avail, x)
 			}
-			select {
-			case <-ctx.Done():
-				return interrupted(o)
-			case <-time.After(3 * time.Second):
+		}
+		hosts = avail
+		if on != "" {
+			h, err = FindHost(hosts, on)
+		} else if sc != nil {
+			// Client-defined sessions run in a container unless --host: only runners that can
+			// start one are candidates, warm data sets decide among those.
+			want := api.JobSpec{Resources: res, Environment: spec.Environment, Runtime: "container", Network: sc.Network}
+			if o.Host {
+				want.Runtime = "host"
 			}
-			continue
+			fit, _ := eligible(hosts, want)
+			if len(fit) == 0 {
+				fit = hosts // PickFor explains why none fits
+			}
+			// Warm data wins among runners that can take the session now; otherwise any that can.
+			if h, err = PickFor(preferData(fit, sc.Data), want, ""); err != nil {
+				h, err = PickFor(fit, want, "")
+			}
+		} else {
+			h, err = Pick(hosts, res, profile, "", "session")
+		}
+		if err == nil {
+			err = checkProto(h)
 		}
 		if err != nil {
-			return fmt.Errorf("%s: %w", h.Name, err)
+			return err
+		}
+		if sc != nil {
+			names := make([]string, 0, len(sc.Data))
+			for name := range sc.Data {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				dc, ok := cfg.Data[name]
+				if !ok {
+					return fmt.Errorf("session %s uses data set %q, which client.toml doesn't define ([data.%s])", profile, name, name)
+				}
+				if err := SyncData(ctx, h, name, dc, false); err != nil {
+					return err
+				}
+			}
+		}
+		for announced := false; ; {
+			err := h.do(ctx, "POST", "/v1/sessions", spec, &se)
+			var ae *APIError
+			if errors.As(err, &ae) && ae.Code == 409 { // the environment is being built
+				if !announced {
+					fmt.Fprintf(os.Stderr, "offload: %s: %s\n", h.Name, ae.Msg)
+					announced = true
+				}
+				select {
+				case <-ctx.Done():
+					return interrupted(o)
+				case <-time.After(3 * time.Second):
+				}
+				continue
+			}
+			if errors.As(err, &ae) && ae.Code == 503 && on == "" {
+				// Full right now (capacity, session limit, upgrading): try the next runner.
+				fmt.Fprintf(os.Stderr, "offload: %s: %s; trying another runner\n", h.Name, ae.Msg)
+				excluded[h.URL] = true
+				continue pick
+			}
+			if err != nil {
+				return fmt.Errorf("%s: %w", h.Name, err)
+			}
+			break
 		}
 		break
 	}

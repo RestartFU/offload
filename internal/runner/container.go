@@ -642,6 +642,10 @@ func (s *Server) prebuildBase() {
 		s.mu.Unlock()
 		return
 	}
+	if ok, _ := s.fitsLocked(api.Resources{Mem: s.cfg.buildMem}); !ok {
+		s.mu.Unlock()
+		return // no room now; the first job that needs it builds it once there is
+	}
 	b := &envBuild{tag: baseTag(), waiters: map[string]*job{}}
 	s.builds[baseTag()] = b
 	s.mu.Unlock()

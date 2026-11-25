@@ -213,8 +213,13 @@ func (c *Config) finish() error {
 	if c.buildMem, err = units.ParseSize(c.Container.BuildMem); err != nil {
 		return err
 	}
-	if c.buildMem == 0 || c.buildMem > c.memCap { // a build must fit the budget it is counted in
-		c.buildMem = min(8<<30, c.memCap)
+	// A build must fit the budget it is counted in: the slice, and the host minus its reserve.
+	limit := c.memCap
+	if total := meminfo("MemTotal"); total > c.memReserve && total-c.memReserve < limit {
+		limit = total - c.memReserve
+	}
+	if c.buildMem == 0 || c.buildMem > limit {
+		c.buildMem = min(8<<30, limit)
 	}
 	if c.imageRetain, err = durationOr(c.Container.ImageRetain, 14*24*time.Hour); err != nil {
 		return err

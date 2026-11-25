@@ -176,7 +176,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !ready {
-			out.err(http.StatusConflict, "building environment "+strings.TrimPrefix(tag, imageRepo+"/")+"; retry shortly")
+			msg := "building environment " + strings.TrimPrefix(tag, imageRepo+"/") + "; retry shortly"
+			if s.builds[tag] == nil {
+				msg = "waiting for memory to build environment " + strings.TrimPrefix(tag, imageRepo+"/") + "; retry shortly"
+			}
+			out.err(http.StatusConflict, msg)
 			return
 		}
 		image = tag

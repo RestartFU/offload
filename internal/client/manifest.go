@@ -50,6 +50,16 @@ func LoadWorkspace(cwd string) (*Workspace, error) {
 			if br, err := git(ws.Root, "symbolic-ref", "-q", "--short", "HEAD"); err == nil {
 				ws.Git.Branch = strings.TrimSpace(br)
 			}
+			if out, err := git(ws.Root, "for-each-ref", "--merged=HEAD", "--format=%(refname:strip=2) %(objectname)", "refs/tags"); err == nil {
+				for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+					if name, id, ok := strings.Cut(line, " "); ok {
+						if ws.Git.Tags == nil {
+							ws.Git.Tags = map[string]string{}
+						}
+						ws.Git.Tags[name] = id
+					}
+				}
+			}
 		}
 		files, err = gitFiles(ws.Root)
 		if err != nil {
@@ -405,13 +415,16 @@ func writeTar(w io.Writer, root string, manifest []api.FileEntry, needed []strin
 
 // gitBundle writes a bundle of HEAD minus the commits the runner already has (those we also
 // have locally) to a temp file and returns its path.
-func gitBundle(ctx context.Context, root string, have []string) (string, error) {
+func gitBundle(ctx context.Context, root string, have []string, tags map[string]string) (string, error) {
 	f, err := os.CreateTemp("", "offload-*.bundle")
 	if err != nil {
 		return "", err
 	}
 	f.Close()
 	args := []string{"bundle", "create", "-q", f.Name(), "HEAD"}
+	for name := range tags { // the tags reachable from HEAD: their objects ride along
+		args = append(args, "refs/tags/"+name)
+	}
 	if len(have) > 0 {
 		cmd := groupCommand(ctx, "git", "-C", root, "cat-file", "--batch-check=%(objectname) %(objecttype)")
 		cmd.Stdin = strings.NewReader(strings.Join(have, "\n") + "\n")

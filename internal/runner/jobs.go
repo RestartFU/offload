@@ -53,6 +53,7 @@ type exitRecord struct {
 	PeakMem          int64          `json:"peak_mem,omitempty"`
 	Artifact         bool           `json:"artifacts,omitempty"`
 	ArtifactsMissing []string       `json:"artifacts_missing,omitempty"`
+	WriteBackError   string         `json:"write_back_error,omitempty"`
 	WriteBack        *api.WriteBack `json:"write_back,omitempty"`
 }
 
@@ -391,7 +392,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			var err error
-			if j.GitNeeded, j.GitHave, err = s.gitPlan(spec.WorkspaceKey, spec.Git.Head); err != nil {
+			if j.GitNeeded, j.GitHave, err = s.gitPlan(spec.WorkspaceKey, spec.Git.Head, spec.Git.Tags); err != nil {
 				j.Spec.Git = nil // git unavailable here; run without it
 				s.note(j, "git metadata unavailable on this runner: "+err.Error())
 			}
@@ -921,7 +922,7 @@ func (s *Server) checkRunning() {
 			}
 			code := rec.Code
 			j.Signal, j.HasArtifact, j.WriteBack, j.PeakMem = rec.Signal, rec.Artifact, rec.WriteBack, rec.PeakMem
-			j.ArtifactsMissing = rec.ArtifactsMissing
+			j.ArtifactsMissing, j.WriteBackError = rec.ArtifactsMissing, rec.WriteBackError
 			s.learn(j, rec)
 			s.finishLocked(j, state, &code, reason)
 		case active:

@@ -116,8 +116,10 @@ type Job struct {
 	HasArtifact bool       `json:"has_artifacts,omitempty"`
 	// ArtifactsMissing lists requested artifact paths the job didn't produce (or that couldn't
 	// be read): the archive, if any, holds the rest.
-	ArtifactsMissing []string   `json:"artifacts_missing,omitempty"`
-	WriteBack        *WriteBack `json:"write_back,omitempty"`
+	ArtifactsMissing []string `json:"artifacts_missing,omitempty"`
+	// WriteBackError says the runner couldn't collect the job's edits (none were sent back).
+	WriteBackError string     `json:"write_back_error,omitempty"`
+	WriteBack      *WriteBack `json:"write_back,omitempty"`
 	// PeakMem is the job's peak memory use (cgroup memory.peak), once it has finished.
 	PeakMem int64 `json:"peak_mem,omitempty"`
 	// AutoMem is set when the runner chose the memory limit (from history or the profile)
@@ -159,6 +161,8 @@ type EnvDef struct {
 type GitRef struct {
 	Head   string `json:"head"`
 	Branch string `json:"branch,omitempty"`
+	// Tags reachable from Head (name -> object id), so `git describe` works on the runner.
+	Tags map[string]string `json:"tags,omitempty"`
 }
 
 // WriteBack lists what a finished job changed in its workspace. Paths are relative to the

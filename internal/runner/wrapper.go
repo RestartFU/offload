@@ -92,6 +92,7 @@ func RunExec(o ExecOptions) int {
 		wb, err := collectWriteBack(o.WriteBack, o.Record, filepath.Join(o.JobDir, "writeback.tar.gz"))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "offload: write-back: %v\n", err)
+			rec.WriteBackError = err.Error() // the client must not read "no edits" into this
 		}
 		rec.WriteBack = wb
 	}
@@ -451,7 +452,6 @@ func packArtifacts(dest string, paths []string) (missing []string, err error) {
 			if packed[path] {
 				return nil
 			}
-			packed[path] = true
 			info, err := root.Lstat(path)
 			if err != nil {
 				return err
@@ -459,6 +459,20 @@ func packArtifacts(dest string, paths []string) (missing []string, err error) {
 			link := ""
 			if info.Mode()&fs.ModeSymlink != 0 {
 				link, _ = root.Readlink(path) // stored as a link, never followed
+			}
+			// A regular file is opened before its header is written: one unreadable output
+			// must not leave a broken entry that spoils everything after it.
+			var src *os.File
+			if info.Mode().IsRegular() {
+				if src, err = root.Open(path); err != nil {
+					fmt.Fprintf(os.Stderr, "offload: artifact %s: %v\n", path, err)
+					missing = append(missing, path) // the rest still gets packed
+					return nil
+				}
+				defer src.Close()
+				if info, err = src.Stat(); err != nil {
+					return err
+				}
 			}
 			h, err := tar.FileInfoHeader(info, link)
 			if err != nil {
@@ -468,17 +482,12 @@ func packArtifacts(dest string, paths []string) (missing []string, err error) {
 			if err := tw.WriteHeader(h); err != nil {
 				return err
 			}
-			if info.Mode().IsRegular() {
-				src, err := root.Open(path)
-				if err != nil {
-					return err
-				}
-				_, err = io.CopyN(tw, src, info.Size())
-				src.Close()
-				if err != nil {
-					return err
+			if src != nil {
+				if _, err := io.CopyN(tw, src, info.Size()); err != nil {
+					return err // the archive itself is broken now: stop
 				}
 			}
+			packed[path] = true
 			found++
 			return nil
 		})

@@ -69,7 +69,11 @@ func (sl *slot) planData(manifest []api.FileEntry) (needed []string, changed boo
 			continue
 		}
 		if _, err := root.Lstat(p); err != nil {
-			needed = append(needed, p) // deleted on the runner: restore it
+			// Deleted on the runner: restore it, unless the runner replaced a directory above it
+			// with a file of its own (a migration): unchanged client data doesn't undo that.
+			if parentsState(root, p) != parentsAliased {
+				needed = append(needed, p)
+			}
 		}
 	}
 	// An interrupted apply may have left any marked path half-done: apply again to repair it.
