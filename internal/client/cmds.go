@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -258,15 +257,6 @@ func Pair(names []string, all bool, code string) error {
 		body := map[string]any{"hash": hex.EncodeToString(sum[:]), "code": code}
 		var out map[string]string
 		err := h.do(ctx, "POST", "/v1/admin/pair", body, &out)
-		var ae *APIError
-		if errors.As(err, &ae) && ae.Code == 403 && h.derived {
-			// Paired before per-runner tokens: authenticate once with the old shared token, which
-			// the runner then forgets.
-			legacy := *h
-			legacy.Token, legacy.derived = clientToken(), false
-			body["rotate"] = true
-			err = legacy.do(ctx, "POST", "/v1/admin/pair", body, &out)
-		}
 		if err != nil {
 			return fmt.Errorf("%s: %w", h.Name, err)
 		}
