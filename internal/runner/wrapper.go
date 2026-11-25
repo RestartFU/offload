@@ -135,7 +135,7 @@ func collectWriteBack(dir, recordPath, dest string) (*api.WriteBack, error) {
 			wb.Deleted = append(wb.Deleted, p)
 			continue
 		}
-		if !fi.Mode().IsRegular() || (fi.Size() == ent.Size && fi.ModTime().UnixNano() == ent.MTime) {
+		if !fi.Mode().IsRegular() || (fi.Size() == ent.Size && fi.ModTime().UnixNano() == ent.MTime && ctimeOf(fi) == ent.CTime) {
 			continue
 		}
 		h, err := fileHash(root, p)
@@ -148,7 +148,7 @@ func collectWriteBack(dir, recordPath, dest string) (*api.WriteBack, error) {
 			}
 			wb.Modified = append(wb.Modified, api.ChangedFile{Path: p, Hash: h, BaseHash: ent.Hash, Mode: uint32(fi.Mode().Perm()), Size: fi.Size()})
 		}
-		ent.Hash, ent.Size, ent.MTime, ent.Mode = h, fi.Size(), fi.ModTime().UnixNano(), uint32(fi.Mode().Perm())
+		ent.Hash, ent.Size, ent.MTime, ent.CTime, ent.Mode = h, fi.Size(), fi.ModTime().UnixNano(), ctimeOf(fi), uint32(fi.Mode().Perm())
 		rec.Files[p] = ent
 	}
 	if len(wb.Modified) > 0 {
@@ -253,8 +253,9 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	// Frames are "<seq> <len>\n<payload>" with seq > 0. A frame is acknowledged with "ok\n" once
-	// queued for the process (a duplicate seq, e.g. retried after a runner restart or a lost
+	// Frames are "<seq> <len>\n<payload>" with seq > 0. "ok\n" means queued for the process
+	// (delivery is asynchronous; a process that already closed stdin is reported as
+	// "stdin closed" from then on) (a duplicate seq, e.g. retried after a runner restart or a lost
 	// acknowledgement, is acknowledged and dropped); "busy\n" if the process isn't reading and
 	// the queue is full. lastSeq lives here, in the process that owns stdin.
 	var mu sync.Mutex

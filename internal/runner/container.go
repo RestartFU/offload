@@ -47,6 +47,7 @@ type envBuild struct {
 	logPath string
 	read    int64  // bytes of the log already copied to the waiters
 	slot    *slot  // the workspace a COPY/ADD build snapshots its context from
+	dir     string // this attempt's private directory
 	ctxRel  string // that context's directory in the workspace ("" = no context)
 }
 
@@ -87,9 +88,28 @@ func envPlan(def *api.EnvDef) (tag, containerfile, variant string) {
 	return imageRepo + "/env:" + h, cf, "e" + h[:8]
 }
 
+// usesContext reports whether a Containerfile reads the local build context: COPY/ADD without
+// --from (which reads another stage or image instead), or RUN with a bind mount of the context.
 func usesContext(cf string) bool {
-	re := regexp.MustCompile(`(?mi)^\s*(COPY|ADD)\s`)
-	return re.MatchString(cf)
+	for _, line := range strings.Split(cf, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		switch strings.ToUpper(f[0]) {
+		case "COPY", "ADD":
+			if !strings.Contains(line, "--from=") {
+				return true
+			}
+		case "RUN":
+			for _, w := range f[1:] {
+				if strings.HasPrefix(w, "--mount=") && strings.Contains(w, "type=bind") && !strings.Contains(w, "from=") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func podman(ctx context.Context, args ...string) (string, error) {
@@ -149,6 +169,9 @@ func (s *Server) build(b *envBuild, cf string) {
 	// build unit that outlived a runner restart, never shares files with another attempt.
 	dir := filepath.Join(s.cfg.StateDir, "envs", strings.ReplaceAll(strings.TrimPrefix(b.tag, imageRepo+"/"), ":", "-"), newID("a-"))
 	_ = os.MkdirAll(dir, 0o755)
+	s.mu.Lock()
+	b.dir = dir
+	s.mu.Unlock()
 	defer os.RemoveAll(dir)
 	b.logPath = filepath.Join(dir, "build.log")
 	_ = os.WriteFile(b.logPath, nil, 0o644)
@@ -325,15 +348,35 @@ func (s *Server) runBootstrap(tag, logPath string) error {
 	return os.WriteFile(s.bootstrapMarker(tag), nil, 0o644)
 }
 
-// cacheMounts are the shared toolchain/cache volumes every environment gets.
+// cacheMounts are the shared toolchain and cache volumes for the runner's own bootstrap step,
+// which installs toolchains: all writable.
 func (s *Server) cacheMounts() []string {
 	var out []string
-	for _, c := range []string{"rustup", "cargo", "go", "npm", "pip"} {
+	for _, c := range []string{"rustup", "cargo", "go", "npm"} {
 		dir := filepath.Join(s.cfg.StateDir, "cache", c)
 		_ = os.MkdirAll(dir, 0o755)
 		out = append(out, dir+":/opt/offload/"+c)
 	}
 	return out
+}
+
+// workloadMounts are the same volumes as jobs and sessions see them. Executables (rustup
+// toolchains, cargo and Go bin dirs, all first on PATH) are read-only, so no job can plant a
+// modified tool for a later job that runs with secrets. Dependency caches stay writable: cargo,
+// Go and npm verify what they take from them by checksum. (pip's cache doesn't, so it isn't shared.)
+func (s *Server) workloadMounts() []string {
+	cache := func(c string) string { return filepath.Join(s.cfg.StateDir, "cache", c) }
+	for _, d := range []string{"rustup", "cargo/bin", "go/bin", "npm"} {
+		_ = os.MkdirAll(cache(d), 0o755)
+	}
+	return []string{
+		cache("cargo") + ":/opt/offload/cargo",
+		cache("go") + ":/opt/offload/go",
+		cache("npm") + ":/opt/offload/npm",
+		cache("rustup") + ":/opt/offload/rustup:ro",
+		cache("cargo/bin") + ":/opt/offload/cargo/bin:ro", // over the writable cargo home
+		cache("go/bin") + ":/opt/offload/go/bin:ro",
+	}
 }
 
 // lastLines returns the last n lines of a file, reading at most its final 16 KiB.
@@ -480,7 +523,7 @@ func (s *Server) podmanRun(r runSpec) []string {
 		}
 	}
 	a = append(a, "-v", s.self+":"+s.self+":ro")
-	for _, m := range append(s.cacheMounts(), r.Volumes...) {
+	for _, m := range append(s.workloadMounts(), r.Volumes...) {
 		a = append(a, "-v", m)
 	}
 	for _, d := range r.Devices {
@@ -639,6 +682,19 @@ func (s *Server) loadImageUse() {
 // gcContainersLocked removes images unused for the retention period (never the current base)
 // and leftover containers of jobs that are no longer running.
 func (s *Server) gcContainersLocked() {
+	// Build attempt directories left by a runner that died mid-build (each holds a full context
+	// snapshot): drop those no running build owns once they're old enough to be abandoned.
+	active := map[string]bool{}
+	for _, b := range s.builds {
+		active[b.dir] = true
+	}
+	if dirs, err := filepath.Glob(filepath.Join(s.cfg.StateDir, "envs", "*", "a-*")); err == nil {
+		for _, d := range dirs {
+			if fi, err := os.Stat(d); err == nil && !active[d] && time.Since(fi.ModTime()) > 6*time.Hour {
+				_ = os.RemoveAll(d)
+			}
+		}
+	}
 	if !s.containersAvailable() {
 		return
 	}

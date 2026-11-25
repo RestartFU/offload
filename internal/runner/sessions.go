@@ -60,12 +60,7 @@ func (s *Server) restoreSessions() {
 		se.Attached = 0 // no client connection survives a runner restart
 		if !api.Terminal(se.State) {
 			se.LastSeen = time.Now()
-			if se.Proto < runnerProto {
-				// Started by an older runner: its stdin protocol and mounts differ. Stop it; the
-				// MCP client sees the session end and starts a new one.
-				se.Reason = "runner upgraded; start the session again"
-				stopUnit(se.Unit)
-			} else if se.Network == "client" {
+			if se.Network == "client" {
 				se.relay = newRelay() // sockets: ensureRelays
 			}
 			if c, ok := s.unitCPUs(se.dir); ok {
@@ -192,7 +187,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	se := &session{Session: api.Session{
 		ID: newID("s-"), Runner: s.cfg.Name, Profile: spec.Profile, State: api.StateRunning,
-		Resources: res, CreatedAt: now, LastSeen: now, Runtime: rt, Image: image, Proto: runnerProto,
+		Resources: res, CreatedAt: now, LastSeen: now, Runtime: rt, Image: image, Proto: api.Proto,
 	}}
 	if prof.Network == "client" {
 		if rt != "container" {
@@ -368,7 +363,7 @@ func (s *Server) handleSessionStdin(w http.ResponseWriter, r *http.Request) {
 	if se == nil {
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<20))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxStdinFrame)) // what the wrapper accepts
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -454,6 +449,9 @@ func sendFrame(c net.Conn, r *bufio.Reader, seq int64, body []byte) error {
 	}
 	return fmt.Errorf("wrapper: %s", strings.TrimSpace(ack))
 }
+
+// maxStdinFrame is the largest stdin message a session accepts (the wrapper queues at most this).
+const maxStdinFrame = 16 << 20
 
 var (
 	errBusy        = errors.New("busy")

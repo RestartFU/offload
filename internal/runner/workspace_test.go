@@ -242,3 +242,17 @@ func TestSessionFramesGapAndClosedStdin(t *testing.T) {
 		t.Fatalf("gap accepted: %v", err)
 	}
 }
+
+func TestUsesContext(t *testing.T) {
+	for cf, want := range map[string]bool{
+		"FROM offload/base\nCOPY . /src\n":                                     true,
+		"FROM a AS builder\nRUN make\nFROM b\nCOPY --from=builder /out /out\n": false,
+		"FROM b\nRUN --mount=type=bind,target=/src make -C /src\n":             true,
+		"FROM b\nRUN --mount=type=bind,from=builder,target=/x ls\n":            false,
+		"FROM offload/base\nRUN apt-get install -y jq\n":                       false,
+	} {
+		if got := usesContext(cf); got != want {
+			t.Errorf("usesContext(%q) = %v, want %v", cf, got, want)
+		}
+	}
+}

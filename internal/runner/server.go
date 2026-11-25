@@ -41,8 +41,8 @@ type Server struct {
 	features map[string]bool
 	history  map[string]*histEntry
 	wake     chan struct{}
-	legacy   map[string]bool // running jobs started by an older runner version
-	tz       string
+
+	tz string
 
 	builds      map[string]*envBuild // image tag -> build in progress
 	buildErrs   map[string]error     // last failed build per tag, reported to the next session
@@ -70,7 +70,6 @@ func New(cfg *Config, version string) (*Server, error) {
 		jobs: map[string]*job{}, sessions: map[string]*session{}, slots: map[string][]*slot{},
 		cpuUse: map[int]int{}, wake: make(chan struct{}, 1), whois: map[string]whoisEntry{},
 		builds: map[string]*envBuild{}, buildErrs: map[string]error{}, readyImages: map[string]bool{}, tz: hostTimezone(),
-		legacy: map[string]bool{},
 	}
 	ctrl := delegatedControllers()
 	s.features = map[string]bool{"cpuset": ctrl["cpuset"], "io": ctrl["io"], "memory": ctrl["memory"], "cpu": ctrl["cpu"]}
@@ -82,6 +81,7 @@ func New(cfg *Config, version string) (*Server, error) {
 	s.loadHistory()
 	s.loadImageUse()
 	s.restore()
+	s.retireOtherVersions()
 	return s, nil
 }
 
@@ -350,6 +350,7 @@ func (s *Server) status() api.Status {
 		Profiles: map[string]api.ProfileInfo{}, Persistent: s.cfg.persistent, Accepting: true,
 	}
 	st.Hostname, _ = os.Hostname()
+	st.Proto = api.Proto
 	st.OS, st.Arch, st.Runtime = runtime.GOOS, runtime.GOARCH, "host"
 	if s.containersAvailable() {
 		st.Runtime = "container"
@@ -390,9 +391,7 @@ func (s *Server) status() api.Status {
 	if st.MemAvailable < s.cfg.memReserve {
 		st.Accepting, st.Reason = false, "host memory below reserve"
 	}
-	if len(s.legacy) > 0 {
-		st.Accepting, st.Reason = false, "draining jobs started by an older runner version"
-	}
+
 	return st
 }
 
@@ -513,21 +512,18 @@ type idleBody struct {
 }
 
 func (b idleBody) Read(p []byte) (int, error) {
+	// Arm the idle deadline first, then check for cancellation: a DELETE arriving in between sets
+	// the deadline to now afterwards, so it can never be overwritten by this one.
+	_ = b.rc.SetReadDeadline(time.Now().Add(uploadIdle))
 	if b.stop != nil && b.stop() {
 		return 0, errors.New("cancelled")
 	}
-	_ = b.rc.SetReadDeadline(time.Now().Add(uploadIdle))
 	return b.r.Read(p)
 }
 
 func uploadBody(w http.ResponseWriter, r *http.Request, limit int64, stop func() bool) io.Reader {
 	return idleBody{r: http.MaxBytesReader(w, r.Body, limit), rc: http.NewResponseController(w), stop: stop}
 }
-
-// runnerProto versions how workloads are wired (mounts, relay sockets, the stdin wrapper
-// protocol). Workloads started by an older version are drained or stopped after an upgrade rather
-// than run side by side with new ones (their mounts expose more than current ones do).
-const runnerProto = 3
 
 // reply holds a handler's response until s.mu is released, so a client that stops reading can
 // never stall the scheduler while it holds the lock.

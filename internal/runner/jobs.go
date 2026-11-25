@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
 	"sort"
@@ -157,9 +159,6 @@ func (s *Server) restore() {
 				j.save()
 			}
 		case api.StateRunning:
-			if j.Proto < runnerProto {
-				s.legacy[j.ID] = true // admission waits until it has drained
-			}
 			if len(j.Spec.Relay) > 0 || j.Spec.Network == "client" {
 				// Its relay sockets are (re)created in its workload dir, still mounted in its
 				// container, by ensureRelays, which keeps retrying until they bind.
@@ -391,7 +390,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	j.Proto = runnerProto
+	j.Proto = api.Proto
 	if err := j.save(); err != nil {
 		if j.slot != nil {
 			s.releaseSlotLocked(j.slot, false)
@@ -549,19 +548,61 @@ func (s *Server) reapUploads() {
 	}
 }
 
+// retireOtherVersions stops, before the runner serves anything, every workload started by a
+// runner of another protocol version (their mounts and sockets differ and may expose more than
+// current ones), and removes offload containers that no current workload owns. Nothing from an
+// older version ever runs next to new work.
+func (s *Server) retireOtherVersions() {
+	live := map[string]bool{}
+	stop := func(unit string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		_ = exec.CommandContext(ctx, "systemctl", "--user", "stop", unit).Run() // waits for it
+	}
+	for _, j := range s.jobs {
+		if api.Terminal(j.State) {
+			continue
+		}
+		if j.State == api.StateRunning && j.Proto != api.Proto {
+			log.Printf("job %s: started by protocol %d, stopping it (runner speaks %d)", j.ID, j.Proto, api.Proto)
+			stop(j.Unit)
+			s.finishLocked(j, api.StateFailed, nil, "stopped: the runner was upgraded while it ran")
+			continue
+		}
+		live["offload-"+j.ID] = true
+	}
+	for _, se := range s.sessions {
+		if api.Terminal(se.State) {
+			continue
+		}
+		if se.Proto != api.Proto {
+			log.Printf("session %s: started by protocol %d, stopping it", se.ID, se.Proto)
+			stop(se.Unit)
+			s.finishSessionLocked(se, nil, "runner upgraded; start the session again")
+			continue
+		}
+		live["offload-"+se.ID] = true
+	}
+	if !s.containersAvailable() {
+		return
+	}
+	out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-[js]-", "--format", "{{.Names}}")
+	if err != nil {
+		return
+	}
+	for _, name := range strings.Fields(out) {
+		if !live[name] {
+			log.Printf("removing container %s: no current workload owns it", name)
+			_, _ = podman(context.Background(), "rm", "-f", name)
+		}
+	}
+}
+
 // admit starts queued jobs that fit, oldest first. Small jobs may pass a big one, unless the
 // big one has waited over two minutes (then nothing passes it, so it can't starve).
 func (s *Server) admit() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id := range s.legacy {
-		if j := s.jobs[id]; j == nil || api.Terminal(j.State) {
-			delete(s.legacy, id)
-		}
-	}
-	if len(s.legacy) > 0 {
-		return // workloads from an older runner version are still draining
-	}
 	var queued []*job
 	for _, j := range s.jobs {
 		if j.State == api.StateQueued && !j.cancel {

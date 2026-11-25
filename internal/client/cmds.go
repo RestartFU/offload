@@ -162,7 +162,7 @@ func Get(ref, dest string) error {
 
 // Upgrade pushes a binary (this one by default) to runners, which swap it in and restart; running
 // jobs continue. A runner of another OS/arch needs a matching build passed with --binary.
-func Upgrade(names []string, all bool, binary string) error {
+func Upgrade(names []string, all bool, binary string, force bool) error {
 	ctx := context.Background()
 	hosts, err := discover(ctx)
 	if err != nil {
@@ -192,6 +192,11 @@ func Upgrade(names []string, all bool, binary string) error {
 		if binary == "" && h.Status.OS != "" && (h.Status.OS != goruntime.GOOS || h.Status.Arch != goruntime.GOARCH) {
 			return fmt.Errorf("%s is %s/%s; build a matching binary (CGO_ENABLED=0 GOOS=%s GOARCH=%s go build) and pass --binary",
 				h.Name, h.Status.OS, h.Status.Arch, h.Status.OS, h.Status.Arch)
+		}
+		// A runner of another protocol version stops workloads started by its old version when it
+		// restarts: say so before doing it.
+		if busy := h.Status.Running + h.Status.Sessions; busy > 0 && h.Status.Proto != api.Proto && !force {
+			return fmt.Errorf("%s has %d running job(s)/session(s) that the upgrade would stop (protocol %d -> %d); wait, or pass --force", h.Name, busy, h.Status.Proto, api.Proto)
 		}
 		f, err := os.Open(self)
 		if err != nil {

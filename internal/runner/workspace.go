@@ -10,10 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/RestartFU/offload/internal/api"
@@ -51,6 +54,7 @@ type slotEntry struct {
 	Link  string `json:"link,omitempty"`
 	Size  int64  `json:"size"`
 	MTime int64  `json:"mtime"` // unix nanoseconds after we wrote it
+	CTime int64  `json:"ctime"` // inode change time: no job can set it back, unlike mtime
 }
 
 var keyRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
@@ -182,7 +186,7 @@ func (s *slot) plan(manifest []api.FileEntry) ([]string, error) {
 			continue
 		}
 		fi, err := root.Lstat(p)
-		if err != nil || !fi.Mode().IsRegular() || fi.Size() != old.Size || fi.ModTime().UnixNano() != old.MTime || !realParents(root, p) {
+		if err != nil || !fi.Mode().IsRegular() || fi.Size() != old.Size || fi.ModTime().UnixNano() != old.MTime || ctimeOf(fi) != old.CTime || !realParents(root, p) {
 			needed = append(needed, p)
 		}
 	}
@@ -205,6 +209,11 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		return err
 	}
 	defer root.Close()
+	if leftovers, _ := fs.Glob(root.FS(), ".offload-stage-*"); len(leftovers) > 0 { // from an interrupted apply
+		for _, l := range leftovers {
+			_ = root.RemoveAll(l)
+		}
+	}
 	want := map[string]api.FileEntry{}
 	for _, e := range manifest {
 		p, err := cleanRel(e.Path)
@@ -217,12 +226,35 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 	for _, p := range needed {
 		pending[p] = true
 	}
-	written := map[string]bool{}
-	if err := extract(root, upload, want, pending, written); err != nil {
+	// Stage the whole upload first; only a complete, verified upload changes the workspace.
+	stage := ".offload-stage-" + randomSuffix()
+	if err := root.Mkdir(stage, 0o700); err != nil {
+		return err
+	}
+	defer root.RemoveAll(stage)
+	staged, err := extract(root, upload, want, pending, stage)
+	if err != nil {
 		return err
 	}
 	for p := range pending {
-		return fmt.Errorf("upload is missing %q (and %d more)", p, len(pending)-1)
+		if staged[p] == "" {
+			return fmt.Errorf("upload is missing %q", p)
+		}
+	}
+	written := map[string]bool{}
+	for p, tmp := range staged {
+		if err := prepareParents(root, p); err != nil {
+			return err
+		}
+		if fi, err := root.Lstat(p); err == nil && !fi.Mode().IsRegular() {
+			if err := root.RemoveAll(p); err != nil {
+				return err
+			}
+		}
+		if err := root.Rename(tmp, p); err != nil {
+			return err
+		}
+		written[p] = true
 	}
 	// Only now, with the upload known complete, remove what left the manifest.
 	for p := range rec.Files {
@@ -274,7 +306,7 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 			ent.Hash = e.Hash
 		}
 		ent.Mode, ent.Link = e.Mode, ""
-		ent.Size, ent.MTime = fi.Size(), fi.ModTime().UnixNano()
+		ent.Size, ent.MTime, ent.CTime = fi.Size(), fi.ModTime().UnixNano(), ctimeOf(fi)
 		rec.Files[e.Path] = ent
 	}
 	s.LastUsed = time.Now()
@@ -293,63 +325,55 @@ func realParents(root *os.Root, rel string) bool {
 	return true
 }
 
-// extract writes the uploaded files (verifying each hash) through the confined root, each via an
-// exclusively created temporary file and an atomic rename.
-// Entries in the manifest but outside pending are read past and ignored.
-func extract(root *os.Root, upload io.Reader, want map[string]api.FileEntry, pending, written map[string]bool) error {
+// extract stages every requested file of the upload in a private directory inside the slot,
+// verifying each hash, and returns path -> staged file. Nothing in the workspace changes here:
+// applyMode renames the staged files into place only once the whole upload has arrived. Entries
+// in the manifest but not requested are read past and ignored.
+func extract(root *os.Root, upload io.Reader, want map[string]api.FileEntry, pending map[string]bool, stage string) (map[string]string, error) {
+	staged := map[string]string{}
 	if upload == nil {
-		return nil
+		return staged, nil
 	}
 	gz, err := gzip.NewReader(upload)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return nil
+			return staged, nil
 		}
-		return fmt.Errorf("upload: %w", err)
+		return nil, fmt.Errorf("upload: %w", err)
 	}
 	tr := tar.NewReader(gz)
-	for {
+	for n := 0; ; n++ {
 		h, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return nil
+			return staged, nil
 		}
 		if err != nil {
-			return fmt.Errorf("upload: %w", err)
+			return nil, fmt.Errorf("upload: %w", err)
 		}
 		p, err := cleanRel(h.Name)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		e, ok := want[p]
 		if !ok || e.Link != "" || h.Typeflag != tar.TypeReg {
-			return fmt.Errorf("upload: unexpected entry %q", h.Name)
+			return nil, fmt.Errorf("upload: unexpected entry %q", h.Name)
 		}
-		if !pending[p] {
-			// Not needed (anymore): read past it without touching the runner's copy.
+		if !pending[p] || staged[p] != "" {
 			if _, err := io.Copy(io.Discard, tr); err != nil {
-				return fmt.Errorf("upload: %w", err)
+				return nil, fmt.Errorf("upload: %w", err)
 			}
 			continue
 		}
-		if err := prepareParents(root, p); err != nil {
-			return err
+		tmp := path.Join(stage, strconv.Itoa(n))
+		if err := stageFile(root, tmp, tr, os.FileMode(e.Mode).Perm(), e.Hash, p); err != nil {
+			return nil, err
 		}
-		if fi, err := root.Lstat(p); err == nil && !fi.Mode().IsRegular() {
-			if err := root.RemoveAll(p); err != nil {
-				return err
-			}
-		}
-		if err := writeConfined(root, p, tr, os.FileMode(e.Mode).Perm(), e.Hash); err != nil {
-			return err
-		}
-		delete(pending, p)
-		written[p] = true
+		staged[p] = tmp
 	}
 }
 
-// writeConfined writes r to rel inside root via a fresh temporary file, checking its sha256.
-func writeConfined(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHash string) error {
-	tmp := path.Join(path.Dir(rel), ".offload-"+randomSuffix())
+// stageFile writes r to the new file tmp inside root, checking its sha256 and setting its mode.
+func stageFile(root *os.Root, tmp string, r io.Reader, mode os.FileMode, wantHash, name string) error {
 	f, err := root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -360,18 +384,36 @@ func writeConfined(root *os.Root, rel string, r io.Reader, mode os.FileMode, wan
 		err = cerr
 	}
 	if err == nil && hex.EncodeToString(hash.Sum(nil)) != wantHash {
-		err = fmt.Errorf("upload: %s: hash mismatch", rel)
+		err = fmt.Errorf("upload: %s: hash mismatch", name)
 	}
 	if err == nil {
 		err = root.Chmod(tmp, mode)
-	}
-	if err == nil {
-		err = root.Rename(tmp, rel)
 	}
 	if err != nil {
 		_ = root.Remove(tmp)
 	}
 	return err
+}
+
+// writeConfined writes r to rel inside root via a fresh temporary file, checking its sha256.
+func writeConfined(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHash string) error {
+	tmp := path.Join(path.Dir(rel), ".offload-"+randomSuffix())
+	if err := stageFile(root, tmp, r, mode, wantHash, rel); err != nil {
+		return err
+	}
+	if err := root.Rename(tmp, rel); err != nil {
+		_ = root.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// ctimeOf returns a file's inode change time in nanoseconds (0 if unavailable).
+func ctimeOf(fi os.FileInfo) int64 {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return st.Ctim.Nano()
+	}
+	return 0
 }
 
 func randomSuffix() string {

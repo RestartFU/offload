@@ -129,15 +129,6 @@ func localSocket() string {
 // vetted: a redirect is returned as an error, never followed.
 func noRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
-// legacyLocalSocket is where local runners listened before their socket moved to offload-admin.
-func legacyLocalSocket() string {
-	p := filepath.Join(filepath.Dir(filepath.Dir(localSocket())), "offload", "runner.sock")
-	if fi, err := os.Stat(p); err == nil && fi.Mode()&os.ModeSocket != 0 {
-		return p
-	}
-	return ""
-}
-
 func newHost(name, url, token string, prio int) *Host {
 	h := &Host{Name: name, URL: strings.TrimRight(url, "/"), Token: token, Priority: prio}
 	if sock, ok := strings.CutPrefix(url, "unix://"); ok {
@@ -255,8 +246,6 @@ func Discover(ctx context.Context, cfg *Config) []*Host {
 	if cfg.Local == nil || *cfg.Local {
 		if _, err := os.Stat(localSocket()); err == nil {
 			fixed = append(fixed, newHost("local", "unix://"+localSocket(), "", -10))
-		} else if old := legacyLocalSocket(); old != "" {
-			fixed = append(fixed, newHost("local", "unix://"+old, "", -10)) // a runner from before the move, so it can be upgraded
 		}
 	}
 	scan := cfg.Discover == nil || *cfg.Discover
@@ -430,6 +419,10 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 	bestScore := -1e18
 	var reasons []string
 	for _, h := range hosts {
+		if err := checkProto(h); err != nil {
+			reasons = append(reasons, err.Error())
+			continue
+		}
 		st := h.Status
 		r := want
 		if p, ok := st.Profiles[profile]; profile != "" {
@@ -489,6 +482,14 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 }
 
 // FindHost returns the named runner from hosts.
+// checkProto refuses a runner of another protocol version: mixing versions is never safe.
+func checkProto(h *Host) error {
+	if h.Status != nil && h.Status.Proto != api.Proto {
+		return fmt.Errorf("runner %s speaks protocol %d, this client %d: run `offload host upgrade %s`", h.Name, h.Status.Proto, api.Proto, h.Name)
+	}
+	return nil
+}
+
 func FindHost(hosts []*Host, name string) (*Host, error) {
 	for _, h := range hosts {
 		if strings.EqualFold(h.Name, name) || (h.Status != nil && strings.EqualFold(h.Status.Hostname, name)) {

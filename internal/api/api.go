@@ -6,6 +6,11 @@ import "time"
 // DefaultPort is the TCP port a runner listens on inside the tailnet.
 const DefaultPort = 7420
 
+// Proto versions the runner protocol and how workloads are wired (mounts, relay sockets, the
+// stdin wrapper). A client only uses runners of its own version (`offload host upgrade` brings
+// them in line), and a runner stops workloads started by another version when it starts.
+const Proto = 4
+
 // Job states.
 const (
 	StateUploading = "uploading" // waiting for the client to send changed source files
@@ -248,6 +253,7 @@ type Status struct {
 	Images       int                    `json:"images,omitempty"`
 	Features     []string               `json:"features"` // cgroup controllers in use: cpuset, io…
 	Accepting    bool                   `json:"accepting"`
+	Proto        int                    `json:"proto"`
 	Reason       string                 `json:"reason,omitempty"`
 }
 

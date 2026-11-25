@@ -3,12 +3,15 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/RestartFU/offload/internal/api"
 	"github.com/RestartFU/offload/internal/streamio"
 )
 
@@ -46,6 +49,38 @@ func dnsSearch() []string {
 	return out
 }
 
+var tailnetRanges = []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("fd7a:115c:a1e0::/48")}
+
+// blockedTarget refuses connections a job must never make with this machine's identity: any
+// runner's API (the tailnet runner port, or a configured runner URL), which would otherwise accept
+// the job as the user who owns this laptop. Everything else goes through.
+func blockedTarget(target string, cfg *Config) string {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return "bad address"
+	}
+	runnerPort := fmt.Sprint(api.DefaultPort)
+	if cfg != nil && cfg.Port != 0 {
+		runnerPort = fmt.Sprint(cfg.Port)
+	}
+	if ip, err := netip.ParseAddr(host); err == nil && port == runnerPort {
+		ip = ip.Unmap()
+		for _, p := range tailnetRanges {
+			if p.Contains(ip) {
+				return "refused: jobs can't reach offload runners through this machine"
+			}
+		}
+	}
+	if cfg != nil {
+		for _, hc := range cfg.Hosts {
+			if u := strings.TrimPrefix(strings.TrimPrefix(hc.URL, "http://"), "https://"); strings.TrimRight(u, "/") == target {
+				return "refused: jobs can't reach offload runners through this machine"
+			}
+		}
+	}
+	return ""
+}
+
 // localResolver is the first nameserver in /etc/resolv.conf (e.g. systemd-resolved, which also
 // answers tailnet names).
 func localResolver() string {
@@ -61,7 +96,7 @@ func localResolver() string {
 }
 
 // serveDial handles one dial request and returns the callback answer ("ok" or the error).
-func serveDial(ctx context.Context, h *Host, data []byte) string {
+func serveDial(ctx context.Context, h *Host, data []byte, cfg *Config) string {
 	var req struct {
 		Stream string `json:"stream"`
 		Proto  string `json:"proto"`
@@ -71,13 +106,16 @@ func serveDial(ctx context.Context, h *Host, data []byte) string {
 		return "bad request"
 	}
 	target := mapAddr(req.Proto, req.Addr)
+	if why := blockedTarget(target, cfg); why != "" {
+		return why
+	}
 	var conn net.Conn
 	var err error
 	switch req.Proto {
 	case "tcp":
-		conn, err = net.DialTimeout("tcp", target, 10*time.Second)
+		conn, err = (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", target)
 	case "udp":
-		conn, err = net.Dial("udp", target)
+		conn, err = (&net.Dialer{}).DialContext(ctx, "udp", target)
 	default:
 		return "unsupported protocol"
 	}

@@ -93,6 +93,9 @@ func MCP(o MCPOptions) error {
 	} else {
 		h, err = Pick(hosts, res, profile, "", "session")
 	}
+	if err == nil {
+		err = checkProto(h)
+	}
 	if err != nil {
 		return err
 	}
@@ -208,6 +211,9 @@ func pumpIn(ctx context.Context, h *Host, id string, in io.Reader) error {
 	var seq int64
 	for {
 		line, err := r.ReadBytes('\n')
+		if len(line) > 16<<20 {
+			return fmt.Errorf("an MCP message of %d bytes is over the 16 MiB a session accepts", len(line))
+		}
 		if len(line) > 0 {
 			seq++
 			if serr := sendStdin(ctx, h, id, seq, line); serr != nil {

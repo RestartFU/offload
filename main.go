@@ -279,8 +279,9 @@ func cmdHost(args []string) error {
 	fs := flag.NewFlagSet("upgrade", flag.ExitOnError)
 	all := fs.Bool("all", false, "upgrade every runner")
 	binary := fs.String("binary", "", "binary to push (default: this one)")
+	force := fs.Bool("force", false, "upgrade even if it stops running work")
 	_ = fs.Parse(args[1:])
-	return client.Upgrade(fs.Args(), *all, *binary)
+	return client.Upgrade(fs.Args(), *all, *binary, *force)
 }
 
 func cmdEnv(args []string) (int, error) {

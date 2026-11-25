@@ -238,6 +238,10 @@ func resolveSecrets(cfg *Config, sets, args []string, withAuto, quiet bool) (map
 // allow lists the callback kinds this workload enabled ("dial", "ssh-agent", "git-credential");
 // anything else is refused here too, whatever the runner forwards.
 func serveCallbacks(ctx context.Context, h *Host, base string, cfg *Config, quiet bool, allow map[string]bool) {
+	// Everything dispatched below (key prompts, credential helpers, dials) is cancelled when the
+	// workload ends (the poll returns) or the caller stops serving it.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	var once sync.Map
 	announce := func(key, msg string) {
 		if _, loaded := once.LoadOrStore(key, true); !loaded {
@@ -285,10 +289,10 @@ func serveCallbacks(ctx context.Context, h *Host, base string, cfg *Config, quie
 			}
 			switch cb.Kind {
 			case "dial":
-				answer = []byte(serveDial(ctx, h, cb.Data))
+				answer = []byte(serveDial(ctx, h, cb.Data, cfg))
 				announce("net", "the job's network goes through this machine")
 			case "ssh-agent":
-				answer = agentRequest(cb.Data)
+				answer = agentRequest(ctx, cb.Data)
 				announce("ssh", "the job is using this machine's ssh-agent")
 			case "git-credential":
 				req, err := parseCredentialRequest(cb.Data)
@@ -296,7 +300,7 @@ func serveCallbacks(ctx context.Context, h *Host, base string, cfg *Config, quie
 				if err != nil {
 					announce("git-bad", "refused a malformed git credential request: "+err.Error())
 				} else if allowedHost(cfg.Credentials.GitHosts, host) {
-					answer = gitCredentialFill(req.canonical())
+					answer = gitCredentialFill(ctx, req.canonical())
 					if len(answer) > 0 {
 						announce("git:"+host, "lent git credentials for "+host+" to the job")
 					}
@@ -310,17 +314,19 @@ func serveCallbacks(ctx context.Context, h *Host, base string, cfg *Config, quie
 }
 
 // agentRequest forwards one framed SSH agent message to the local agent.
-func agentRequest(msg []byte) []byte {
+func agentRequest(ctx context.Context, msg []byte) []byte {
 	sock := os.Getenv("SSH_AUTH_SOCK")
 	if sock == "" {
 		return nil
 	}
-	c, err := net.DialTimeout("unix", sock, 5*time.Second)
+	d := net.Dialer{Timeout: 5 * time.Second}
+	c, err := d.DialContext(ctx, "unix", sock)
 	if err != nil {
 		return nil
 	}
 	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(2 * time.Minute)) // hardware keys may need a touch
+	defer context.AfterFunc(ctx, func() { c.Close() })() // the workload ended: abandon the request
+	_ = c.SetDeadline(time.Now().Add(2 * time.Minute))   // hardware keys may need a touch
 	if _, err := c.Write(msg); err != nil {
 		return nil
 	}
@@ -424,8 +430,8 @@ func allowedHost(allow []string, host string) bool {
 }
 
 // gitCredentialFill asks this machine's git for a credential, never prompting.
-func gitCredentialFill(req []byte) []byte {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func gitCredentialFill(ctx context.Context, req []byte) []byte {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "credential", "fill")
 	cmd.Stdin = bytes.NewReader(req)

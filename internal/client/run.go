@@ -201,6 +201,9 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 		if err != nil {
 			return nil, j, err
 		}
+		if err := checkProto(h); err != nil { // also for --on
+			return nil, j, err
+		}
 		err = h.do(ctx, "POST", "/v1/jobs", spec, &j)
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Code == 409 {
@@ -488,7 +491,7 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, quiet
 		}
 		// Replace only if the local file is still exactly what was hashed: same file, mode and
 		// content, re-checked right before the rename. Otherwise the job's version is kept next
-		// to it as <file>.offload-incoming, never silently dropped or written over an edit.
+		// to it as <file>.offload-incoming[.N], never silently dropped or written over an edit.
 		unchanged := func() bool {
 			now, err := tree.Lstat(c.Path)
 			if err != nil || !os.SameFile(before, now) || now.Mode() != before.Mode() {
@@ -498,8 +501,9 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, quiet
 			return err == nil && h == c.BaseHash
 		}
 		if err := writeInIf(tree, c.Path, tr, os.FileMode(c.Mode).Perm(), c.Hash, unchanged); err != nil {
-			if errors.Is(err, errChangedLocally) {
-				skipped = append(skipped, c.Path+" (job's version: "+c.Path+".offload-incoming)")
+			var ce *conflictError
+			if errors.As(err, &ce) {
+				skipped = append(skipped, c.Path+" (job's version: "+ce.saved+")")
 				continue
 			}
 			return err
@@ -558,6 +562,12 @@ func realParents(root *os.Root, rel string) bool {
 
 var errChangedLocally = errors.New("changed locally")
 
+// conflictError means the local file changed during write-back; the job's version is at saved.
+type conflictError struct{ saved string }
+
+func (e *conflictError) Error() string { return "changed locally; job's version saved as " + e.saved }
+func (e *conflictError) Unwrap() error { return errChangedLocally }
+
 // mkdirReal creates dir (and its parents) inside root, refusing any existing component that is
 // not a real directory (a symlink there would alias another path).
 func mkdirReal(root *os.Root, dir string) error {
@@ -609,11 +619,19 @@ func writeInIf(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHas
 		err = root.Chmod(tmp, mode)
 	}
 	if err == nil && still != nil && !still() {
-		// Keep the incoming content beside the local file instead of discarding it.
-		if root.Rename(tmp, rel+".offload-incoming") == nil {
-			return errChangedLocally
+		// Keep the incoming content beside the local file instead of discarding it, under a name
+		// no existing file has (hard links never replace anything).
+		err = fmt.Errorf("%w; could not save the job's version beside it", errChangedLocally)
+		for i := 0; i < 100; i++ {
+			name := rel + ".offload-incoming"
+			if i > 0 {
+				name = fmt.Sprintf("%s.%d", name, i)
+			}
+			if root.Link(tmp, name) == nil {
+				err = &conflictError{saved: name}
+				break
+			}
 		}
-		err = errChangedLocally
 	}
 	if err == nil {
 		err = root.Rename(tmp, rel)
