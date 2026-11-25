@@ -107,6 +107,12 @@ func (s *Server) gitReceive(ctx context.Context, key, head, bundle string) error
 	if _, err := gitCmdCtx(ctx, shared, "bundle", "verify", "-q", bundle); err != nil {
 		return err
 	}
+	// The store's tag refs only carry tag objects in; the slot gets the client's names. Clear
+	// them first, so a renamed tag (release -> release/v2) can't block the fetch. The objects
+	// stay (nothing prunes them), and missingObjects looks at objects, not refs.
+	if refs, err := gitCmdCtx(ctx, shared, "for-each-ref", "--format=delete %(refname)", "refs/tags"); err == nil && refs != "" {
+		_, _ = gitCmdIn(ctx, shared, refs+"\n", "update-ref", "--stdin")
+	}
 	// HEAD is in the bundle unless the store already had it (then only tags are new).
 	refspecs := []string{"+refs/tags/*:refs/tags/*"}
 	if heads, err := gitCmdCtx(ctx, shared, "bundle", "list-heads", bundle); err == nil {

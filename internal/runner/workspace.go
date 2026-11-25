@@ -148,11 +148,14 @@ func (s *slot) openTree() (*os.Root, error) {
 
 // prepareParents makes every parent of rel a real directory, replacing files or symlinks that
 // stand where a directory must be.
-func prepareParents(root *os.Root, rel string) error { return prepareParentsMode(root, rel, false) }
+func prepareParents(root *os.Root, rel string) error {
+	return prepareParentsTracked(root, rel, false, nil)
+}
 
-// prepareParentsMode makes rel's parents real directories. In a data set (keepRunner) a file the
-// runner put where a directory belongs is moved aside, not deleted.
-func prepareParentsMode(root *os.Root, rel string, keepRunner bool) error {
+// prepareParentsTracked makes rel's parents real directories. In a data set (keepRunner) a file
+// the runner put where a directory belongs is moved aside, not deleted, and recorded in
+// displaced (everything the client has below it must then be reinstalled).
+func prepareParentsTracked(root *os.Root, rel string, keepRunner bool, displaced map[string]bool) error {
 	parts := strings.Split(rel, "/")
 	for i := 1; i < len(parts); i++ {
 		dir := strings.Join(parts[:i], "/")
@@ -171,6 +174,9 @@ func prepareParentsMode(root *os.Root, rel string, keepRunner bool) error {
 					return err
 				}
 				log.Printf("data set: the runner's file %s is in the way of the client's directory; kept as %s", dir, aside)
+				if displaced != nil {
+					displaced[dir] = true
+				}
 			} else if err := root.RemoveAll(dir); err != nil { // removes a symlink itself, never its target
 				return err
 			}
@@ -307,19 +313,27 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 	written := map[string]bool{}
 	// Directories the client replaced by a file or symlink are moved aside first (in a data
 	// set), before anything below them is deleted: they may hold what only the runner has.
+	// clientChanged is whether the client's entry differs from what was last synced: only then
+	// does a data set's runner-side state at that path give way (displacement and apply agree).
+	clientChanged := func(p string, e api.FileEntry) bool {
+		old, had := rec.Files[p]
+		return staged[p] != "" || dirtyBefore[p] || !had || old.Link != e.Link
+	}
+	displaced := map[string]bool{} // data set: directories moved aside to make way (see below)
 	if keepRunner {
 		for p, e := range want {
 			if fi, err := root.Lstat(p); err == nil && fi.IsDir() && parentsState(root, p) == parentsReal {
-				if e.Link != "" || staged[p] != "" {
+				if (e.Link != "" || staged[p] != "") && clientChanged(p, e) {
 					if err := clearForReplacement(root, p, fi, true); err != nil {
 						return err
 					}
+					displaced[p] = true
 				}
 			}
 		}
 	}
 	for p, tmp := range staged {
-		if err := prepareParentsMode(root, p, keepRunner); err != nil {
+		if err := prepareParentsTracked(root, p, keepRunner, displaced); err != nil {
 			return err
 		}
 		if fi, err := root.Lstat(p); err == nil && !fi.Mode().IsRegular() {
@@ -382,10 +396,10 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 	}
 	for _, e := range manifest {
 		old, had := rec.Files[e.Path]
-		if keepRunner && had && !written[e.Path] && !dirtyBefore[e.Path] && old.Link == e.Link && (e.Link != "" || (old.Hash == e.Hash && old.Mode == e.Mode)) {
+		if keepRunner && had && !written[e.Path] && !dirtyBefore[e.Path] && !underAny(e.Path, displaced) && old.Link == e.Link && (e.Link != "" || (old.Hash == e.Hash && old.Mode == e.Mode)) {
 			continue // unchanged on the client: leave the runner's copy alone
 		}
-		if err := prepareParentsMode(root, e.Path, keepRunner); err != nil {
+		if err := prepareParentsTracked(root, e.Path, keepRunner, displaced); err != nil {
 			return fmt.Errorf("%s: %w", e.Path, err)
 		}
 		if e.Link != "" {
@@ -430,6 +444,16 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 	sort.Strings(stillDirty)
 	rec.Dirty, rec.Stages = stillDirty, nil
 	return s.save(rec)
+}
+
+// underAny reports whether p is below (or is) one of dirs.
+func underAny(p string, dirs map[string]bool) bool {
+	for d := p; d != "." && d != "/" && d != ""; d = path.Dir(d) {
+		if dirs[d] {
+			return true
+		}
+	}
+	return false
 }
 
 // clearForReplacement makes way for a file or symlink at p. In a data set (keepRunner) a

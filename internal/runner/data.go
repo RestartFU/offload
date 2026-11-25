@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/RestartFU/offload/internal/api"
@@ -77,6 +78,32 @@ func (sl *slot) planData(manifest []api.FileEntry) (needed []string, changed boo
 		}
 	}
 	// An interrupted apply may have left any marked path half-done: apply again to repair it.
+	// A file the client changed below an ancestor the runner turned into a file: apply moves
+	// that file aside and recreates the directory, so everything the client has below it must
+	// come along, not only the changed file.
+	aliased := map[string]bool{}
+	for _, p := range needed {
+		parts := strings.Split(p, "/")
+		for i := 1; i < len(parts); i++ {
+			anc := strings.Join(parts[:i], "/")
+			if fi, err := root.Lstat(anc); err == nil && !fi.IsDir() {
+				aliased[anc] = true
+				break
+			}
+		}
+	}
+	if len(aliased) > 0 {
+		have := map[string]bool{}
+		for _, p := range needed {
+			have[p] = true
+		}
+		for _, e := range manifest {
+			if e.Link == "" && !have[e.Path] && underAny(e.Path, aliased) {
+				needed = append(needed, e.Path)
+				have[e.Path] = true
+			}
+		}
+	}
 	return needed, changed || len(needed) > 0 || len(rec.Dirty) > 0, nil
 }
 

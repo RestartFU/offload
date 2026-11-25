@@ -100,6 +100,16 @@ pick:
 				avail = append(avail, x)
 			}
 		}
+		if len(avail) == 0 && len(excluded) > 0 { // every runner was full: wait, then a fresh round
+			fmt.Fprintf(os.Stderr, "offload: every runner is full right now; waiting\n")
+			select {
+			case <-ctx.Done():
+				return interrupted(o)
+			case <-time.After(5 * time.Second):
+			}
+			excluded = map[string]bool{}
+			continue
+		}
 		hosts = avail
 		if on != "" {
 			h, err = FindHost(hosts, on)
@@ -158,10 +168,19 @@ pick:
 				}
 				continue
 			}
-			if errors.As(err, &ae) && ae.Code == 503 && on == "" {
-				// Full right now (capacity, session limit, upgrading): try the next runner.
-				fmt.Fprintf(os.Stderr, "offload: %s: %s; trying another runner\n", h.Name, ae.Msg)
-				excluded[h.URL] = true
+			if errors.As(err, &ae) && ae.Code == 503 {
+				// Full right now (capacity, session limit, upgrading): try the next runner, or
+				// with --on wait for this one.
+				fmt.Fprintf(os.Stderr, "offload: %s: %s\n", h.Name, ae.Msg)
+				if on == "" {
+					excluded[h.URL] = true
+				} else {
+					select {
+					case <-ctx.Done():
+						return interrupted(o)
+					case <-time.After(5 * time.Second):
+					}
+				}
 				continue pick
 			}
 			if err != nil {

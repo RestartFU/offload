@@ -45,7 +45,12 @@ func LoadWorkspace(cwd string) (*Workspace, error) {
 	var files []string
 	if top, err := git(cwd, "rev-parse", "--show-toplevel"); err == nil {
 		ws.Root, ws.GitTree = strings.TrimSpace(top), true
-		if head, err := git(ws.Root, "rev-parse", "--verify", "-q", "HEAD"); err == nil {
+		shallow, _ := git(ws.Root, "rev-parse", "--is-shallow-repository")
+		if strings.TrimSpace(shallow) == "true" {
+			// A bundle of a shallow clone can't be fetched into an empty store (its boundary
+			// parents are missing): sync the files and say why .git stays behind.
+			logf(false, "shallow clone: the job runs without .git (deepen it with `git fetch --unshallow` to send history)")
+		} else if head, err := git(ws.Root, "rev-parse", "--verify", "-q", "HEAD"); err == nil {
 			ws.Git = &api.GitRef{Head: strings.TrimSpace(head)}
 			if br, err := git(ws.Root, "symbolic-ref", "-q", "--short", "HEAD"); err == nil {
 				ws.Git.Branch = strings.TrimSpace(br)

@@ -434,3 +434,29 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 		}
 	}
 }
+
+func TestDataSetKeepsRunnerMigratedDirectory(t *testing.T) {
+	dir := t.TempDir()
+	sl := &slot{Key: "d", Index: 0, Dir: filepath.Join(dir, "0")}
+	os.MkdirAll(sl.Dir, 0o755)
+	s1, s1b := entry("settings.json", "{}")
+	m := []api.FileEntry{s1, {Path: "current", Link: "v1", Mode: 0o777}}
+	need, _, _ := sl.planData(m)
+	if err := sl.applyMode(m, need, tarOf(t, map[string][]byte{"settings.json": s1b}, need), true); err != nil {
+		t.Fatal(err)
+	}
+	// A session turns the synced link into a real directory holding its state.
+	os.Remove(filepath.Join(sl.Dir, "current"))
+	os.MkdirAll(filepath.Join(sl.Dir, "current"), 0o755)
+	os.WriteFile(filepath.Join(sl.Dir, "current", "state.db"), []byte("runner only"), 0o644)
+	// The client changes only settings.json.
+	s2, s2b := entry("settings.json", `{"x":1}`)
+	m2 := []api.FileEntry{s2, {Path: "current", Link: "v1", Mode: 0o777}}
+	need, _, _ = sl.planData(m2)
+	if err := sl.applyMode(m2, need, tarOf(t, map[string][]byte{"settings.json": s2b}, need), true); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(sl.Dir, "current", "state.db")); err != nil || string(b) != "runner only" {
+		t.Fatalf("runner state lost: %q %v", b, err)
+	}
+}

@@ -168,23 +168,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		out.err(503, "runner is upgrading; try again in a few seconds")
 		return
 	}
-	image := ""
-	if rt == "container" {
-		tag, ready, err := s.sessionImageLocked(def)
-		if err != nil {
-			out.err(500, "environment build failed: "+err.Error())
-			return
-		}
-		if !ready {
-			msg := "building environment " + strings.TrimPrefix(tag, imageRepo+"/") + "; retry shortly"
-			if s.builds[tag] == nil {
-				msg = "waiting for memory to build environment " + strings.TrimPrefix(tag, imageRepo+"/") + "; retry shortly"
-			}
-			out.err(http.StatusConflict, msg)
-			return
-		}
-		image = tag
-	}
+	// Capacity first: a full runner says so at once (503), and the client tries another.
 	live := 0
 	for _, x := range s.sessions {
 		if !api.Terminal(x.State) {
@@ -198,6 +182,23 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if ok, why := s.fitsLocked(res); !ok {
 		out.err(http.StatusServiceUnavailable, "no capacity: "+why)
 		return
+	}
+	image := ""
+	if rt == "container" {
+		tag, ready, err := s.sessionImageLocked(def)
+		if err != nil {
+			out.err(500, "environment build failed: "+err.Error())
+			return
+		}
+		if !ready {
+			if s.builds[tag] == nil { // no room to build it here now: another runner may have
+				out.err(http.StatusServiceUnavailable, "no memory free to build environment "+strings.TrimPrefix(tag, imageRepo+"/"))
+				return
+			}
+			out.err(http.StatusConflict, "building environment "+strings.TrimPrefix(tag, imageRepo+"/")+"; retry shortly")
+			return
+		}
+		image = tag
 	}
 	now := time.Now()
 	se := &session{Session: api.Session{

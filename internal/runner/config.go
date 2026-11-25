@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -213,10 +214,15 @@ func (c *Config) finish() error {
 	if c.buildMem, err = units.ParseSize(c.Container.BuildMem); err != nil {
 		return err
 	}
-	// A build must fit the budget it is counted in: the slice, and the host minus its reserve.
+	// A build must fit the budget it is counted in: the slice, and what the host can really
+	// spare above its reserve (the kernel and services use some of MemTotal; half of what's
+	// left over the reserve is a limit an idle host can always admit).
 	limit := c.memCap
-	if total := meminfo("MemTotal"); total > c.memReserve && total-c.memReserve < limit {
-		limit = total - c.memReserve
+	if total := meminfo("MemTotal"); total > c.memReserve && (total-c.memReserve)/2 < limit {
+		limit = (total - c.memReserve) / 2
+	}
+	if c.buildMem > limit {
+		log.Printf("container.build_mem %s can never be admitted on this host; using %s", units.FormatSize(c.buildMem), units.FormatSize(limit))
 	}
 	if c.buildMem == 0 || c.buildMem > limit {
 		c.buildMem = min(8<<30, limit)

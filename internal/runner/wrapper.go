@@ -133,6 +133,12 @@ func collectWriteBack(dir, recordPath, dest string) (*api.WriteBack, error) {
 		if ent.Link != "" {
 			continue
 		}
+		// Through real directories only: a parent the job replaced with a symlink would make
+		// this read some other file's bytes for p. Behind such a parent, p is gone.
+		if parentsState(root, p) != parentsReal {
+			wb.Deleted = append(wb.Deleted, p)
+			continue
+		}
 		fi, err := root.Lstat(p)
 		if err != nil {
 			wb.Deleted = append(wb.Deleted, p)
@@ -455,6 +461,12 @@ func packArtifacts(dest string, paths []string) (missing []string, err error) {
 			info, err := root.Lstat(path)
 			if err != nil {
 				return err
+			}
+			if t := info.Mode().Type(); t != 0 && t != fs.ModeDir && t != fs.ModeSymlink {
+				// Sockets, FIFOs, devices can't be artifacts: say so, keep packing the rest.
+				fmt.Fprintf(os.Stderr, "offload: artifact %s: not a file, directory or symlink\n", path)
+				missing = append(missing, path)
+				return nil
 			}
 			link := ""
 			if info.Mode()&fs.ModeSymlink != 0 {

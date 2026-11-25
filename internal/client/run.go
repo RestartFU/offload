@@ -479,6 +479,11 @@ func startCallbacks(ctx context.Context, h *Host, j api.Job, cfg *Config, quiet 
 	go serveCallbacks(ctx, h, "/v1/jobs/"+j.ID, cfg, quiet, allow)
 }
 
+// collectError is the runner failing to collect a job's edits: final, attach can't fix it.
+type collectError struct{ msg string }
+
+func (e *collectError) Error() string { return "the runner couldn't collect the job's edits: " + e.msg }
+
 // baseline is what a job was sent, kept until its write-back is applied (by `run` when it sees
 // the job finish, or later by `offload attach`).
 type baseline struct {
@@ -555,8 +560,14 @@ func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, 
 	// the baseline for its root, lock, and read it again under both locks.
 	if !checkoutLocked {
 		bl, err := readBaseline()
-		if bl == nil || err != nil {
+		if err != nil {
 			return err
+		}
+		if bl == nil {
+			if j.WriteBackError != "" {
+				return &collectError{j.WriteBackError}
+			}
+			return nil
 		}
 		unlockCheckout, err := lockFile(checkoutLock(bl.Root))
 		if err != nil {
@@ -570,15 +581,21 @@ func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, 
 	}
 	defer unlock()
 	bl, err := readBaseline()
-	if bl == nil || err != nil {
+	if err != nil {
 		return err
+	}
+	if bl == nil { // applied (or forgotten) already; a collection failure is still a failure
+		if j.WriteBackError != "" {
+			return &collectError{j.WriteBackError}
+		}
+		return nil
 	}
 	if j.WriteBack == nil { // finished with nothing to write back (or cancelled): just forget it
 		if err := os.Remove(baselinePath(j.ID)); err != nil {
 			return err
 		}
 		if j.WriteBackError != "" {
-			return fmt.Errorf("the runner couldn't collect the job's edits: %s", j.WriteBackError)
+			return &collectError{j.WriteBackError}
 		}
 		return nil
 	}
@@ -601,7 +618,12 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 	wrote := map[string]fileSig{}
 	var wbErr error
 	if err := consumeWriteBack(ctx, h, j, true, o.Quiet, wrote); err != nil {
-		wbErr = fmt.Errorf("write-back: %w (run `offload attach %s:%s` to retry)", err, h.Name, j.ID)
+		var ce *collectError
+		if errors.As(err, &ce) { // nothing to retry: the edits never left the runner
+			wbErr = fmt.Errorf("write-back: %w", err)
+		} else {
+			wbErr = fmt.Errorf("write-back: %w (run `offload attach %s:%s` to retry)", err, h.Name, j.ID)
+		}
 	}
 	// What write-back installed is the job's own result, not a local change: artifacts may
 	// replace exactly those files (identified as they were installed, before any later edit).
