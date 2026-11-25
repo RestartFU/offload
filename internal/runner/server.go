@@ -719,7 +719,7 @@ func (s *Server) status() api.Status {
 	}
 	st.Hostname, _ = os.Hostname()
 	st.Started, st.HostCPUs, st.Metrics = s.started, runtime.NumCPU(), true
-	st.Proto = api.Proto
+	st.Proto, st.Requeue = api.Proto, true
 	st.OS, st.Arch, st.Runtime = runtime.GOOS, runtime.GOARCH, "host"
 	if s.containersAvailable() {
 		st.Runtime = "container"
@@ -732,6 +732,10 @@ func (s *Server) status() api.Status {
 			st.Running++
 		case api.StateQueued, api.StateUploading:
 			st.Queued++
+			if !j.StopRequested { // claimed already: routing counts it as taken
+				st.Pending.CPU += j.Resources.CPU
+				st.Pending.Mem += j.Resources.Mem
+			}
 		}
 	}
 	for _, se := range s.sessions {

@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -159,6 +160,7 @@ func Run(o RunOptions) (int, error) {
 	if len(o.Artifacts) > 0 {
 		snap = snapshotArtifacts(o.Artifacts)
 	}
+	moves := 0
 	for attempt := 0; ; attempt++ {
 		spec.SubmitID = randomName() // one per submission (an OOM retry is a new job)
 		// Every write-back job gets a baseline bound to its ID, so `offload attach` can still
@@ -182,7 +184,17 @@ func Run(o RunOptions) (int, error) {
 			fmt.Println(ref)
 			return 0, nil
 		}
-		code, done, err := follow(ctx, h, j.ID, o.Quiet, true, cfg)
+		var relocate func(api.Job) bool
+		if o.On == "" && moves < maxMoves && h.Status != nil && h.Status.Requeue {
+			relocate = func(q api.Job) bool { return moveQueued(ctx, cfg, h, spec, q, o.Quiet) }
+		}
+		code, done, err := follow(ctx, h, j.ID, o.Quiet, true, cfg, relocate)
+		if errors.Is(err, errMoved) {
+			_ = os.Remove(baselinePath(j.ID)) // never ran: nothing of it to write back
+			moves++
+			attempt-- // a move is not one of the retries
+			continue
+		}
 		if err != nil || done == nil {
 			return code, err
 		}
@@ -392,10 +404,49 @@ func cancelJob(h *Host, id string) {
 	_ = h.do(ctx, "DELETE", "/v1/jobs/"+id, nil, nil)
 }
 
+// errMoved: the queued job was cancelled so it can be resubmitted to a runner that can start it.
+var errMoved = errors.New("moved to another runner")
+
+const (
+	maxMoves  = 3                // per run: a job never ping-pongs between runners
+	moveAfter = 10 * time.Second // queued this long before another runner is considered
+)
+
+// moveQueued cancels queued job q on h when another runner could start it right now, and reports
+// whether it did. The runner cancels only a job still in its queue, so one that started in the
+// meantime is left alone.
+func moveQueued(ctx context.Context, cfg *Config, h *Host, spec api.JobSpec, q api.Job, quiet bool) bool {
+	var others []*Host
+	for _, x := range Discover(ctx, cfg) {
+		if x.URL != h.URL && x.Status != nil {
+			others = append(others, x)
+		}
+	}
+	if len(others) == 0 {
+		return false
+	}
+	to, err := PickFor(others, spec, "job")
+	if err != nil || !to.Status.Accepting {
+		return false
+	}
+	if f := to.free(); f.CPU+1e-9 < q.Resources.CPU || f.Mem < min(q.Resources.Mem, to.Status.Capacity.Mem) {
+		return false // it would only queue there too
+	}
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := h.do(dctx, "DELETE", "/v1/jobs/"+q.ID+"?moved=1", nil, nil); err != nil {
+		return false // started meanwhile, or the runner didn't answer: it stays
+	}
+	logf(quiet, "%s is busy; moving the job to %s, which can start it now", h.Name, to.Name)
+	return true
+}
+
 // follow streams a job's stdout and stderr from the start, reconnecting from the last byte after
 // network trouble or laptop sleep, and returns the exit code with the final job record. With
 // cancelOnInterrupt, Ctrl-C cancels the job; otherwise it only detaches.
-func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bool, cfg *Config) (int, *api.Job, error) {
+// With relocate, a job that has waited in the queue for a while is offered to it every few
+// seconds; when relocate moves it, follow returns errMoved.
+func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bool, cfg *Config, relocate func(api.Job) bool) (int, *api.Job, error) {
 	var j api.Job
 	err := h.do(ctx, "GET", "/v1/jobs/"+id, nil, &j)
 	if _, started := callbacksStarted.Load(id); err == nil && !started {
@@ -426,8 +477,49 @@ func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bo
 			}
 		}()
 	}
+	var moved atomic.Bool
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		if relocate == nil {
+			return
+		}
+		var since time.Time
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-streamCtx.Done():
+				return
+			case <-t.C:
+			}
+			var cur api.Job
+			if err := h.do(streamCtx, "GET", "/v1/jobs/"+id, nil, &cur); err != nil {
+				continue
+			}
+			switch cur.State {
+			case api.StateUploading:
+				continue
+			case api.StateQueued:
+			default:
+				return // started or over: it stays where it is
+			}
+			if since.IsZero() {
+				since = time.Now()
+			}
+			if time.Since(since) >= moveAfter && relocate(cur) {
+				moved.Store(true)
+				stopStreams()
+				return
+			}
+		}
+	}()
 	wg.Wait()
 	stopStreams()
+	<-watched
+	if moved.Load() {
+		return 0, nil, errMoved
+	}
 	if ctx.Err() != nil {
 		if cancelOnInterrupt {
 			logf(quiet, "cancelling %s:%s", h.Name, id)

@@ -1138,6 +1138,13 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		out.err(404, "no such job")
 		return
 	}
+	// ?moved=1: the client found a runner that can start this job now and resubmits it there.
+	// Only a job still waiting in the queue may go; one that has started stays put.
+	moved := r.URL.Query().Get("moved") == "1"
+	if moved && (j.State != api.StateQueued || j.syncing || j.StopRequested) {
+		out.err(409, "not queued (state "+j.State+")")
+		return
+	}
 	j.cancelled.Store(true)
 	if !api.Terminal(j.State) && !j.StopRequested {
 		// Recorded before it is acknowledged: a restart must never bring a cancelled job back.
@@ -1155,6 +1162,8 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 			if j.abortUpload != nil {
 				j.abortUpload()
 			}
+		} else if moved {
+			s.finishLocked(j, api.StateCancelled, nil, "moved to another runner")
 		} else {
 			s.finishLocked(j, api.StateCancelled, nil, "cancelled")
 		}

@@ -136,7 +136,7 @@ func Attach(ref string) (int, error) {
 		return 1, err
 	}
 	cfg, _ := LoadConfig()
-	code, done, err := follow(ctx, h, id, false, false, cfg)
+	code, done, err := follow(ctx, h, id, false, false, cfg, nil)
 	if err == nil && done != nil {
 		if werr := consumeWriteBack(ctx, h, done, false, false, nil); werr != nil {
 			logf(false, "write-back: %v", werr)

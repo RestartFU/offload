@@ -524,7 +524,10 @@ func (h *Host) do(ctx context.Context, method, path string, in, out any) error {
 // free returns what the runner could hand out right now.
 func (h *Host) free() api.Resources {
 	st := h.Status
-	return api.Resources{CPU: st.Capacity.CPU - st.Allocated.CPU, Mem: min(st.Capacity.Mem-st.Allocated.Mem, st.MemAvailable-st.MemReserve)}
+	// Jobs still uploading or queued have claimed their share: two submits a few seconds apart
+	// must not both see the same idle runner.
+	used := api.Resources{CPU: st.Allocated.CPU + st.Pending.CPU, Mem: st.Allocated.Mem + st.Pending.Mem}
+	return api.Resources{CPU: st.Capacity.CPU - used.CPU, Mem: min(st.Capacity.Mem-used.Mem, st.MemAvailable-st.MemReserve-st.Pending.Mem)}
 }
 
 // PickFor chooses a runner for a job spec: like Pick, plus platform and runtime constraints.

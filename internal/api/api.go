@@ -282,8 +282,10 @@ type Status struct {
 	Name         string                 `json:"name"`
 	Version      string                 `json:"version"`
 	Hostname     string                 `json:"hostname"`
-	Capacity     Resources              `json:"capacity"`  // CPU and Mem the runner hands out
-	Allocated    Resources              `json:"allocated"` // sum of running jobs' and sessions' guarantees
+	Capacity     Resources              `json:"capacity"`          // CPU and Mem the runner hands out
+	Allocated    Resources              `json:"allocated"`         // sum of running jobs' and sessions' guarantees
+	Pending      Resources              `json:"pending"`           // guarantees of jobs still uploading or queued
+	Requeue      bool                   `json:"requeue,omitempty"` // DELETE /v1/jobs/{id}?moved=1 cancels only a queued job
 	Defaults     Resources              `json:"defaults"`
 	MemAvailable int64                  `json:"mem_available"` // host MemAvailable right now
 	MemReserve   int64                  `json:"mem_reserve"`   // never admit below this MemAvailable
