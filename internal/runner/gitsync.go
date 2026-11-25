@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/RestartFU/offload/internal/api"
@@ -29,9 +30,18 @@ func (s *Server) sharedGit(key string) string {
 }
 
 func gitCmd(dir string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	return gitCmdCtx(context.Background(), dir, args...)
+}
+
+// gitCmdCtx runs git in its own process group, killed as a whole (index-pack and other helpers
+// included) when ctx ends or after five minutes.
+func gitCmdCtx(ctx context.Context, dir string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -77,18 +87,18 @@ func (s *Server) gitPlan(key, head string) (needed bool, have []string, err erro
 }
 
 // gitReceive fetches an uploaded bundle into the store and pins head with a ref.
-func (s *Server) gitReceive(key, head, bundle string) error {
+func (s *Server) gitReceive(ctx context.Context, key, head, bundle string) error {
 	shared, err := s.ensureShared(key)
 	if err != nil {
 		return err
 	}
-	if _, err := gitCmd(shared, "bundle", "verify", "-q", bundle); err != nil {
+	if _, err := gitCmdCtx(ctx, shared, "bundle", "verify", "-q", bundle); err != nil {
 		return err
 	}
-	if _, err := gitCmd(shared, "fetch", "-q", "--no-tags", bundle, "+HEAD:refs/offload/"+head); err != nil {
+	if _, err := gitCmdCtx(ctx, shared, "fetch", "-q", "--no-tags", bundle, "+HEAD:refs/offload/"+head); err != nil {
 		return err
 	}
-	if _, err := gitCmd(shared, "cat-file", "-e", head+"^{commit}"); err != nil {
+	if _, err := gitCmdCtx(ctx, shared, "cat-file", "-e", head+"^{commit}"); err != nil {
 		return fmt.Errorf("bundle did not contain %s", head)
 	}
 	s.pruneGitRefs(shared)
@@ -110,12 +120,12 @@ func (s *Server) pruneGitRefs(shared string) {
 // gitCheckout makes the slot a repository at head without touching its files (they were just
 // synced from the client): HEAD and branch point at head, and the index matches head, so
 // `git status` / `git diff` show the client's uncommitted changes as working-tree changes.
-func (s *Server) gitCheckout(sl *slot, key string, g *api.GitRef) error {
+func (s *Server) gitCheckout(ctx context.Context, sl *slot, key string, g *api.GitRef) error {
 	shared, err := s.ensureShared(key)
 	if err != nil {
 		return err
 	}
-	if _, err := gitCmd(shared, "cat-file", "-e", g.Head+"^{commit}"); err != nil {
+	if _, err := gitCmdCtx(ctx, shared, "cat-file", "-e", g.Head+"^{commit}"); err != nil {
 		return fmt.Errorf("commit %s was not uploaded", g.Head[:12])
 	}
 	// A fresh .git for every job: a previous job may have replaced parts of it with symlinks, and
@@ -131,7 +141,7 @@ func (s *Server) gitCheckout(sl *slot, key string, g *api.GitRef) error {
 	if err != nil {
 		return err
 	}
-	if _, err := gitCmd(sl.Dir, "init", "-q"); err != nil {
+	if _, err := gitCmdCtx(ctx, sl.Dir, "init", "-q"); err != nil {
 		return err
 	}
 	alt := filepath.Join(gitDir, "objects", "info", "alternates")
@@ -142,18 +152,18 @@ func (s *Server) gitCheckout(sl *slot, key string, g *api.GitRef) error {
 		return err
 	}
 	if g.Branch != "" {
-		if _, err := gitCmd(sl.Dir, "update-ref", "refs/heads/"+g.Branch, g.Head); err != nil {
+		if _, err := gitCmdCtx(ctx, sl.Dir, "update-ref", "refs/heads/"+g.Branch, g.Head); err != nil {
 			return err
 		}
-		if _, err := gitCmd(sl.Dir, "symbolic-ref", "HEAD", "refs/heads/"+g.Branch); err != nil {
+		if _, err := gitCmdCtx(ctx, sl.Dir, "symbolic-ref", "HEAD", "refs/heads/"+g.Branch); err != nil {
 			return err
 		}
-	} else if _, err := gitCmd(sl.Dir, "update-ref", "--no-deref", "HEAD", g.Head); err != nil {
+	} else if _, err := gitCmdCtx(ctx, sl.Dir, "update-ref", "--no-deref", "HEAD", g.Head); err != nil {
 		return err
 	}
-	if _, err := gitCmd(sl.Dir, "read-tree", "HEAD"); err != nil {
+	if _, err := gitCmdCtx(ctx, sl.Dir, "read-tree", "HEAD"); err != nil {
 		return err
 	}
-	_, _ = gitCmd(sl.Dir, "update-index", "-q", "--refresh")
+	_, _ = gitCmdCtx(ctx, sl.Dir, "update-index", "-q", "--refresh")
 	return nil
 }

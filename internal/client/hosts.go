@@ -5,6 +5,8 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,6 +51,7 @@ func newRequest(ctx context.Context, h *Host, method, path string, body io.Reade
 	if h.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+h.Token)
 	}
+	req.Header.Set(api.ProtoHeader, fmt.Sprint(api.Proto))
 	return req, nil
 }
 
@@ -129,7 +132,31 @@ func localSocket() string {
 // vetted: a redirect is returned as an error, never followed.
 func noRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
+// clientTokenPath holds this client's secret token; runners store only its hash (`offload host
+// pair`). Jobs never see it, so they can't use a runner's API even from inside the tailnet.
+func clientTokenPath() string { return filepath.Join(configDir(), "client.token") }
+
+// clientToken returns this client's token, creating it on first use.
+func clientToken() string {
+	if b, err := os.ReadFile(clientTokenPath()); err == nil && len(strings.TrimSpace(string(b))) >= 32 {
+		return strings.TrimSpace(string(b))
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return ""
+	}
+	tok := hex.EncodeToString(buf)
+	_ = os.MkdirAll(configDir(), 0o700)
+	if err := os.WriteFile(clientTokenPath(), []byte(tok+"\n"), 0o600); err != nil {
+		return ""
+	}
+	return tok
+}
+
 func newHost(name, url, token string, prio int) *Host {
+	if token == "" && !strings.HasPrefix(url, "unix://") {
+		token = clientToken()
+	}
 	h := &Host{Name: name, URL: strings.TrimRight(url, "/"), Token: token, Priority: prio}
 	if sock, ok := strings.CutPrefix(url, "unix://"); ok {
 		h.URL, h.sock = "http://local", sock
@@ -340,6 +367,7 @@ func (h *Host) request(ctx context.Context, method, path string, body io.Reader)
 	if h.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+h.Token)
 	}
+	req.Header.Set(api.ProtoHeader, fmt.Sprint(api.Proto))
 	resp, err := h.http.Do(req)
 	if err != nil {
 		return nil, err

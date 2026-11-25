@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RestartFU/offload/internal/api"
@@ -91,25 +92,77 @@ func envPlan(def *api.EnvDef) (tag, containerfile, variant string) {
 // usesContext reports whether a Containerfile reads the local build context: COPY/ADD without
 // --from (which reads another stage or image instead), or RUN with a bind mount of the context.
 func usesContext(cf string) bool {
-	for _, line := range strings.Split(cf, "\n") {
+	for _, line := range logicalLines(cf) {
 		f := strings.Fields(line)
 		if len(f) == 0 {
 			continue
 		}
+		var flags []string // the instruction's leading --flags
+		for _, w := range f[1:] {
+			if !strings.HasPrefix(w, "--") {
+				break
+			}
+			flags = append(flags, w)
+		}
 		switch strings.ToUpper(f[0]) {
 		case "COPY", "ADD":
-			if !strings.Contains(line, "--from=") {
+			fromStage := false
+			for _, w := range flags {
+				if strings.HasPrefix(w, "--from=") {
+					fromStage = true
+				}
+			}
+			if !fromStage {
 				return true
 			}
 		case "RUN":
-			for _, w := range f[1:] {
-				if strings.HasPrefix(w, "--mount=") && strings.Contains(w, "type=bind") && !strings.Contains(w, "from=") {
+			for _, w := range flags {
+				if strings.HasPrefix(w, "--mount=") && !strings.Contains(w, "from=") &&
+					(strings.Contains(w, "type=bind") || !strings.Contains(w, "type=")) { // bind is the default type
 					return true
 				}
 			}
 		}
 	}
 	return false
+}
+
+// logicalLines joins a Containerfile's continuation lines (ending in the escape character, `\`
+// unless an escape directive says otherwise) and drops comments, as the builder reads it.
+func logicalLines(cf string) []string {
+	esc := "\\"
+	lines := strings.Split(strings.ReplaceAll(cf, "\r\n", "\n"), "\n")
+	for _, l := range lines { // parser directives come first, before anything else
+		t := strings.TrimSpace(l)
+		if !strings.HasPrefix(t, "#") {
+			break
+		}
+		if k, v, ok := strings.Cut(strings.TrimSpace(strings.TrimPrefix(t, "#")), "="); ok && strings.EqualFold(strings.TrimSpace(k), "escape") {
+			if v = strings.TrimSpace(v); v == "`" {
+				esc = v
+			}
+		}
+	}
+	var out []string
+	var cur strings.Builder
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if strings.HasPrefix(t, "#") {
+			continue // comments, also between continuation lines
+		}
+		if strings.HasSuffix(t, esc) {
+			cur.WriteString(strings.TrimSuffix(t, esc))
+			cur.WriteString(" ")
+			continue
+		}
+		cur.WriteString(t)
+		out = append(out, cur.String())
+		cur.Reset()
+	}
+	if cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	return out
 }
 
 func podman(ctx context.Context, args ...string) (string, error) {
@@ -197,7 +250,13 @@ func (s *Server) build(b *envBuild, cf string) {
 		err = s.runBuild(b.tag, cf, ctxDir, dir, b.logPath)
 	}
 	if err == nil && !s.bootstrapped(b.tag) {
-		err = s.runBootstrap(b.tag, b.logPath)
+		// Never a project image's own bootstrap script: it would write the shared toolchains.
+		if !imageExists(baseTag()) {
+			err = s.runBuild(baseTag(), baseContainerfile, "", dir, b.logPath)
+		}
+		if err == nil {
+			err = s.runBootstrap(baseTag(), b.logPath)
+		}
 	}
 	close(stop)
 	<-pumped                    // the pump owns b.read until it has stopped
@@ -239,7 +298,7 @@ func (s *Server) runBuild(tag, cf, ctxDir, dir, logPath string) error {
 		"--unit=" + unit, "--slice=" + s.cfg.Slice,
 		"-p", "Delegate=yes",
 		"-p", fmt.Sprintf("MemoryMax=%d", s.cfg.buildMem),
-		"-p", "MemorySwapMax=0", "-p", "CPUWeight=50",
+		"-p", "MemorySwapMax=0", "-p", "CPUWeight=50", "-p", "RuntimeMaxSec=7200",
 		"-p", fmt.Sprintf("OOMScoreAdjust=%d", s.cfg.Policy.OOMScoreAdj),
 		"-p", "StandardOutput=append:" + logPath, "-p", "StandardError=append:" + logPath,
 		"--", "podman", "build", "--layers", "--network=host", "--security-opt", "label=disable",
@@ -319,8 +378,9 @@ func (s *Server) bootstrapMarker(tag string) string {
 
 // bootstrapped reports whether the image's bootstrap has run against the current shared volumes
 // (the marker lives in the cache directory, so wiping the caches re-runs it).
-func (s *Server) bootstrapped(tag string) bool {
-	_, err := os.Stat(s.bootstrapMarker(tag))
+func (s *Server) bootstrapped(string) bool {
+	// Toolchains are installed only by the runner's own base image; every environment uses them.
+	_, err := os.Stat(s.bootstrapMarker(baseTag()))
 	return err == nil
 }
 
@@ -328,10 +388,17 @@ func (s *Server) bootstrapped(tag string) bool {
 // mounted, in its own unit with the build memory limit, so toolchain installs never count
 // against (or get killed by) a small job's limit.
 func (s *Server) runBootstrap(tag, logPath string) error {
+	// One at a time: two environment builds finishing together must not both install into the
+	// same shared volumes.
+	bootstrapMu.Lock()
+	defer bootstrapMu.Unlock()
+	if _, err := os.Stat(s.bootstrapMarker(tag)); err == nil {
+		return nil
+	}
 	args := []string{
 		"--user", "--quiet", "--collect", "--wait",
 		"--unit=offload-bootstrap-" + hash12(tag, time.Now().String()) + ".service", "--slice=" + s.cfg.Slice,
-		"-p", "Delegate=yes", "-p", fmt.Sprintf("MemoryMax=%d", s.cfg.buildMem), "-p", "MemorySwapMax=0",
+		"-p", "Delegate=yes", "-p", fmt.Sprintf("MemoryMax=%d", s.cfg.buildMem), "-p", "MemorySwapMax=0", "-p", "RuntimeMaxSec=3600",
 		"-p", "StandardOutput=append:" + logPath, "-p", "StandardError=append:" + logPath,
 		"--", "podman", "run", "--rm", "--cgroups=split", "--network=host", "--security-opt", "label=disable",
 		"--pull=never", "--entrypoint", "sh",
@@ -348,35 +415,68 @@ func (s *Server) runBootstrap(tag, logPath string) error {
 	return os.WriteFile(s.bootstrapMarker(tag), nil, 0o644)
 }
 
-// cacheMounts are the shared toolchain and cache volumes for the runner's own bootstrap step,
-// which installs toolchains: all writable.
+var bootstrapMu sync.Mutex
+
+// Shared toolchain volumes (written only by the runner's bootstrap, from its own base image):
+// rustup toolchains and the cargo and Go bin directories, all first on PATH.
+var toolchainDirs = map[string]string{"rustup": "/opt/offload/rustup", "cargo-bin": "/opt/offload/cargo/bin", "go-bin": "/opt/offload/go/bin"}
+
+// cacheLayout versions the cache directory layout. Older layouts mounted toolchains writable into
+// jobs, so on a change everything is wiped once and the bootstrap reinstalls it from scratch.
+const cacheLayout = "2"
+
+func (s *Server) cacheDir(parts ...string) string {
+	return filepath.Join(append([]string{s.cfg.StateDir, "cache"}, parts...)...)
+}
+
+// resetCachesIfOld wipes caches from an older layout (they may have been tampered with).
+func (s *Server) resetCachesIfOld() {
+	marker := s.cacheDir(".layout")
+	if b, err := os.ReadFile(marker); err == nil && strings.TrimSpace(string(b)) == cacheLayout {
+		return
+	}
+	log.Printf("cache layout changed: wiping shared toolchains and caches (the bootstrap reinstalls them)")
+	_ = removeAll(s.cacheDir())
+	_ = os.MkdirAll(s.cacheDir(), 0o755)
+	_ = os.WriteFile(marker, []byte(cacheLayout+"\n"), 0o644)
+}
+
+// cacheMounts are the toolchain volumes for the runner's bootstrap step, which installs them:
+// writable, and only ever used with the runner's own base image.
 func (s *Server) cacheMounts() []string {
 	var out []string
-	for _, c := range []string{"rustup", "cargo", "go", "npm"} {
-		dir := filepath.Join(s.cfg.StateDir, "cache", c)
-		_ = os.MkdirAll(dir, 0o755)
-		out = append(out, dir+":/opt/offload/"+c)
+	for name, dst := range toolchainDirs {
+		_ = os.MkdirAll(s.cacheDir(name), 0o755)
+		out = append(out, s.cacheDir(name)+":"+dst)
 	}
 	return out
 }
 
-// workloadMounts are the same volumes as jobs and sessions see them. Executables (rustup
-// toolchains, cargo and Go bin dirs, all first on PATH) are read-only, so no job can plant a
-// modified tool for a later job that runs with secrets. Dependency caches stay writable: cargo,
-// Go and npm verify what they take from them by checksum. (pip's cache doesn't, so it isn't shared.)
-func (s *Server) workloadMounts() []string {
-	cache := func(c string) string { return filepath.Join(s.cfg.StateDir, "cache", c) }
-	for _, d := range []string{"rustup", "cargo/bin", "go/bin", "npm"} {
-		_ = os.MkdirAll(cache(d), 0o755)
+// workloadMounts are the volumes a job or session sees. Toolchains are read-only. Dependency and
+// build caches (cargo registry and git checkouts, Go modules and build cache) are writable, so
+// they are scoped: workloads of the same repository share them (as they already share target/),
+// other repositories never do. CARGO_HOME itself is not shared, so a job's cargo config or
+// credentials never reach another. npm's cache is shared: it verifies content on every read.
+// scope "" (no workspace) gets no persistent caches at all.
+func (s *Server) workloadMounts(scope string) []string {
+	var out []string
+	for name, dst := range toolchainDirs {
+		_ = os.MkdirAll(s.cacheDir(name), 0o755)
+		out = append(out, s.cacheDir(name)+":"+dst+":ro")
 	}
-	return []string{
-		cache("cargo") + ":/opt/offload/cargo",
-		cache("go") + ":/opt/offload/go",
-		cache("npm") + ":/opt/offload/npm",
-		cache("rustup") + ":/opt/offload/rustup:ro",
-		cache("cargo/bin") + ":/opt/offload/cargo/bin:ro", // over the writable cargo home
-		cache("go/bin") + ":/opt/offload/go/bin:ro",
+	_ = os.MkdirAll(s.cacheDir("npm"), 0o755)
+	out = append(out, s.cacheDir("npm")+":/opt/offload/npm")
+	if scope != "" && validKey(scope) {
+		for name, dst := range map[string]string{
+			"cargo-registry": "/opt/offload/cargo/registry", "cargo-git": "/opt/offload/cargo/git",
+			"go-mod": "/opt/offload/go/pkg/mod", "go-build": "/opt/offload/go/cache",
+		} {
+			dir := s.cacheDir("scoped", scope, name)
+			_ = os.MkdirAll(dir, 0o755)
+			out = append(out, dir+":"+dst)
+		}
 	}
+	return out
 }
 
 // lastLines returns the last n lines of a file, reading at most its final 16 KiB.
@@ -471,9 +571,10 @@ type runSpec struct {
 	Volumes                             []string // "host:container"
 	Devices                             []string
 	Env                                 map[string]string
-	Interactive                         bool // keep stdin (sessions)
-	NestedSandbox                       bool // flatpak/bubblewrap inside: unmask /proc, no seccomp filter
-	ClientNet                           bool // network through the client (own netns + TUN + user-space stack)
+	Interactive                         bool   // keep stdin (sessions)
+	NestedSandbox                       bool   // flatpak/bubblewrap inside: unmask /proc, no seccomp filter
+	ClientNet                           bool   // network through the client (own netns + TUN + user-space stack)
+	CacheScope                          string // which scoped caches to mount (see workloadMounts)
 	DNSSearch                           []string
 	Argv                                []string
 }
@@ -523,7 +624,7 @@ func (s *Server) podmanRun(r runSpec) []string {
 		}
 	}
 	a = append(a, "-v", s.self+":"+s.self+":ro")
-	for _, m := range append(s.workloadMounts(), r.Volumes...) {
+	for _, m := range append(s.workloadMounts(r.CacheScope), r.Volumes...) {
 		a = append(a, "-v", m)
 	}
 	for _, d := range r.Devices {
@@ -569,6 +670,7 @@ func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets s
 		r.Devices = j.Spec.Environment.Devices
 	}
 	r.ClientNet, r.DNSSearch = j.Spec.Network == "client", j.Spec.DNSSearch
+	r.CacheScope = j.Spec.WorkspaceKey
 	return s.podmanRun(r)
 }
 

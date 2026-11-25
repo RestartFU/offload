@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/signal"
@@ -121,6 +123,9 @@ func Attach(ref string) (int, error) {
 		return 1, err
 	}
 	h, id, err := locateJob(ctx, hosts, ref)
+	if err == nil {
+		err = checkProto(h)
+	}
 	if err != nil {
 		return 1, err
 	}
@@ -202,12 +207,49 @@ func Upgrade(names []string, all bool, binary string, force bool) error {
 		if err != nil {
 			return err
 		}
-		err = h.do(ctx, "PUT", "/v1/admin/binary", f, nil)
+		q := ""
+		if force {
+			q = "?force=1"
+		}
+		err = h.do(ctx, "PUT", "/v1/admin/binary"+q, f, nil)
 		f.Close()
 		if err != nil {
 			return fmt.Errorf("%s: %w", h.Name, err)
 		}
 		fmt.Printf("%s: upgraded (was %s)\n", h.Name, h.Status.Version)
+	}
+	return nil
+}
+
+// Pair registers this client's token with runners (the first pairing of a fresh runner only needs
+// your tailnet identity; later ones need an already paired client).
+func Pair(names []string, all bool) error {
+	ctx := context.Background()
+	hosts, err := discover(ctx)
+	if err != nil {
+		return err
+	}
+	var targets []*Host
+	if all {
+		targets = hosts
+	}
+	for _, n := range names {
+		h, err := FindHost(hosts, n)
+		if err != nil {
+			return err
+		}
+		targets = append(targets, h)
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("name a runner or pass --all")
+	}
+	sum := sha256.Sum256([]byte(clientToken()))
+	for _, h := range targets {
+		var out map[string]string
+		if err := h.do(ctx, "POST", "/v1/admin/pair", map[string]string{"hash": hex.EncodeToString(sum[:])}, &out); err != nil {
+			return fmt.Errorf("%s: %w", h.Name, err)
+		}
+		fmt.Printf("%s: %s\n", h.Name, out["status"])
 	}
 	return nil
 }

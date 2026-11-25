@@ -480,12 +480,8 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, quiet
 			skipped = append(skipped, c.Path)
 			continue
 		}
-		before, err := tree.Lstat(c.Path)
-		if err != nil {
-			skipped = append(skipped, c.Path)
-			continue
-		}
-		if cur, err := hashIn(tree, c.Path); err != nil || cur != c.BaseHash {
+		cur, before, err := hashFileIn(tree, c.Path)
+		if err != nil || cur != c.BaseHash {
 			skipped = append(skipped, c.Path)
 			continue
 		}
@@ -493,12 +489,8 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, quiet
 		// content, re-checked right before the rename. Otherwise the job's version is kept next
 		// to it as <file>.offload-incoming[.N], never silently dropped or written over an edit.
 		unchanged := func() bool {
-			now, err := tree.Lstat(c.Path)
-			if err != nil || !os.SameFile(before, now) || now.Mode() != before.Mode() {
-				return false
-			}
-			h, err := hashIn(tree, c.Path)
-			return err == nil && h == c.BaseHash
+			h, now, err := hashFileIn(tree, c.Path)
+			return err == nil && os.SameFile(before, now) && now.Mode() == before.Mode() && h == c.BaseHash
 		}
 		if err := writeInIf(tree, c.Path, tr, os.FileMode(c.Mode).Perm(), c.Hash, unchanged); err != nil {
 			var ce *conflictError
@@ -529,23 +521,33 @@ func checkRel(p string) error {
 
 // hashIn returns the sha256 of a regular file inside root (never following a final symlink).
 func hashIn(root *os.Root, rel string) (string, error) {
-	fi, err := root.Lstat(rel)
+	h, _, err := hashFileIn(root, rel)
+	return h, err
+}
+
+// hashFileIn hashes a regular file through one descriptor and returns that descriptor's identity.
+// The path must name that same file both before and after the read, so a swap mid-check fails.
+func hashFileIn(root *os.Root, rel string) (string, os.FileInfo, error) {
+	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return "", err
-	}
-	if !fi.Mode().IsRegular() {
-		return "", fmt.Errorf("%s is not a regular file", rel)
-	}
-	f, err := root.Open(rel)
-	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("%s is not a regular file", rel)
+	}
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	if now, err := root.Lstat(rel); err != nil || !os.SameFile(fi, now) {
+		return "", nil, fmt.Errorf("%s changed while being read", rel)
+	}
+	return hex.EncodeToString(h.Sum(nil)), fi, nil
 }
 
 // realParents reports whether every parent directory of rel inside root is a real directory.

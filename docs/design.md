@@ -6,9 +6,18 @@
   itself is optional; it gets priority -10 and is reached over a unix socket.
 - **One binary.** `offload` is the CLI, the daemon (`runner serve`) and the unit wrappers
   (`runner exec`, `runner pipe`). Upgrading a runner means pushing the client's own binary.
-- **Transport.** HTTP over the tailnet. Auth uses tailscaled WhoIs against `allow_users` and
-  `allow_tags`. Bearer tokens are a fallback for hosts outside the tailnet. There is no SSH
-  anywhere.
+- **Transport.** HTTP over the tailnet. There is no SSH anywhere.
+- **Auth is a paired client token, not tailnet identity.** Runners are devices of the same
+  tailnet user, and so are their jobs' network connections: a WhoIs match can't tell the laptop
+  from a job on another runner. So the API wants a bearer token whose hash is in the runner's
+  `tokens` file (`offload host pair`). An allowed WhoIs identity (`allow_users`, `allow_tags`)
+  may only read `/v1/status` and, while no client is paired and within 30 minutes of the
+  runner's start, pair the first client. The local unix socket needs nothing.
+- **One protocol version at a time.** Clients send `X-Offload-Proto`; runners refuse other
+  versions except for status, pairing and upgrades. A runner of a new version stops workloads
+  the old one started (their mounts and sockets differ) and admits nothing until it has
+  confirmed that, so upgrades check the new binary's version (`offload proto`) and refuse to
+  strand running work without `--force`.
 - **No browsers.** Tailnet identity is ambient: a browser on an allowed machine carries it for
   every page it shows. So the API refuses any request with `Origin` or a `Sec-Fetch-Site` other
   than `none` (cross-site request forgery). Callers trusted by tailnet identity must also name
@@ -56,7 +65,8 @@ an index at HEAD (`read-tree`), so the synced working tree shows your uncommitte
 
 ## Credentials
 
-- Relays: per job, an SSH agent socket (framed request/response) and a git credential helper
+- Relays: per job, an SSH agent socket (framed request/response; only list-keys and sign
+  requests pass, checked on both ends) and a git credential helper
   (`offload runner credential`, local socket only) queue requests that the attached client
   long-polls and answers with its own ssh-agent and `git credential fill`. With no client
   attached, requests fail immediately.
@@ -89,9 +99,14 @@ Things measured before building this (Fedora 44, podman 5.8):
 Environments are Containerfiles; `FROM offload/base` is rewritten to the runner's base tag
 (a hash of the embedded `envs/base.Containerfile`). Image tags are content hashes. Builds run as
 their own units with `container.build_mem`, never inside a job's limit, and their log streams to
-every waiting job's stderr. A build never blocks other jobs in the queue. After a build, the
-image's `/etc/offload/bootstrap.sh` runs once against the shared volumes (also in its own unit)
-to install or repair toolchains (rustup). A marker in the cache dir records it. Workspace slots
+every waiting job's stderr. A build never blocks other jobs in the queue. After a build, the base
+image's `/etc/offload/bootstrap.sh` runs once against the toolchain volumes (also in its own unit)
+to install or repair rustup and the cargo/Go bin directories. Only the runner's own base image
+ever writes them; jobs see them read-only, because one job's planted binary would otherwise run
+in every later job. Dependency and build caches (cargo registry and git, Go modules and build
+cache) are writable and therefore scoped per repository, and `CARGO_HOME` itself stays in the
+container, so cargo config and credentials never carry over. The cache dir records its layout
+version; an older layout is wiped once. Workspace slots
 are keyed by repo plus environment base (`<key>--b<base>`), so a different base never reuses
 stale `target/`, while adding tools on top of the same base keeps builds warm. Unused images are
 removed after `container.image_retain`.

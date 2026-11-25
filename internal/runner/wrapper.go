@@ -296,7 +296,7 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 					if err != nil {
 						return
 					}
-					if _, err := fmt.Sscanf(hdr, "%d %d", &seq, &n); err != nil || seq <= 0 || n < 0 || n > 64<<20 {
+					if _, err := fmt.Sscanf(hdr, "%d %d", &seq, &n); err != nil || seq <= 0 || n < 0 || n > maxStdinFrame {
 						fmt.Fprintf(c, "bad frame\n")
 						return
 					}
@@ -485,13 +485,18 @@ func packArtifacts(dest string, paths []string) error {
 	return nil
 }
 
-// checkBinary makes sure an uploaded binary runs on this machine before we swap it in.
-func checkBinary(path string) error {
+// checkBinary makes sure an uploaded binary runs on this machine before we swap it in, and
+// returns the protocol version it speaks.
+func checkBinary(path string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, path, "version").CombinedOutput()
+	out, err := exec.CommandContext(ctx, path, "proto").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("new binary does not run: %v: %s", err, strings.TrimSpace(string(out)))
+		return 0, fmt.Errorf("new binary does not run (or predates protocol checks): %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	return nil
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("new binary reports protocol %q", strings.TrimSpace(string(out)))
+	}
+	return n, nil
 }

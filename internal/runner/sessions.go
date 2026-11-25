@@ -157,6 +157,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.retireErr != "" {
+		out.err(503, "runner busy retiring workloads of an older version: "+s.retireErr)
+		return
+	}
+	if s.upgrading {
+		out.err(503, "runner is upgrading; try again in a few seconds")
+		return
+	}
 	image := ""
 	if rt == "container" {
 		tag, ready, err := s.sessionImageLocked(def)
@@ -281,7 +289,8 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		}
 		command = s.podmanRun(runSpec{Name: "offload-" + se.ID, Image: image, Workdir: filepath.Join(se.dir, "tmp"), CPUs: allowed,
 			Secrets: secrets, Mem: res.Mem, Env: cenv, Interactive: true, Argv: prof.Command, ClientNet: prof.Network == "client", DNSSearch: dnsSearch,
-			Same: same, Volumes: volumes, Devices: devices, NestedSandbox: prof.NestedSandbox})
+			Same: same, Volumes: volumes, Devices: devices, NestedSandbox: prof.NestedSandbox,
+			CacheScope: "session-" + prof.Name})
 		unitEnv = map[string]string{}
 		s.touchImage(image)
 	} else if secrets != "" {

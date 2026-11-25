@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path"
 	"regexp"
@@ -46,6 +45,20 @@ type slotRecord struct {
 	LastUsed time.Time            `json:"last_used"`
 	Rev      int64                `json:"rev"` // bumped on every save: plans are only valid against their revision
 	Files    map[string]slotEntry `json:"files"`
+	// Dirty lists files an apply was replacing when it was interrupted (recorded before the first
+	// rename): their recorded metadata can't be trusted, so the next plan always re-requests them.
+	Dirty []string `json:"dirty,omitempty"`
+	// Stages are staging directories an apply created; an interrupted apply leaves them behind and
+	// the next one removes exactly those (never anything else that merely looks like one).
+	Stages []string `json:"stages,omitempty"`
+}
+
+func (r slotRecord) dirtySet() map[string]bool {
+	m := map[string]bool{}
+	for _, p := range r.Dirty {
+		m[p] = true
+	}
+	return m
 }
 
 type slotEntry struct {
@@ -167,7 +180,7 @@ func (s *slot) plan(manifest []api.FileEntry) ([]string, error) {
 	}
 	defer root.Close()
 	var needed []string
-	seen := map[string]bool{}
+	seen, dirty := map[string]bool{}, rec.dirtySet()
 	for _, e := range manifest {
 		p, err := cleanRel(e.Path)
 		if err != nil {
@@ -181,7 +194,7 @@ func (s *slot) plan(manifest []api.FileEntry) ([]string, error) {
 			continue // symlinks travel in the manifest itself
 		}
 		old, ok := rec.Files[p]
-		if !ok || old.Hash != e.Hash || old.Link != "" {
+		if !ok || old.Hash != e.Hash || old.Link != "" || dirty[p] {
 			needed = append(needed, p)
 			continue
 		}
@@ -209,11 +222,12 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		return err
 	}
 	defer root.Close()
-	if leftovers, _ := fs.Glob(root.FS(), ".offload-stage-*"); len(leftovers) > 0 { // from an interrupted apply
-		for _, l := range leftovers {
+	for _, l := range rec.Stages { // from an interrupted apply
+		if strings.HasPrefix(l, ".offload-stage-") && !strings.ContainsAny(l, "/\\") {
 			_ = root.RemoveAll(l)
 		}
 	}
+	rec.Stages = nil
 	want := map[string]api.FileEntry{}
 	for _, e := range manifest {
 		p, err := cleanRel(e.Path)
@@ -228,10 +242,17 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 	}
 	// Stage the whole upload first; only a complete, verified upload changes the workspace.
 	stage := ".offload-stage-" + randomSuffix()
-	if err := root.Mkdir(stage, 0o700); err != nil {
-		return err
+	if len(pending) > 0 {
+		rec.Stages = []string{stage}
+		if err := s.save(rec); err != nil {
+			return err
+		}
+		rec.Rev++ // save bumped the stored revision; keep ours in step
+		if err := root.Mkdir(stage, 0o700); err != nil {
+			return err
+		}
+		defer root.RemoveAll(stage)
 	}
-	defer root.RemoveAll(stage)
 	staged, err := extract(root, upload, want, pending, stage)
 	if err != nil {
 		return err
@@ -240,6 +261,17 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		if staged[p] == "" {
 			return fmt.Errorf("upload is missing %q", p)
 		}
+	}
+	// Record what is about to change before changing it, so a crash between the renames and the
+	// final save leaves those files marked untrusted rather than described by stale metadata.
+	for p := range staged {
+		rec.Dirty = append(rec.Dirty, p)
+	}
+	if len(staged) > 0 {
+		if err := s.save(rec); err != nil {
+			return err
+		}
+		rec.Rev++ // save bumped the stored revision; keep ours in step
 	}
 	written := map[string]bool{}
 	for p, tmp := range staged {
@@ -310,6 +342,7 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		rec.Files[e.Path] = ent
 	}
 	s.LastUsed = time.Now()
+	rec.Dirty, rec.Stages = nil, nil
 	return s.save(rec)
 }
 

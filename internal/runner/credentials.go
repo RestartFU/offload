@@ -251,6 +251,12 @@ func (r *relay) serveAgent(c net.Conn) {
 		if _, err := io.ReadFull(c, msg[4:]); err != nil {
 			return
 		}
+		if !api.AgentRequestAllowed(msg) { // listing keys and signing only: nothing that changes the agent
+			if _, err := c.Write(failure); err != nil {
+				return
+			}
+			continue
+		}
 		resp, err := r.ask("ssh-agent", msg, 2*time.Minute)
 		if err != nil || len(resp) < 5 {
 			resp = failure

@@ -16,7 +16,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/RestartFU/offload/internal/api"
 )
 
 // CredentialsConfig is the [credentials] table of client.toml.
@@ -109,7 +112,7 @@ func resolveValue(src string) (string, error) {
 	case strings.HasPrefix(src, "cmd:"):
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		out, err := exec.CommandContext(ctx, "sh", "-c", strings.TrimPrefix(src, "cmd:")).Output()
+		out, err := groupCommand(ctx, "sh", "-c", strings.TrimPrefix(src, "cmd:")).Output()
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", strings.TrimPrefix(src, "cmd:"), err)
 		}
@@ -316,8 +319,8 @@ func serveCallbacks(ctx context.Context, h *Host, base string, cfg *Config, quie
 // agentRequest forwards one framed SSH agent message to the local agent.
 func agentRequest(ctx context.Context, msg []byte) []byte {
 	sock := os.Getenv("SSH_AUTH_SOCK")
-	if sock == "" {
-		return nil
+	if sock == "" || !api.AgentRequestAllowed(msg) {
+		return nil // a job may list keys and sign, never add, remove, lock or extend
 	}
 	d := net.Dialer{Timeout: 5 * time.Second}
 	c, err := d.DialContext(ctx, "unix", sock)
@@ -429,11 +432,22 @@ func allowedHost(allow []string, host string) bool {
 	return false
 }
 
+// groupCommand runs a helper in its own process group: on timeout or cancel the whole group is
+// killed (helpers spawn helpers that would otherwise hold the output pipe open), and Wait gives
+// up shortly after.
+func groupCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 2 * time.Second
+	return cmd
+}
+
 // gitCredentialFill asks this machine's git for a credential, never prompting.
 func gitCredentialFill(ctx context.Context, req []byte) []byte {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "credential", "fill")
+	cmd := groupCommand(ctx, "git", "credential", "fill")
 	cmd.Stdin = bytes.NewReader(req)
 	var env []string
 	for _, e := range os.Environ() {

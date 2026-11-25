@@ -210,9 +210,9 @@ func pumpIn(ctx context.Context, h *Host, id string, in io.Reader) error {
 	r := bufio.NewReaderSize(in, 1<<20)
 	var seq int64
 	for {
-		line, err := r.ReadBytes('\n')
-		if len(line) > 16<<20 {
-			return fmt.Errorf("an MCP message of %d bytes is over the 16 MiB a session accepts", len(line))
+		line, err := readLineMax(r, maxMessage)
+		if errors.Is(err, errTooLong) {
+			return fmt.Errorf("an MCP message is over the %d MiB a session accepts", maxMessage>>20)
 		}
 		if len(line) > 0 {
 			seq++
@@ -226,6 +226,27 @@ func pumpIn(ctx context.Context, h *Host, id string, in io.Reader) error {
 			}
 			return err
 		}
+	}
+}
+
+// maxMessage is the largest stdin line a session accepts (the runner's frame limit).
+const maxMessage = 16 << 20
+
+var errTooLong = errors.New("line too long")
+
+// readLineMax reads one line (with its newline, if any), never buffering more than max bytes.
+func readLineMax(r *bufio.Reader, max int) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(line)+len(chunk) > max {
+			return nil, errTooLong
+		}
+		line = append(line, chunk...)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return line, err
 	}
 }
 

@@ -40,7 +40,7 @@ func (sl *slot) planData(manifest []api.FileEntry) (needed []string, changed boo
 		return nil, false, err
 	}
 	defer root.Close()
-	seen := map[string]bool{}
+	seen, dirty := map[string]bool{}, rec.dirtySet()
 	for _, e := range manifest {
 		seen[e.Path] = true
 		old, ok := rec.Files[e.Path]
@@ -62,7 +62,7 @@ func (sl *slot) planData(manifest []api.FileEntry) (needed []string, changed boo
 			continue
 		}
 		old, ok := rec.Files[p]
-		if !ok || old.Hash != e.Hash {
+		if !ok || old.Hash != e.Hash || dirty[p] {
 			needed = append(needed, p)
 			continue
 		}

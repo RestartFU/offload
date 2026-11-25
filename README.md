@@ -11,9 +11,9 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
                                              └─ workspaces: persistent per-repo slots
 ```
 
-- **No SSH.** Runners listen on their tailnet addresses only. Callers are identified with
-  tailscaled's WhoIs, so your tailnet login is the credential. Optional bearer tokens cover
-  hosts outside the tailnet.
+- **No SSH.** Runners listen on their tailnet addresses only. The laptop pairs with each runner
+  once (`offload host pair`) and then authenticates with its client token; tailnet identity
+  alone only discovers runners.
 - **Discovery.** The client probes online tailnet peers on port 7420 and keeps the ones that answer.
 - **Sliced, not exclusive.** Every job asks for a guaranteed CPU share, a burst ceiling and a
   hard memory limit. Jobs are packed onto runners and queue when nothing fits. Tools see their
@@ -40,8 +40,9 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
   a sorted package layer in `.offload/Containerfile` (`FROM offload/base`, Ubuntu 24.04 LTS).
   `.devcontainer/devcontainer.json` (image or build, containerEnv) works too. Every runner builds
   the same definition, layer-cached: the first build takes minutes, adding a tool takes seconds,
-  and a warm job starts in about 0.5s. Toolchains (rustup, Go modules, npm and pip caches) live
-  in shared volumes, so every environment reuses them. `--host` runs directly on the runner.
+  and a warm job starts in about 0.5s. Toolchains (rustup, cargo and Go binaries) live in
+  shared read-only volumes and dependency caches are kept per repository, so every environment
+  reuses them. `--host` runs directly on the runner.
 - **Sessions too.** `offload mcp <profile>` runs the MCP server in the profile's environment
   (`containerfile`, `devices` such as `/dev/dri`, persistent `volumes`), or the client's
   `--environment NAME`, or on the host with `runtime = "host"`. The environment is built on first
@@ -61,7 +62,8 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
   and the client prefers one matching the laptop (`--platform linux/arm64` forces one).
   Windows hosts can be runners through WSL2; macOS hosts through a Linux VM.
 - **Survives restarts.** Jobs are systemd units, so the daemon can restart or upgrade
-  (`offload host upgrade`) without killing work. Clients reattach from the last byte after
+  (`offload host upgrade`) without killing work, unless the upgrade changes the protocol
+  version (then it waits for idle, or `--force` stops the old workloads). Clients reattach from the last byte after
   network drops or laptop sleep.
 
 ## Install a runner
@@ -75,7 +77,10 @@ sudo dnf install podman   # or apt: rootless podman for container jobs (optional
 systemctl --user daemon-reexec && systemctl --user restart offload-runner
 ```
 
-After that, upgrades come from the laptop with `offload host upgrade <name>`.
+Then, from the laptop and within 30 minutes of the runner starting, pair with it:
+`offload host pair <name>` (the first pairing only needs your tailnet login; later clients pair
+from an already paired one). After that, upgrades come from the laptop with
+`offload host upgrade <name>`.
 
 The config lives in `~/.config/offload/runner.toml` and holds capacity, reserve, storage and
 policy settings. Profiles live in `~/.config/offload/profiles/*.toml`. See
@@ -122,8 +127,8 @@ token = "…"
 priority = 10
 ```
 
-Runners accept tailnet callers (no token) only when the URL names them by IP address, their
-hostname or tailnet name. Add any other DNS name to `hostnames` in the runner's `runner.toml`.
+Unpaired tailnet callers may only discover a runner (and pair the first client), and only when
+the URL names it by IP address, its hostname or tailnet name. Add any other DNS name to `hostnames` in the runner's `runner.toml`.
 The runner API refuses requests made by web pages.
 
 ## Agents

@@ -49,6 +49,10 @@ type Server struct {
 	readyImages map[string]bool
 	imageUse    map[string]time.Time
 
+	startedAt time.Time
+	upgrading bool   // a new binary is being swapped in: start nothing
+	retireErr string // set while workloads of another version couldn't be confirmed stopped
+
 	whoisMu sync.Mutex
 	whois   map[string]whoisEntry
 
@@ -68,7 +72,7 @@ func New(cfg *Config, version string) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg: cfg, version: version, self: self,
+		cfg: cfg, version: version, self: self, startedAt: time.Now(),
 		jobs: map[string]*job{}, sessions: map[string]*session{}, slots: map[string][]*slot{},
 		cpuUse: map[int]int{}, wake: make(chan struct{}, 1), whois: map[string]whoisEntry{},
 		builds: map[string]*envBuild{}, buildErrs: map[string]error{}, readyImages: map[string]bool{}, tz: hostTimezone(),
@@ -82,8 +86,12 @@ func New(cfg *Config, version string) (*Server, error) {
 	}
 	s.loadHistory()
 	s.loadImageUse()
+	s.resetCachesIfOld()
 	s.restore()
-	s.retireOtherVersions()
+	if err := s.retireOtherVersions(); err != nil {
+		log.Printf("retiring old workloads: %v (admitting nothing until this succeeds)", err)
+		s.retireErr = err.Error()
+	}
 	return s, nil
 }
 
@@ -125,6 +133,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/data/{name}", s.handleDataPlan)
 	mux.HandleFunc("PUT /v1/data/{name}", s.handleDataUpload)
 	mux.HandleFunc("PUT /v1/admin/binary", s.handleUpgrade)
+	mux.HandleFunc("POST /v1/admin/pair", s.handlePair)
 
 	handler := s.auth(mux)
 	errc := make(chan error, len(s.cfg.Listen))
@@ -228,19 +237,27 @@ func (s *Server) waitTailscaleIPs(ctx context.Context) []string {
 	}
 }
 
-// auth admits local socket callers, bearer-token holders, and allowed tailnet identities. Web
-// pages are refused whatever the caller's identity (see browser.go).
+// auth admits the local socket, and over the network only a paired client: one holding a token
+// whose hash is in the tokens file. A tailnet identity alone is not enough, because runners are
+// devices of the same tailnet user and their jobs share their network identity; a job must never be
+// able to use a runner's API. Allowed tailnet identities may only read /v1/status (discovery) and,
+// while no client is paired yet, pair the first one. Web pages are refused whatever the caller's
+// identity (see browser.go).
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Context().Value(unixMarker{}) != nil {
-			next.ServeHTTP(w, r)
+			checkClientProto(next).ServeHTTP(w, r)
 			return
 		}
 		if browserRequest(r) {
 			writeErr(w, http.StatusForbidden, "not allowed: the runner API does not accept requests from web pages")
 			return
 		}
-		if tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && s.tokenOK(tok) {
+		r.Header.Del(firstPairHeader) // only ever set by us, below
+		r.Header.Del("X-Offload-Caller")
+		tok, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		next := checkClientProto(next)
+		if tok != "" && s.tokenOK(tok) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -248,27 +265,132 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			writeErr(w, http.StatusForbidden, fmt.Sprintf("not allowed: unknown Host %q (if clients reach this runner by that name, add it to hostnames in runner.toml)", r.Host))
 			return
 		}
-		if who, ok := s.tailnetOK(r.Context(), r.RemoteAddr); ok {
+		who, idOK := s.tailnetOK(r.Context(), r.RemoteAddr)
+		if idOK {
 			r.Header.Set("X-Offload-Caller", who)
-			next.ServeHTTP(w, r)
-			return
 		}
-		writeErr(w, http.StatusForbidden, "not allowed: unknown tailnet identity and no valid token")
+		switch {
+		case idOK && r.Method == "GET" && r.URL.Path == "/v1/status":
+			next.ServeHTTP(w, r)
+		case idOK && r.Method == "POST" && r.URL.Path == "/v1/admin/pair" && s.noClientPaired() && time.Since(s.startedAt) < pairWindow:
+			r.Header.Set(firstPairHeader, "1") // handlePair re-checks under the lock
+			next.ServeHTTP(w, r)               // first pairing of a fresh runner
+		case idOK:
+			writeErr(w, http.StatusForbidden, "this client isn't paired with the runner: run `offload host pair "+s.cfg.Name+"`")
+		default:
+			writeErr(w, http.StatusForbidden, "not allowed")
+		}
 	})
 }
 
-func (s *Server) tokenOK(tok string) bool {
-	if s.cfg.TokensFile == "" || tok == "" {
-		return false
+// pairWindow is how long after it starts a runner with no paired client accepts its first
+// pairing by tailnet identity alone (restart it to open the window again).
+const pairWindow = 30 * time.Minute
+
+// checkClientProto refuses requests from clients of another protocol version, except the ones
+// that bring versions back in step (status, pairing, binary upgrades).
+func checkClientProto(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/status", "/v1/admin/pair", "/v1/admin/binary":
+		default:
+			if got := r.Header.Get(api.ProtoHeader); got != fmt.Sprint(api.Proto) {
+				if got == "" {
+					got = "unknown"
+				}
+				writeErr(w, http.StatusPreconditionFailed, fmt.Sprintf("client protocol %s, runner protocol %d: upgrade the older side (`offload host upgrade`)", got, api.Proto))
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// tokensPath is the file of paired client token hashes ("sha256:<hex>" per line).
+func (s *Server) tokensPath() string {
+	if s.cfg.TokensFile != "" {
+		return s.cfg.TokensFile
 	}
-	b, err := os.ReadFile(s.cfg.TokensFile)
+	return filepath.Join(filepath.Dir(DefaultConfigPath()), "tokens")
+}
+
+const firstPairHeader = "X-Offload-First-Pair"
+
+// noClientPaired reports whether no client is paired yet: the tokens file is missing or empty
+// (an unreadable file counts as paired, so an error never reopens first pairing).
+func (s *Server) noClientPaired() bool {
+	_, err := os.Stat(s.tokensPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	return err == nil && len(s.pairedTokens()) == 0
+}
+
+func (s *Server) pairedTokens() []string {
+	b, err := os.ReadFile(s.tokensPath())
 	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// handlePair adds a client's token hash. A fresh runner accepts the first pairing from an
+// allowed tailnet identity; after that only an already paired client can pair another.
+func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Hash string `json:"hash"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || len(req.Hash) != 64 {
+		writeErr(w, 400, "want {\"hash\": \"<sha256 hex of the client token>\"}")
+		return
+	}
+	if _, err := hex.DecodeString(req.Hash); err != nil {
+		writeErr(w, 400, "hash must be hex")
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r.Header.Get(firstPairHeader) == "1" && !s.noClientPaired() {
+		writeErr(w, http.StatusForbidden, "another client paired first: pair from it (`offload host pair "+s.cfg.Name+"`)")
+		return
+	}
+	for _, line := range s.pairedTokens() {
+		if line == "sha256:"+req.Hash {
+			writeJSON(w, map[string]string{"status": "already paired"})
+			return
+		}
+	}
+	_ = os.MkdirAll(filepath.Dir(s.tokensPath()), 0o700)
+	f, err := os.OpenFile(s.tokensPath(), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	_, err = fmt.Fprintf(f, "sha256:%s\n", req.Hash)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	log.Printf("paired a client (%s)", r.Header.Get("X-Offload-Caller"))
+	writeJSON(w, map[string]string{"status": "paired"})
+}
+
+func (s *Server) tokenOK(tok string) bool {
+	if tok == "" {
 		return false
 	}
 	sum := sha256.Sum256([]byte(tok))
 	want := hex.EncodeToString(sum[:])
-	for _, line := range strings.Split(string(b), "\n") {
-		line = strings.TrimSpace(line)
+	for _, line := range s.pairedTokens() {
 		// Lines hold either the token itself or "sha256:<hex>".
 		if h, ok := strings.CutPrefix(line, "sha256:"); ok {
 			if subtle.ConstantTimeCompare([]byte(h), []byte(want)) == 1 {
@@ -323,7 +445,7 @@ func (s *Server) tailnetOK(ctx context.Context, remote string) (string, bool) {
 func (s *Server) loop(ctx context.Context) {
 	tick := time.NewTicker(200 * time.Millisecond) // exit records are a cheap stat; see checkRunning
 	defer tick.Stop()
-	lastGC, lastRelays := time.Time{}, time.Time{}
+	lastGC, lastRelays, lastRetire := time.Time{}, time.Time{}, time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -333,6 +455,23 @@ func (s *Server) loop(ctx context.Context) {
 		}
 		s.checkRunning()
 		s.checkSessions()
+		if time.Since(lastRetire) > 10*time.Second {
+			s.mu.Lock()
+			failed := s.retireErr != ""
+			s.mu.Unlock()
+			if failed {
+				lastRetire = time.Now()
+				err := s.retireOtherVersions()
+				s.mu.Lock()
+				if err != nil {
+					s.retireErr = err.Error()
+				} else {
+					s.retireErr = ""
+					log.Printf("old workloads retired; admitting work")
+				}
+				s.mu.Unlock()
+			}
+		}
 		s.reapUploads()
 		if time.Since(lastRelays) > 5*time.Second {
 			lastRelays = time.Now()
@@ -402,6 +541,12 @@ func (s *Server) status() api.Status {
 	if st.MemAvailable < s.cfg.memReserve {
 		st.Accepting, st.Reason = false, "host memory below reserve"
 	}
+	if s.retireErr != "" {
+		st.Accepting, st.Reason = false, "workloads of an older version still running: "+s.retireErr
+	}
+	if s.upgrading {
+		st.Accepting, st.Reason = false, "upgrading"
+	}
 
 	return st
 }
@@ -466,6 +611,23 @@ func (s *Server) releaseCPUsLocked(cpus []int) {
 }
 
 func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	if s.upgrading {
+		s.mu.Unlock()
+		writeErr(w, 503, "an upgrade is already in progress")
+		return
+	}
+	s.upgrading = true // no new work starts until the new binary takes over (or this fails)
+	s.mu.Unlock()
+	done := false
+	defer func() {
+		if !done {
+			s.mu.Lock()
+			s.upgrading = false
+			s.mu.Unlock()
+			s.kick()
+		}
+	}()
 	tmp := s.self + ".new"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 	if err != nil {
@@ -476,8 +638,19 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
+	proto := 0
 	if err == nil {
-		err = checkBinary(tmp)
+		proto, err = checkBinary(tmp)
+	}
+	if err == nil && proto != api.Proto && r.URL.Query().Get("force") != "1" {
+		// The new version would stop every workload this one started: only when none run, or
+		// when asked to.
+		s.mu.Lock()
+		busy := s.allocatedBusyLocked()
+		s.mu.Unlock()
+		if busy > 0 {
+			err = fmt.Errorf("the new binary speaks protocol %d (this one %d) and would stop %d running job(s)/session(s); retry when idle, or with --force", proto, api.Proto, busy)
+		}
 	}
 	if err == nil {
 		err = os.Rename(tmp, s.self)
@@ -487,9 +660,26 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "upgrade: "+err.Error())
 		return
 	}
+	done = true
 	writeJSON(w, map[string]string{"status": "upgraded; restarting"})
 	log.Printf("binary replaced; exiting so systemd restarts the new version")
 	go func() { time.Sleep(300 * time.Millisecond); os.Exit(0) }()
+}
+
+// allocatedBusyLocked counts running jobs and live sessions.
+func (s *Server) allocatedBusyLocked() int {
+	n := 0
+	for _, j := range s.jobs {
+		if j.State == api.StateRunning {
+			n++
+		}
+	}
+	for _, se := range s.sessions {
+		if !api.Terminal(se.State) {
+			n++
+		}
+	}
+	return n
 }
 
 // hostTimezone returns the IANA zone of /etc/localtime, so containers keep the host's clock zone.

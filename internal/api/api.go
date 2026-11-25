@@ -9,7 +9,11 @@ const DefaultPort = 7420
 // Proto versions the runner protocol and how workloads are wired (mounts, relay sockets, the
 // stdin wrapper). A client only uses runners of its own version (`offload host upgrade` brings
 // them in line), and a runner stops workloads started by another version when it starts.
-const Proto = 4
+const Proto = 5
+
+// ProtoHeader carries the client's protocol version on every request; runners refuse other
+// versions (except for status, pairing and upgrades, which is how versions get back in step).
+const ProtoHeader = "X-Offload-Proto"
 
 // Job states.
 const (
@@ -260,4 +264,14 @@ type Status struct {
 // Error is the JSON body of a non-2xx response.
 type Error struct {
 	Error string `json:"error"`
+}
+
+// AgentRequestAllowed reports whether a framed SSH agent message is one a job may relay to the
+// user's agent: SSH_AGENTC_REQUEST_IDENTITIES (11) and SSH_AGENTC_SIGN_REQUEST (13) only. Adding
+// or removing keys, locking, and extensions never leave the runner.
+func AgentRequestAllowed(msg []byte) bool {
+	if len(msg) < 5 || int(msg[0])<<24|int(msg[1])<<16|int(msg[2])<<8|int(msg[3]) != len(msg)-4 {
+		return false
+	}
+	return msg[4] == 11 || msg[4] == 13
 }

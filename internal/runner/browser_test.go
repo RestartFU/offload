@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/RestartFU/offload/internal/api"
 )
 
 func TestBrowserRequest(t *testing.T) {
@@ -70,6 +73,7 @@ func TestAuthRefusesBrowsersAndForeignHosts(t *testing.T) {
 	h := s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
 	do := func(host string, hdr map[string]string) (int, string) {
 		r := httptest.NewRequest("POST", "http://"+host+"/v1/jobs", strings.NewReader(`{"argv":["true"]}`))
+		r.Header.Set(api.ProtoHeader, fmt.Sprint(api.Proto))
 		for k, v := range hdr {
 			r.Header.Set(k, v)
 		}
@@ -84,6 +88,15 @@ func TestAuthRefusesBrowsersAndForeignHosts(t *testing.T) {
 	// A browser is refused even with a token.
 	if code, body := do("100.64.0.1:7420", map[string]string{"Authorization": "Bearer secret", "Sec-Fetch-Site": "cross-site"}); code != 403 || !strings.Contains(body, "web pages") {
 		t.Fatalf("browser: %d %s", code, body)
+	}
+	// A client of another protocol version is refused, even with a token.
+	if code, body := do("box.example:7420", map[string]string{"Authorization": "Bearer secret", api.ProtoHeader: "4"}); code != 412 || !strings.Contains(body, "protocol") {
+		t.Fatalf("old client: %d %s", code, body)
+	}
+	// Without a token, a caller is not admitted to the API (tailnet identity is only for status
+	// and first pairing; the test request comes from no tailnet peer at all).
+	if code, _ := do("100.64.0.1:7420", nil); code != 403 {
+		t.Fatalf("tokenless caller: %d", code)
 	}
 	// An unknown name is refused before the tailnet identity is even looked up.
 	if code, body := do("evil.example:7420", nil); code != 403 || !strings.Contains(body, "hostnames") {

@@ -81,6 +81,7 @@ Client:
 Secrets can also come from the environment (e.g. an MCP entry's "env"):
   OFFLOAD_SECRET_<NAME>=<source>   OFFLOAD_SECRET_FILE_<NAME>=<path>   OFFLOAD_WITH=set1,set2
   offload host upgrade NAME|--all [--binary PATH]   push this (or a matching) binary to runners
+  offload host pair NAME|--all       let this client use a runner (once per runner)
 
 Environments (jobs run in containers; agents are root inside and can install anything):
   offload env show [--environment N]            the environment a job here would use
@@ -153,6 +154,8 @@ func main() {
 		die("usage: offload hook claude")
 	case "version", "--version":
 		fmt.Println(versionString())
+	case "proto": // the runner protocol this binary speaks (runners check it before an upgrade)
+		fmt.Println(api.Proto)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:
@@ -273,8 +276,14 @@ func cmdMCP(args []string) error {
 }
 
 func cmdHost(args []string) error {
+	if len(args) >= 1 && args[0] == "pair" {
+		fs := flag.NewFlagSet("pair", flag.ExitOnError)
+		all := fs.Bool("all", false, "pair with every runner")
+		_ = fs.Parse(args[1:])
+		return client.Pair(fs.Args(), *all)
+	}
 	if len(args) < 1 || args[0] != "upgrade" {
-		die("usage: offload host upgrade NAME...|--all")
+		die("usage: offload host upgrade|pair NAME...|--all")
 	}
 	fs := flag.NewFlagSet("upgrade", flag.ExitOnError)
 	all := fs.Bool("all", false, "upgrade every runner")

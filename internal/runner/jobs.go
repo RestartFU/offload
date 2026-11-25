@@ -417,13 +417,15 @@ func (s *Server) note(j *job, msg string) {
 
 // handleGitBundle receives the commits a job's workspace is missing.
 func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
+	gitCtx, stopGit := context.WithCancel(r.Context())
+	defer stopGit()
 	s.mu.Lock()
 	j := s.jobs[r.PathValue("id")]
 	ok := j != nil && j.State == api.StateUploading && j.Spec.Git != nil && !j.syncing
 	if ok {
 		j.syncing = true
 		rc := http.NewResponseController(w)
-		j.abortUpload = func() { _ = rc.SetReadDeadline(time.Now()) } // DELETE interrupts a read in progress
+		j.abortUpload = func() { _ = rc.SetReadDeadline(time.Now()); stopGit() } // DELETE interrupts the read, or git
 	}
 	s.mu.Unlock()
 	if !ok {
@@ -447,7 +449,7 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 		defer os.Remove(tmp.Name())
 	}
 	if err == nil {
-		err = s.gitReceive(j.Spec.WorkspaceKey, j.Spec.Git.Head, tmp.Name())
+		err = s.gitReceive(gitCtx, j.Spec.WorkspaceKey, j.Spec.Git.Head, tmp.Name())
 	}
 	if err != nil {
 		s.note(j, "git history upload failed; running without .git: "+err.Error())
@@ -477,7 +479,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	j.syncing = true
 	rc := http.NewResponseController(w)
-	j.abortUpload = func() { _ = rc.SetReadDeadline(time.Now()) } // DELETE interrupts a read in progress
+	gitCtx, stopGit := context.WithCancel(r.Context())
+	defer stopGit()
+	j.abortUpload = func() { _ = rc.SetReadDeadline(time.Now()); stopGit() } // DELETE interrupts the read, or git
 	sl, manifest := j.slot, j.Spec.Manifest
 	s.mu.Unlock()
 
@@ -489,7 +493,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	g := j.Spec.Git
 	s.mu.Unlock()
 	if err == nil && g != nil {
-		if gerr := s.gitCheckout(sl, j.Spec.WorkspaceKey, g); gerr != nil {
+		if gerr := s.gitCheckout(gitCtx, sl, j.Spec.WorkspaceKey, g); gerr != nil {
 			s.note(j, "running without .git: "+gerr.Error())
 		}
 	} else if err == nil {
@@ -552,21 +556,26 @@ func (s *Server) reapUploads() {
 // runner of another protocol version (their mounts and sockets differ and may expose more than
 // current ones), and removes offload containers that no current workload owns. Nothing from an
 // older version ever runs next to new work.
-func (s *Server) retireOtherVersions() {
-	live := map[string]bool{}
-	stop := func(unit string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		_ = exec.CommandContext(ctx, "systemctl", "--user", "stop", unit).Run() // waits for it
+func (s *Server) retireOtherVersions() error {
+	type victim struct {
+		unit   string
+		finish func()
 	}
+	var victims []victim
+	live := map[string]bool{}
+	s.mu.Lock()
 	for _, j := range s.jobs {
 		if api.Terminal(j.State) {
 			continue
 		}
 		if j.State == api.StateRunning && j.Proto != api.Proto {
+			j := j
 			log.Printf("job %s: started by protocol %d, stopping it (runner speaks %d)", j.ID, j.Proto, api.Proto)
-			stop(j.Unit)
-			s.finishLocked(j, api.StateFailed, nil, "stopped: the runner was upgraded while it ran")
+			victims = append(victims, victim{j.Unit, func() {
+				if !api.Terminal(j.State) {
+					s.finishLocked(j, api.StateFailed, nil, "stopped: the runner was upgraded while it ran")
+				}
+			}})
 			continue
 		}
 		live["offload-"+j.ID] = true
@@ -576,26 +585,59 @@ func (s *Server) retireOtherVersions() {
 			continue
 		}
 		if se.Proto != api.Proto {
+			se := se
 			log.Printf("session %s: started by protocol %d, stopping it", se.ID, se.Proto)
-			stop(se.Unit)
-			s.finishSessionLocked(se, nil, "runner upgraded; start the session again")
+			victims = append(victims, victim{se.Unit, func() {
+				if !api.Terminal(se.State) {
+					s.finishSessionLocked(se, nil, "runner upgraded; start the session again")
+				}
+			}})
 			continue
 		}
 		live["offload-"+se.ID] = true
 	}
-	if !s.containersAvailable() {
-		return
+	s.mu.Unlock()
+	var problems []string
+	for _, v := range victims {
+		if err := stopUnitConfirmed(v.unit); err != nil {
+			problems = append(problems, err.Error())
+			continue
+		}
+		s.mu.Lock()
+		v.finish()
+		s.mu.Unlock()
 	}
-	out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-[js]-", "--format", "{{.Names}}")
-	if err != nil {
-		return
-	}
-	for _, name := range strings.Fields(out) {
-		if !live[name] {
-			log.Printf("removing container %s: no current workload owns it", name)
-			_, _ = podman(context.Background(), "rm", "-f", name)
+	if s.containersAvailable() {
+		out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-[js]-", "--format", "{{.Names}}")
+		if err != nil {
+			problems = append(problems, "listing containers: "+err.Error())
+		} else {
+			for _, name := range strings.Fields(out) {
+				if live[name] {
+					continue
+				}
+				log.Printf("removing container %s: no current workload owns it", name)
+				if _, err := podman(context.Background(), "rm", "-f", name); err != nil {
+					problems = append(problems, "removing container "+name+": "+err.Error())
+				}
+			}
 		}
 	}
+	if len(problems) > 0 {
+		return errors.New(strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// stopUnitConfirmed stops a unit, waiting, and confirms it is gone.
+func stopUnitConfirmed(unit string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	err := exec.CommandContext(ctx, "systemctl", "--user", "stop", unit).Run() // waits for it
+	if active, known := unitActive(unit); active || !known {
+		return fmt.Errorf("stopping %s: still running or unknown (%v)", unit, err)
+	}
+	return nil
 }
 
 // admit starts queued jobs that fit, oldest first. Small jobs may pass a big one, unless the
@@ -603,6 +645,9 @@ func (s *Server) retireOtherVersions() {
 func (s *Server) admit() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.retireErr != "" || s.upgrading {
+		return // workloads of an older version may still run: start nothing until they're gone
+	}
 	var queued []*job
 	for _, j := range s.jobs {
 		if j.State == api.StateQueued && !j.cancel {
@@ -768,6 +813,7 @@ func (s *Server) startJobLocked(j *job) error {
 	// the start, restore sees a running job and watches its unit instead of starting it again.
 	now := time.Now()
 	j.State, j.StartedAt = api.StateRunning, &now
+	j.Proto = api.Proto // the version that launched it (a queued job may predate an upgrade)
 	if err := j.save(); err != nil {
 		s.releaseCPUsLocked(j.cpus)
 		s.cleanupCredentials(j)

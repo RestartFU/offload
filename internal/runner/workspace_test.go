@@ -250,9 +250,73 @@ func TestUsesContext(t *testing.T) {
 		"FROM b\nRUN --mount=type=bind,target=/src make -C /src\n":             true,
 		"FROM b\nRUN --mount=type=bind,from=builder,target=/x ls\n":            false,
 		"FROM offload/base\nRUN apt-get install -y jq\n":                       false,
+		"FROM b\nRUN echo \\\n  hi\nCOPY \\\n  . /src\n":                       true,  // continued COPY
+		"FROM b\nRUN apt-get install -y \\\n  # a comment\\\n  jq\n":           false, // comment inside a continuation
+		"FROM b\nCOPY --chown=1:1 --from=builder /a /a\n":                      false,
+		"FROM b\nCOPY ./--from=x /a\n":                                         true, // not a flag
+		"FROM b\nRUN --mount=target=/src make\n":                               true, // bind is the default mount type
+		"# escape=`\nFROM b\nCOPY `\n  . /src\n":                               true,
 	} {
 		if got := usesContext(cf); got != want {
 			t.Errorf("usesContext(%q) = %v, want %v", cf, got, want)
+		}
+	}
+}
+
+func TestInterruptedApplyIsDistrusted(t *testing.T) {
+	dir := t.TempDir()
+	sl := &slot{Key: "k", Index: 0, Dir: filepath.Join(dir, "0")}
+	os.MkdirAll(sl.Dir, 0o755)
+	a, ab := entry("a.txt", "one")
+	m := []api.FileEntry{a}
+	need, _ := sl.plan(m)
+	if err := sl.apply(m, need, tarOf(t, map[string][]byte{"a.txt": ab}, need)); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash after the dirty record was saved: a.txt looks unchanged, but its record
+	// can't be trusted, so it is requested again; a recorded stage is cleaned, a lookalike not.
+	rec := sl.load()
+	rec.Dirty, rec.Stages = []string{"a.txt"}, []string{".offload-stage-dead"}
+	if err := sl.save(rec); err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(filepath.Join(sl.Dir, ".offload-stage-dead"), 0o755)
+	os.WriteFile(filepath.Join(sl.Dir, ".offload-stage-mine"), []byte("job file"), 0o644)
+	if need, _ := sl.plan(m); len(need) != 1 {
+		t.Fatalf("dirty file not re-requested: %v", need)
+	}
+	need, _ = sl.plan(m)
+	if err := sl.apply(m, need, tarOf(t, map[string][]byte{"a.txt": ab}, need)); err != nil {
+		t.Fatal(err)
+	}
+	if need, _ := sl.plan(m); len(need) != 0 {
+		t.Fatalf("still distrusted after a complete apply: %v", need)
+	}
+	if _, err := os.Stat(filepath.Join(sl.Dir, ".offload-stage-dead")); !os.IsNotExist(err) {
+		t.Fatal("recorded stage left behind")
+	}
+	if _, err := os.Stat(filepath.Join(sl.Dir, ".offload-stage-mine")); err != nil {
+		t.Fatal("removed a file that only looked like a stage")
+	}
+}
+
+func TestAgentRequestAllowed(t *testing.T) {
+	frame := func(b ...byte) []byte { return append([]byte{0, 0, 0, byte(len(b))}, b...) }
+	for _, c := range []struct {
+		msg  []byte
+		want bool
+	}{
+		{frame(11), true},               // list identities
+		{frame(13, 0, 0, 0), true},      // sign
+		{frame(17, 1, 2), false},        // add identity
+		{frame(19), false},              // remove all
+		{frame(22, 0), false},           // lock
+		{frame(27, 1), false},           // extension
+		{[]byte{0, 0, 0, 9, 11}, false}, // length mismatch
+		{nil, false},
+	} {
+		if got := api.AgentRequestAllowed(c.msg); got != c.want {
+			t.Errorf("AgentRequestAllowed(%v) = %v, want %v", c.msg, got, c.want)
 		}
 	}
 }

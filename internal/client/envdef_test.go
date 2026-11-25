@@ -1,7 +1,9 @@
 package client
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,5 +131,19 @@ func TestBlockedTarget(t *testing.T) {
 		if got := blockedTarget(target, cfg) != ""; got != blocked {
 			t.Errorf("blockedTarget(%s) = %v, want %v", target, got, blocked)
 		}
+	}
+}
+
+func TestReadLineMax(t *testing.T) {
+	r := bufio.NewReaderSize(strings.NewReader("short\n"+strings.Repeat("x", 100)+"\nend"), 16)
+	if l, err := readLineMax(r, 64); err != nil || string(l) != "short\n" {
+		t.Fatalf("got %q %v", l, err)
+	}
+	if _, err := readLineMax(r, 64); !errors.Is(err, errTooLong) {
+		t.Fatalf("long line: %v", err)
+	}
+	r = bufio.NewReaderSize(strings.NewReader(strings.Repeat("y", 40)+"\n"), 16)
+	if l, err := readLineMax(r, 64); err != nil || len(l) != 41 {
+		t.Fatalf("line across buffer refills: %d %v", len(l), err)
 	}
 }
