@@ -91,7 +91,8 @@ func MCP(o MCPOptions) error {
 	var h *Host
 	var se api.Session
 	excluded := map[string]bool{}
-	refused := map[string]bool{} // answered 403 (pairing reset there): skipped for this session
+	refused := map[string]bool{} // answered 403/422 (not paired, can never fit): skipped this launch
+	lastRefusal := ""
 pick:
 	for {
 		hosts := Discover(ctx, cfg)
@@ -122,8 +123,12 @@ pick:
 		} else {
 			h, err = Pick(hosts, res, profile, "", "session")
 		}
-		if err != nil && len(excluded) > 0 {
-			// Every runner that can take it was full: wait, then a fresh round.
+		if err != nil && len(excluded) == 0 && !anyBusy(hosts) && lastRefusal != "" {
+			return fmt.Errorf("%w (and %s)", err, lastRefusal)
+		}
+		if err != nil && (len(excluded) > 0 || anyBusy(hosts)) {
+			// Every runner that can take it is full or under memory pressure right now: wait,
+			// then a fresh round.
 			fmt.Fprintf(os.Stderr, "offload: every runner that fits is full right now; waiting\n")
 			select {
 			case <-ctx.Done():
@@ -151,6 +156,12 @@ pick:
 					return fmt.Errorf("session %s uses data set %q, which client.toml doesn't define ([data.%s])", profile, name, name)
 				}
 				if err := SyncData(ctx, h, name, dc, false); err != nil {
+					var ae *APIError
+					if errors.As(err, &ae) && ae.Code == 403 && on == "" {
+						fmt.Fprintf(os.Stderr, "offload: %s: %s; trying another runner\n", h.Name, ae.Msg)
+						refused[h.URL] = true
+						continue pick
+					}
 					return err
 				}
 			}
@@ -170,9 +181,11 @@ pick:
 				}
 				continue
 			}
-			if errors.As(err, &ae) && ae.Code == 403 && on == "" {
+			if errors.As(err, &ae) && (ae.Code == 403 || ae.Code == 422) && on == "" {
+				// Not paired any more, or the session can never fit there: another runner.
 				fmt.Fprintf(os.Stderr, "offload: %s: %s; trying another runner\n", h.Name, ae.Msg)
 				refused[h.URL] = true
+				lastRefusal = h.Name + ": " + ae.Msg
 				continue pick
 			}
 			if errors.As(err, &ae) && ae.Code == 503 {
@@ -259,6 +272,17 @@ pick:
 		}
 		return nil
 	}
+}
+
+// anyBusy reports whether a paired runner is temporarily refusing work (below its memory
+// reserve, upgrading, reconciling): worth waiting for rather than giving up.
+func anyBusy(hosts []*Host) bool {
+	for _, h := range hosts {
+		if h.Status != nil && !h.Status.Accepting && !(h.derived && h.Token == "") {
+			return true
+		}
+	}
+	return false
 }
 
 // interrupted is what Ctrl-C returns: fine for a bridged MCP server, a failure for --prepare

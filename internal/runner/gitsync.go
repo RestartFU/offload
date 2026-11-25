@@ -105,9 +105,14 @@ func (s *Server) gitPlan(key, head string, tags map[string]string) (needed bool,
 var gitLocks sync.Map
 
 func (s *Server) gitReceive(ctx context.Context, key, head, bundle string) error {
-	m, _ := gitLocks.LoadOrStore(key, &sync.Mutex{})
-	m.(*sync.Mutex).Lock()
-	defer m.(*sync.Mutex).Unlock()
+	l, _ := gitLocks.LoadOrStore(key, make(chan struct{}, 1))
+	sem := l.(chan struct{})
+	select { // a cancelled job stops waiting (and frees its slot) at once
+	case sem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-sem }()
 	shared, err := s.ensureShared(key)
 	if err != nil {
 		return err

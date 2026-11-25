@@ -338,7 +338,7 @@ func SyncData(ctx context.Context, h *Host, name string, cfg DataSetConfig, quie
 			continue
 		}
 		if resp.StatusCode >= 300 {
-			return fmt.Errorf("data set %s: %s: %s", name, resp.Status, strings.TrimSpace(string(b)))
+			return fmt.Errorf("data set %s: %w", name, &APIError{Code: resp.StatusCode, Msg: apiMessage(b)})
 		}
 		break
 	}

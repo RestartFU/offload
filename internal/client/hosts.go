@@ -465,14 +465,19 @@ func (h *Host) request(ctx context.Context, method, path string, body io.Reader)
 	}
 	if resp.StatusCode >= 300 {
 		defer resp.Body.Close()
-		var e api.Error
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-		if json.Unmarshal(b, &e) != nil || e.Error == "" {
-			e.Error = strings.TrimSpace(string(b))
-		}
-		return nil, &APIError{Code: resp.StatusCode, Msg: e.Error}
+		return nil, &APIError{Code: resp.StatusCode, Msg: apiMessage(b)}
 	}
 	return resp, nil
+}
+
+// apiMessage is the error message of a runner's error body.
+func apiMessage(b []byte) string {
+	var e api.Error
+	if json.Unmarshal(b, &e) != nil || e.Error == "" {
+		return strings.TrimSpace(string(b))
+	}
+	return e.Error
 }
 
 // do sends a JSON request (in may be nil, or an io.Reader for raw bodies) and decodes JSON into out.

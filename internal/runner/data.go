@@ -84,7 +84,7 @@ func (sl *slot) planData(manifest []api.FileEntry) (needed []string, changed boo
 	aliased := map[string]bool{}
 	changedEntries := append([]string(nil), needed...) // contents, and links/modes that changed
 	for _, e := range manifest {
-		if old, ok := rec.Files[e.Path]; !ok || old.Link != e.Link || old.Mode != e.Mode {
+		if old, ok := rec.Files[e.Path]; !ok || old.Link != e.Link || (e.Link == "" && old.Mode != e.Mode) { // a link's mode means nothing
 			changedEntries = append(changedEntries, e.Path)
 		}
 	}

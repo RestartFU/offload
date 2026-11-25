@@ -687,7 +687,10 @@ func (s *Server) ownerLabel() string { return "dev.offload.runner=" + hash12(s.c
 // podmanRun builds the podman command line. Paths are mounted where they are on the host; the
 // mounted static offload binary is the entrypoint and loads secrets inside.
 func (s *Server) podmanRun(r runSpec) []string {
-	a := []string{"podman", "run", "--rm", "--name", r.Name, "--label", s.ownerLabel(),
+	// --user 0:0: workloads run as the container's root (the runner's own user outside, in
+	// rootless podman), which owns the mounted workspace and temp dirs; an image's USER line
+	// (a devcontainer's "node") couldn't write them.
+	a := []string{"podman", "run", "--rm", "--name", r.Name, "--label", s.ownerLabel(), "--user", "0:0",
 		"--cgroups=split", "--security-opt", "label=disable",
 		"--pids-limit=-1", "--init", "--pull=never",
 		fmt.Sprintf("--memory=%d", r.Mem), "--memory-swap=" + fmt.Sprint(r.Mem),
@@ -908,13 +911,25 @@ func (s *Server) gcContainersLocked() {
 	if !s.containersAvailable() {
 		return
 	}
+	live := map[string]bool{} // images of running jobs and live sessions are in use, whatever their age
+	for _, j := range s.jobs {
+		if !api.Terminal(j.State) && j.Image != "" {
+			live[j.Image] = true
+		}
+	}
+	for _, se := range s.sessions {
+		if !api.Terminal(se.State) && se.Image != "" {
+			live[se.Image] = true
+		}
+	}
 	for tag, at := range s.imageUse {
-		if tag == baseTag() || time.Since(at) < s.cfg.imageRetain {
+		if tag == baseTag() || time.Since(at) < s.cfg.imageRetain || live[tag] {
 			continue
 		}
-		if _, err := podman(context.Background(), "rmi", tag); err == nil {
-			log.Printf("gc: removed image %s (unused since %s)", tag, at.Format(time.DateTime))
+		if _, err := podman(context.Background(), "rmi", tag); err != nil && imageExists(tag) {
+			continue // still there (in use?): keep its record, try again next time
 		}
+		log.Printf("gc: removed image %s (unused since %s)", tag, at.Format(time.DateTime))
 		delete(s.imageUse, tag)
 		delete(s.readyImages, tag)
 	}
