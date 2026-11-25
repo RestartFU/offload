@@ -154,6 +154,46 @@ environment starts a system D-Bus for `flatpak run`. The updates mod's Google cr
 consent window is approved by mcpelauncher-agent itself (its `src/consent.ts`, via xdotool), so
 the session needs no laptop-side help.
 
+## Usage metrics and the ledger
+
+The runner samples usage every 5 seconds (`metrics.go`):
+
+- each CPU's busy share, from `/proc/stat` deltas;
+- host memory;
+- each live workload's `cpu.stat` `usage_usec` and `memory.current`/`memory.peak`, read from its
+  unit cgroup (the slice path expanded, falling back to systemd's `ControlGroup`).
+
+Samples are kept for an hour at full resolution and for a week as one-minute averages,
+persisted to `metrics.json` every five minutes. Longer ranges are averaged into round steps of
+at most 720 points. The wrapper records the unit's CPU time in the exit record, next to
+`memory.peak`.
+
+Every finished job and session is appended to `ledger.jsonl`: command signature, workspace,
+caller, wait and run time, resources, peak memory, CPU time, and synced vs uploaded files.
+The ledger outlives `storage.jobs.retain` and is trimmed to `storage.ledger.retain`.
+
+`X-Offload-Caller` is set only by `auth`: the tailnet login or tags, `token`, or `local`.
+Clients can't spoof it. It is recorded as the job's `caller`, separate from the free-form
+`client` label.
+
+## Dashboard
+
+`offload dashboard` runs on the laptop. It polls every runner every 2 seconds while a page is
+open (every 30 when none is) and rediscovers runners every 30 seconds. It serves a page with no
+build step: plain JS and hand-drawn SVG charts, embedded in the binary.
+
+It acts with the laptop's tailnet identity, so it guards that identity:
+
+- it listens on loopback only, and checks `Host` against its own address (no DNS rebinding);
+- a random key in the printed link becomes an `HttpOnly`, `SameSite=Strict` cookie (other local
+  users can't use it);
+- changes (cancel, stop) need an `X-Offload-Dashboard` header and a same-origin request;
+- a strict CSP forbids inline script and style;
+- runner data goes into the page as text nodes only.
+
+Session logs are read with `observe=1`, so watching doesn't count as an attached client and
+doesn't keep an idle session alive.
+
 ## Keeping the host alive
 
 - One physical core (the siblings of the highest-numbered CPU) is left out of `capacity.cpus`.

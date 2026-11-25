@@ -56,6 +56,9 @@ type Config struct {
 		Jobs struct {
 			Retain string `toml:"retain"`
 		} `toml:"jobs"`
+		Ledger struct {
+			Retain string `toml:"retain"`
+		} `toml:"ledger"`
 	} `toml:"storage"`
 
 	Container struct {
@@ -78,6 +81,7 @@ type Config struct {
 	cpus         []int
 	cacheRetain  time.Duration
 	jobsRetain   time.Duration
+	ledgerRetain time.Duration
 	sessionGrace time.Duration
 	persistent   bool
 	buildMem     int64
@@ -206,6 +210,9 @@ func (c *Config) finish() error {
 		return err
 	}
 	if c.jobsRetain, err = durationOr(c.Storage.Jobs.Retain, 24*time.Hour); err != nil {
+		return err
+	}
+	if c.ledgerRetain, err = durationOr(c.Storage.Ledger.Retain, 30*24*time.Hour); err != nil {
 		return err
 	}
 	if c.sessionGrace, err = durationOr(c.Policy.SessionGrace, 5*time.Minute); err != nil {

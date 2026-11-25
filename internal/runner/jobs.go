@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,7 @@ type job struct {
 // exitRecord is written by the unit wrapper when the command ends.
 type exitRecord struct {
 	Code             int            `json:"code"`
+	CPUUsec          int64          `json:"cpu_usec,omitempty"` // the unit's CPU time (cpu.stat usage_usec)
 	Signal           string         `json:"signal,omitempty"`
 	OOM              bool           `json:"oom,omitempty"`
 	Error            string         `json:"error,omitempty"`
@@ -270,6 +272,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if spec.Client == "" {
 		spec.Client = r.Header.Get("X-Offload-Caller")
 	}
+	caller := callerOf(r)
 	if err := validSecrets(spec.Secrets, spec.SecretFiles); err != nil {
 		out.err(400, err.Error())
 		return
@@ -300,7 +303,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j := &job{Job: api.Job{
-		ID: newID("j-"), Runner: s.cfg.Name, State: api.StateUploading, Spec: spec,
+		ID: newID("j-"), Runner: s.cfg.Name, State: api.StateUploading, Spec: spec, Caller: caller,
 		Resources: s.cfg.effective(spec.Resources, prof), CreatedAt: time.Now(), Runtime: rt,
 	}}
 	if rt == "container" {
@@ -406,7 +409,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		j.slot, j.Slot = sl, sl.id()
-		j.Needed, j.SyncFiles = needed, len(spec.Manifest)
+		j.Needed, j.SyncFiles, j.Uploaded = needed, len(spec.Manifest), len(needed)
 		s.touchRepoStores(spec.WorkspaceKey)
 		if spec.Git != nil {
 			if !validGitRef(spec.Git) {
@@ -1034,6 +1037,7 @@ func (s *Server) checkRunning() {
 			if state == api.StateCancelled {
 				j.WriteBack = nil // a cancelled job's half-done edits are never written back
 			}
+			j.CPUSeconds = float64(rec.CPUUsec) / 1e6
 			s.learn(j, rec)
 			s.finishLocked(j, state, &code, reason)
 		case active:
@@ -1069,6 +1073,10 @@ func (s *Server) finishLocked(j *job, state string, code *int, reason string) {
 	now := time.Now()
 	j.State, j.ExitCode, j.Reason, j.FinishedAt = state, code, reason, &now
 	s.leaveBuildsLocked(j)
+	if cpu := s.takeCPUSeconds(j.ID); j.CPUSeconds == 0 {
+		j.CPUSeconds = cpu // from the last sample: an older wrapper, or no exit record
+	}
+	s.recordJobLocked(j)
 	s.cleanupCredentials(j)
 	s.releaseCPUsLocked(j.cpus)
 	j.cpus = nil
@@ -1197,7 +1205,8 @@ func (s *Server) handleJobLogs(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("stream") == "stderr" {
 		file = "stderr.log"
 	}
-	streamFile(w, r, filepath.Join(j.dir, file), offset, follow, done)
+	path := filepath.Join(j.dir, file)
+	streamFile(w, r, path, tailOffset(r, path, offset), follow, done)
 }
 
 func (s *Server) handleWriteBack(w http.ResponseWriter, r *http.Request) {
@@ -1217,6 +1226,19 @@ func (s *Server) handleWriteBack(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, p)
 }
 
+// tailOffset applies ?tail=N: start N bytes before the end (for a log viewer). streamFile
+// reports the offset it starts from in X-Offload-Offset, so the caller knows what it skipped.
+func tailOffset(r *http.Request, path string, offset int64) int64 {
+	var tail int64
+	fmt.Sscan(r.URL.Query().Get("tail"), &tail)
+	if tail > 0 {
+		if fi, err := os.Stat(path); err == nil {
+			offset = max(0, fi.Size()-tail)
+		}
+	}
+	return offset
+}
+
 // streamFile copies path from offset to the response, polling for growth while follow is set
 // and done() is false. It always drains the file after done() turns true.
 func streamFile(w http.ResponseWriter, r *http.Request, path string, offset int64, follow bool, done func() bool) {
@@ -1232,6 +1254,7 @@ func streamFile(w http.ResponseWriter, r *http.Request, path string, offset int6
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("X-Offload-Offset", strconv.FormatInt(offset, 10))
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 64<<10)
 	// A follow ends after a while even if nothing does: the client reconnects from its offset,
@@ -1293,6 +1316,7 @@ func (s *Server) gc() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcContainersLocked()
+	s.gcLedgerLocked()
 	for id, j := range s.jobs {
 		if api.Terminal(j.State) && j.FinishedAt != nil && time.Since(*j.FinishedAt) > s.cfg.jobsRetain {
 			_ = os.RemoveAll(j.dir)

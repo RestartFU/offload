@@ -63,6 +63,9 @@ type Server struct {
 	whois   map[string]whoisEntry
 
 	ownNames selfNames // our own DNS names, for the Host check
+
+	started time.Time
+	metrics metricsState // usage samples (metrics.go)
 }
 
 type whoisEntry struct {
@@ -91,6 +94,8 @@ func New(cfg *Config, version string) (*Server, error) {
 		}
 	}
 	s.loadHistory()
+	s.loadMetrics()
+	s.started = time.Now()
 	s.loadImageUse()
 	// Held for the daemon's lifetime: `runner reset-pairing` resets the file directly only when
 	// no runner holds it.
@@ -161,6 +166,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/estimate", s.handleEstimate)
 	mux.HandleFunc("POST /v1/admin/reset-pairing-checked", s.handleResetPairing)
 	mux.HandleFunc("POST /v1/admin/pair", s.handlePair)
+	mux.HandleFunc("GET /v1/metrics", s.handleMetrics)
+	mux.HandleFunc("GET /v1/metrics/series", s.handleSeries)
+	mux.HandleFunc("GET /v1/ledger", s.handleLedger)
 
 	handler := s.auth(mux)
 	errc := make(chan error, len(s.cfg.Listen))
@@ -169,6 +177,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	go s.loop(ctx)
 	go s.prebuildBase()
+	go s.sampleLoop(ctx)
 	select {
 	case <-ctx.Done():
 		return nil
@@ -482,6 +491,18 @@ func (s *Server) tokensPath() string {
 
 const pairByCodeHeader = "X-Offload-Pair-By-Code"
 
+// callerOf names how a request was admitted, for the job's record: "local" (the unix socket),
+// "token" (a paired client), or the tailnet identity. auth strips the headers it relies on.
+func callerOf(r *http.Request) string {
+	switch {
+	case r.Context().Value(unixMarker{}) != nil:
+		return "local"
+	case r.Header.Get(callerTokenHeader) != "":
+		return "token"
+	}
+	return r.Header.Get("X-Offload-Caller")
+}
+
 // callerTokenHeader carries the sha256 of the token a request authenticated with (set by auth).
 const callerTokenHeader = "X-Offload-Caller-Token"
 
@@ -689,6 +710,7 @@ func (s *Server) status() api.Status {
 		Profiles: map[string]api.ProfileInfo{}, Persistent: s.cfg.persistent, Accepting: true,
 	}
 	st.Hostname, _ = os.Hostname()
+	st.Started, st.HostCPUs, st.Metrics = s.started, runtime.NumCPU(), true
 	st.Proto = api.Proto
 	st.OS, st.Arch, st.Runtime = runtime.GOOS, runtime.GOARCH, "host"
 	if s.containersAvailable() {

@@ -90,6 +90,8 @@ max_slots_per_key = 3  # concurrent jobs per repository
 retain = "14d"         # drop workspaces unused this long
 [storage.jobs]
 retain = "24h"         # keep finished job logs and artifacts this long
+[storage.ledger]
+retain = "30d"         # keep statistics on finished jobs (for the dashboard) this long
 
 [policy]
 max_sessions = 4

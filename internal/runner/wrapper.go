@@ -75,6 +75,9 @@ func RunExec(o ExecOptions) int {
 	}
 	code, sig, runErr := runChild(o.Argv, nil, os.Stdout)
 	rec := exitRecord{Code: code, Signal: sig, OOM: oomKilled(), PeakMem: cgroupInt("memory.peak")}
+	if usec, ok := cgroupCPUUsec(unitCgroup()); ok {
+		rec.CPUUsec = int64(usec)
+	}
 	if runErr != nil {
 		rec.Error = runErr.Error()
 		fmt.Fprintf(os.Stderr, "offload: %v\n", runErr)

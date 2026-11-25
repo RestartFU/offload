@@ -485,6 +485,16 @@ func apiMessage(b []byte) string {
 	return e.Error
 }
 
+// Request sends a request to the runner. A non-2xx answer comes back as an *APIError.
+func (h *Host) Request(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
+	return h.request(ctx, method, path, body)
+}
+
+// Do sends a JSON request (in may be nil) and decodes the JSON answer into out (may be nil).
+func (h *Host) Do(ctx context.Context, method, path string, in, out any) error {
+	return h.do(ctx, method, path, in, out)
+}
+
 // do sends a JSON request (in may be nil, or an io.Reader for raw bodies) and decodes JSON into out.
 func (h *Host) do(ctx context.Context, method, path string, in, out any) error {
 	var body io.Reader

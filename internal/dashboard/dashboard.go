@@ -1,0 +1,334 @@
+// Package dashboard serves `offload dashboard`: a local web page showing every runner, its
+// cores and memory, the jobs and sessions on it, and statistics from its ledger. It runs on
+// the laptop, talks to runners with the client's own identity, and listens on loopback only.
+package dashboard
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"embed"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"net/http"
+	"net/url"
+	"os/exec"
+	"regexp"
+	"runtime"
+	"strconv"
+	"time"
+
+	"github.com/RestartFU/offload/internal/api"
+	"github.com/RestartFU/offload/internal/client"
+)
+
+//go:embed ui
+var uiFiles embed.FS
+
+// Options configures the dashboard.
+type Options struct {
+	Addr    string // loopback address to listen on, e.g. "127.0.0.1:7421"
+	Open    bool   // open the browser
+	Version string // this binary's version, compared with the runners'
+}
+
+const cookieName = "offload_dashboard"
+
+type server struct {
+	opts  Options
+	token string
+	host  string // the Host header the page is served under, e.g. "127.0.0.1:7421"
+	fleet *fleet
+}
+
+// Run serves the dashboard until ctx ends.
+func Run(ctx context.Context, opts Options) error {
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return err
+	}
+	host, port, err := net.SplitHostPort(opts.Addr)
+	if err != nil {
+		return err
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("the dashboard listens on loopback only (got %s): it acts with this machine's identity", host)
+	}
+	ln, err := net.Listen("tcp", opts.Addr)
+	if err != nil && port != "0" {
+		ln, err = net.Listen("tcp", net.JoinHostPort(host, "0")) // the usual port is taken: any port
+	}
+	if err != nil {
+		return err
+	}
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return err
+	}
+	s := &server{opts: opts, token: hex.EncodeToString(b), host: ln.Addr().String(), fleet: newFleet(cfg)}
+	go s.fleet.run(ctx)
+
+	link := "http://" + s.host + "/?token=" + s.token
+	fmt.Printf("offload dashboard: %s\n(the link holds this session's key; Ctrl-C stops the dashboard)\n", link)
+	if opts.Open {
+		openBrowser(link)
+	}
+	srv := &http.Server{Handler: s.routes(), ReadHeaderTimeout: 10 * time.Second}
+	go func() { <-ctx.Done(); _ = srv.Close() }()
+	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+func openBrowser(link string) {
+	cmd := "xdg-open"
+	if runtime.GOOS == "darwin" {
+		cmd = "open"
+	}
+	_ = exec.Command(cmd, link).Start()
+}
+
+func (s *server) routes() http.Handler {
+	mux := http.NewServeMux()
+	static, _ := fs.Sub(uiFiles, "ui")
+	files := http.FileServerFS(static)
+	mux.Handle("GET /", files)
+	mux.HandleFunc("GET /api/fleet", s.handleFleet)
+	mux.HandleFunc("GET /api/series", s.handleSeries)
+	mux.HandleFunc("GET /api/ledger", s.handleLedger)
+	mux.HandleFunc("GET /api/logs", s.handleLogs)
+	mux.HandleFunc("POST /api/stop", s.handleStop)
+	return s.guard(mux)
+}
+
+// guard keeps the dashboard to this browser session. It acts with this machine's tailnet
+// identity, so: the Host must be our own loopback address (no DNS rebinding), every request
+// needs the session cookie (another local user can't use it), and anything that changes state
+// must come from our own page (no cross-site requests).
+func (s *server) guard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Cache-Control", "no-store")
+		if !s.hostOK(r.Host) {
+			http.Error(w, "unexpected Host", http.StatusForbidden)
+			return
+		}
+		if tok := r.URL.Query().Get("token"); tok != "" && r.URL.Path == "/" {
+			if !s.tokenOK(tok) {
+				http.Error(w, "this link is from an earlier dashboard session; use the link offload dashboard printed", http.StatusForbidden)
+				return
+			}
+			http.SetCookie(w, &http.Cookie{Name: cookieName, Value: s.token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
+			http.Redirect(w, r, "/", http.StatusSeeOther) // drop the key from the address bar
+			return
+		}
+		c, err := r.Cookie(cookieName)
+		if err != nil || !s.tokenOK(c.Value) {
+			http.Error(w, "open the link offload dashboard printed (it carries this session's key)", http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			site := r.Header.Get("Sec-Fetch-Site")
+			origin := r.Header.Get("Origin")
+			if r.Header.Get("X-Offload-Dashboard") != "1" || (site != "" && site != "same-origin") || (origin != "" && origin != "http://"+s.host) {
+				http.Error(w, "cross-site request refused", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *server) hostOK(h string) bool {
+	_, port, _ := net.SplitHostPort(s.host)
+	return h == s.host || h == "localhost:"+port
+}
+
+func (s *server) tokenOK(t string) bool {
+	return subtle.ConstantTimeCompare([]byte(t), []byte(s.token)) == 1
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeErr(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(api.Error{Error: msg})
+}
+
+func (s *server) handleFleet(w http.ResponseWriter, r *http.Request) {
+	s.fleet.watched()
+	writeJSON(w, s.fleet.snapshot(s.opts.Version))
+}
+
+var idRE = regexp.MustCompile(`^[a-z]-[0-9a-f]{1,32}$`)
+
+func (s *server) handleSeries(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	h := s.fleet.host(q.Get("host"))
+	if h == nil {
+		writeErr(w, 404, "no such runner")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	var out api.Series
+	if err := h.Do(ctx, "GET", "/v1/metrics/series?range="+url.QueryEscape(q.Get("range")), nil, &out); err != nil {
+		writeErr(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, out)
+}
+
+// ledgerRow is a ledger entry with the runner it came from.
+type ledgerRow struct {
+	Runner string `json:"runner"`
+	api.LedgerEntry
+}
+
+// handleLedger merges the ledgers of every online runner that keeps one.
+func (s *server) handleLedger(w http.ResponseWriter, r *http.Request) {
+	since := r.URL.Query().Get("since")
+	if _, err := time.Parse(time.RFC3339, since); err != nil {
+		writeErr(w, 400, "since: want RFC 3339")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	type result struct {
+		name string
+		rows []api.LedgerEntry
+		err  error
+	}
+	hosts := s.fleet.ledgerHosts()
+	ch := make(chan result, len(hosts))
+	for name, h := range hosts {
+		go func() {
+			var rows []api.LedgerEntry
+			err := h.Do(ctx, "GET", "/v1/ledger?since="+url.QueryEscape(since), nil, &rows)
+			ch <- result{name, rows, err}
+		}()
+	}
+	out := struct {
+		Rows   []ledgerRow       `json:"rows"`
+		Errors map[string]string `json:"errors,omitempty"`
+	}{Rows: []ledgerRow{}}
+	for range hosts {
+		res := <-ch
+		if res.err != nil {
+			if out.Errors == nil {
+				out.Errors = map[string]string{}
+			}
+			out.Errors[res.name] = res.err.Error()
+			continue
+		}
+		for _, e := range res.rows {
+			out.Rows = append(out.Rows, ledgerRow{Runner: res.name, LedgerEntry: e})
+		}
+	}
+	writeJSON(w, out)
+}
+
+// handleLogs streams a job's or session's output from the runner, following it. Session
+// streams are observe-only: watching doesn't keep an idle session alive. The body starts with
+// one JSON line, {"offset":N} (how many earlier bytes were skipped), then the raw output. The
+// line also gets a quiet stream going: browsers wait for a first byte before handing it over.
+func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	h := s.fleet.host(q.Get("host"))
+	id := q.Get("id")
+	if h == nil || !idRE.MatchString(id) {
+		writeErr(w, 404, "no such runner or workload")
+		return
+	}
+	tail, _ := strconv.ParseInt(q.Get("tail"), 10, 64)
+	tail = min(max(tail, 4<<10), 1<<20)
+	var path string
+	switch q.Get("kind") {
+	case "job":
+		path = "/v1/jobs/" + id + "/logs?follow=1&tail=" + strconv.FormatInt(tail, 10)
+		if q.Get("stream") == "stderr" {
+			path += "&stream=stderr"
+		}
+	case "session":
+		file := "stderr"
+		if q.Get("stream") == "stdout" {
+			file = "stdout"
+		}
+		path = "/v1/sessions/" + id + "/" + file + "?follow=1&observe=1&tail=" + strconv.FormatInt(tail, 10)
+	default:
+		writeErr(w, 400, "kind: job or session")
+		return
+	}
+	resp, err := h.Request(r.Context(), "GET", path, nil)
+	if err != nil {
+		var ae *client.APIError
+		if errors.As(err, &ae) && ae.Code == 404 {
+			writeErr(w, 404, ae.Msg)
+			return
+		}
+		writeErr(w, 502, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	off, _ := strconv.ParseInt(resp.Header.Get("X-Offload-Offset"), 10, 64)
+	fmt.Fprintf(w, "{\"offset\":%d}\n", off)
+	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// handleStop cancels a job or stops a session.
+func (s *server) handleStop(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Host string `json:"host"`
+		Kind string `json:"kind"`
+		ID   string `json:"id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	h := s.fleet.host(req.Host)
+	if h == nil || !idRE.MatchString(req.ID) || (req.Kind != "job" && req.Kind != "session") {
+		writeErr(w, 404, "no such runner or workload")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	if err := h.Do(ctx, "DELETE", "/v1/"+req.Kind+"s/"+req.ID, nil, nil); err != nil {
+		writeErr(w, 502, err.Error())
+		return
+	}
+	s.fleet.poke()
+	writeJSON(w, map[string]string{"status": "stopping"})
+}

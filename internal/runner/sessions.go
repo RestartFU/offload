@@ -141,6 +141,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if spec.Client == "" {
 		spec.Client = r.Header.Get("X-Offload-Caller")
 	}
+	caller := callerOf(r)
 	if err := validSecrets(spec.Secrets, spec.SecretFiles); err != nil {
 		out.err(400, err.Error())
 		return
@@ -239,6 +240,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	se := &session{Session: api.Session{
 		ID: newID("s-"), Runner: s.cfg.Name, Profile: spec.Profile, State: api.StateRunning,
 		Resources: res, CreatedAt: now, LastSeen: now, Runtime: rt, Image: image, Proto: api.Proto,
+		Client: spec.Client, Caller: caller,
 	}}
 	if spec.Def != nil && rt == "container" { // only container sessions mount them
 		for name := range spec.Def.Data {
@@ -582,14 +584,18 @@ func (s *Server) streamSession(w http.ResponseWriter, r *http.Request, file stri
 	var offset int64
 	fmt.Sscan(r.URL.Query().Get("offset"), &offset)
 	follow := r.URL.Query().Get("follow") != ""
-	s.touch(se, 1)
-	defer s.touch(se, -1)
+	if r.URL.Query().Get("observe") == "" { // a dashboard watching isn't a client keeping it alive
+		s.touch(se, 1)
+		defer s.touch(se, -1)
+	}
+	path := filepath.Join(se.dir, file)
+	offset = tailOffset(r, path, offset)
 	done := func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		return api.Terminal(se.State)
 	}
-	streamFile(w, r, filepath.Join(se.dir, file), offset, follow, done)
+	streamFile(w, r, path, offset, follow, done)
 }
 
 func (s *Server) handleStopSession(w http.ResponseWriter, r *http.Request) {
@@ -659,6 +665,7 @@ func (s *Server) checkSessions() {
 func (s *Server) finishSessionLocked(se *session, code *int, reason string) {
 	now := time.Now()
 	se.State, se.ExitCode, se.Reason, se.FinishedAt = api.StateExited, code, reason, &now
+	s.recordSessionLocked(se)
 	_ = os.RemoveAll(secretsDir(se.ID))
 	if se.relay != nil {
 		se.relay.close()
