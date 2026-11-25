@@ -51,6 +51,8 @@ type Server struct {
 
 	whoisMu sync.Mutex
 	whois   map[string]whoisEntry
+
+	ownNames selfNames // our own DNS names, for the Host check
 }
 
 type whoisEntry struct {
@@ -226,15 +228,24 @@ func (s *Server) waitTailscaleIPs(ctx context.Context) []string {
 	}
 }
 
-// auth admits local socket callers, bearer-token holders, and allowed tailnet identities.
+// auth admits local socket callers, bearer-token holders, and allowed tailnet identities. Web
+// pages are refused whatever the caller's identity (see browser.go).
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Context().Value(unixMarker{}) != nil {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if browserRequest(r) {
+			writeErr(w, http.StatusForbidden, "not allowed: the runner API does not accept requests from web pages")
+			return
+		}
 		if tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && s.tokenOK(tok) {
 			next.ServeHTTP(w, r)
+			return
+		}
+		if !s.hostOK(r.Host) {
+			writeErr(w, http.StatusForbidden, fmt.Sprintf("not allowed: unknown Host %q (if clients reach this runner by that name, add it to hostnames in runner.toml)", r.Host))
 			return
 		}
 		if who, ok := s.tailnetOK(r.Context(), r.RemoteAddr); ok {

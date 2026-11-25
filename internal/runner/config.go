@@ -18,11 +18,14 @@ import (
 
 // Config is the runner's TOML configuration (~/.config/offload/runner.toml).
 type Config struct {
-	Name        string            `toml:"name"`
-	Listen      []string          `toml:"listen"`      // "tailscale:7420", "unix", or "host:port"
-	AllowUsers  []string          `toml:"allow_users"` // tailnet login names allowed to use this runner
-	AllowTags   []string          `toml:"allow_tags"`  // tailnet node tags allowed to use this runner
-	TokensFile  string            `toml:"tokens_file"` // optional: one bearer token per line
+	Name       string   `toml:"name"`
+	Listen     []string `toml:"listen"`      // "tailscale:7420", "unix", or "host:port"
+	AllowUsers []string `toml:"allow_users"` // tailnet login names allowed to use this runner
+	AllowTags  []string `toml:"allow_tags"`  // tailnet node tags allowed to use this runner
+	TokensFile string   `toml:"tokens_file"` // optional: one bearer token per line
+	// Hostnames are extra DNS names tailnet clients use to reach this runner (a [[host]] url).
+	// IP addresses, localhost, this machine's hostname and tailnet name are always accepted.
+	Hostnames   []string          `toml:"hostnames"`
 	StateDir    string            `toml:"state_dir"`
 	ProfilesDir string            `toml:"profiles_dir"`
 	Slice       string            `toml:"slice"`

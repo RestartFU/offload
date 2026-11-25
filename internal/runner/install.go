@@ -69,6 +69,7 @@ listen = ["tailscale:%d", "unix"]   # tailnet addresses only, plus a local socke
 allow_users = [%s]                  # tailnet logins allowed to use this runner
 allow_tags = []
 # tokens_file = "~/.config/offload/tokens"   # optional bearer tokens, one per line
+# hostnames = ["box.example"]   # other DNS names tailnet clients use for this runner (IPs and its own names always work)
 
 [capacity]
 cpu = %d               # guaranteed CPU handed out in total
