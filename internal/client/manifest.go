@@ -26,13 +26,14 @@ import (
 
 // Workspace is the local source tree a job runs against.
 type Workspace struct {
-	Root     string // absolute path of the tree's root (git toplevel or cwd)
-	Key      string // stable runner-side workspace name
-	Dir      string // cwd relative to Root
-	Manifest []api.FileEntry
-	Git      *api.GitRef // HEAD and branch, nil outside git or before the first commit
-	GitTree  bool        // the manifest is git's view (tracked + untracked, minus ignored)
-	Submods  bool        // has submodules (synced as files; their own .git isn't recreated)
+	Root        string // absolute path of the tree's root (git toplevel or cwd)
+	Key         string // stable runner-side workspace name
+	Dir         string // cwd relative to Root
+	Manifest    []api.FileEntry
+	Git         *api.GitRef // HEAD and branch, nil outside git or before the first commit
+	GitTree     bool        // the manifest is git's view (tracked + untracked, minus ignored)
+	Submods     bool        // has submodules (synced as files; their own .git isn't recreated)
+	IgnoreRules string      // .git/info/exclude and core.excludesFile, concatenated
 }
 
 // skipDirs are never synced when the tree is not a git repository.
@@ -71,6 +72,7 @@ func LoadWorkspace(cwd string) (*Workspace, error) {
 		if err != nil {
 			return nil, err
 		}
+		ws.IgnoreRules = localIgnoreRules(ws.Root)
 		if staged, err := git(ws.Root, "ls-files", "--stage"); err == nil {
 			ws.Submods = strings.Contains("\n"+staged, "\n160000 ")
 		}
@@ -165,6 +167,36 @@ func gitFiles(root string) ([]string, error) {
 		add(f)
 	}
 	return files, nil
+}
+
+// localIgnoreRules are the ignore rules that live outside the tree: .git/info/exclude and the
+// user's excludes file (core.excludesFile, or git's default ~/.config/git/ignore).
+func localIgnoreRules(root string) string {
+	var files []string
+	if p, err := git(root, "rev-parse", "--git-path", "info/exclude"); err == nil {
+		p = strings.TrimSpace(p)
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(root, p)
+		}
+		files = append(files, p)
+	}
+	if p, err := git(root, "config", "--path", "core.excludesFile"); err == nil && strings.TrimSpace(p) != "" {
+		files = append(files, strings.TrimSpace(p))
+	} else if home, err := os.UserHomeDir(); err == nil {
+		cfg := os.Getenv("XDG_CONFIG_HOME")
+		if cfg == "" {
+			cfg = filepath.Join(home, ".config")
+		}
+		files = append(files, filepath.Join(cfg, "git", "ignore"))
+	}
+	var b strings.Builder
+	for _, f := range files {
+		if data, err := os.ReadFile(f); err == nil && b.Len()+len(data) < 256<<10 {
+			b.Write(data)
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
 }
 
 // workspaceKey names the runner-side workspace: repo name plus a hash of its origin (or path),

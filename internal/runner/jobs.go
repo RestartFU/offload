@@ -519,7 +519,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err == nil && j.Spec.GitTree {
-		s.pruneUntracked(gitCtx, sl, manifest)
+		s.pruneUntracked(gitCtx, sl, manifest, j.Spec.IgnoreRules)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -958,6 +958,7 @@ func readExit(path string) (*exitRecord, error) {
 func (s *Server) finishLocked(j *job, state string, code *int, reason string) {
 	now := time.Now()
 	j.State, j.ExitCode, j.Reason, j.FinishedAt = state, code, reason, &now
+	s.leaveBuildsLocked(j)
 	s.cleanupCredentials(j)
 	s.releaseCPUsLocked(j.cpus)
 	j.cpus = nil
@@ -1123,6 +1124,9 @@ func streamFile(w http.ResponseWriter, r *http.Request, path string, offset int6
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 64<<10)
+	// A follow ends after a while even if nothing does: the client reconnects from its offset,
+	// and every reconnect is authorized again (a reset pairing ends an idle bridge).
+	deadline := time.Now().Add(5 * time.Minute)
 	for {
 		finished := done()
 		for {
@@ -1142,7 +1146,7 @@ func streamFile(w http.ResponseWriter, r *http.Request, path string, offset int6
 		if flusher != nil {
 			flusher.Flush()
 		}
-		if !follow || finished {
+		if !follow || finished || time.Now().After(deadline) {
 			return
 		}
 		select {

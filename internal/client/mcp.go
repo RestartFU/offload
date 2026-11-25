@@ -123,7 +123,7 @@ pick:
 		} else {
 			h, err = Pick(hosts, res, profile, "", "session")
 		}
-		busy := anyBusy(candidates(hosts, on, profile, sc != nil))
+		busy := anyBusy(candidates(hosts, on, profile, api.JobSpec{Resources: res, Environment: spec.Environment, Runtime: "container"}, sc != nil))
 		if err != nil && len(excluded) == 0 && !busy && lastRefusal != "" {
 			return fmt.Errorf("%w (and %s)", err, lastRefusal)
 		}
@@ -275,22 +275,26 @@ pick:
 	}
 }
 
-// candidates are the runners a launch could use at all: the pinned one, or those with the
-// profile (client-defined sessions: any).
-func candidates(hosts []*Host, on, profile string, defined bool) []*Host {
+// candidates are the runners that could ever take this launch (pinned name, profile of the
+// session kind, capacity), whatever they are doing right now: only those are worth waiting for.
+func candidates(hosts []*Host, on, profile string, want api.JobSpec, defined bool) []*Host {
 	var out []*Host
 	for _, h := range hosts {
-		switch {
-		case on != "":
-			if h.Name == on {
-				out = append(out, h)
-			}
-		case defined:
+		if on != "" && h.Name != on || h.Status == nil {
+			continue
+		}
+		idle := *h
+		st := *h.Status
+		st.Accepting = true // judge what it can take, not what it is doing
+		idle.Status = &st
+		var err error
+		if defined {
+			_, err = PickFor([]*Host{&idle}, want, "")
+		} else {
+			_, err = Pick([]*Host{&idle}, want.Resources, profile, "", "session")
+		}
+		if err == nil {
 			out = append(out, h)
-		default:
-			if _, ok := h.Status.Profiles[profile]; ok {
-				out = append(out, h)
-			}
 		}
 	}
 	return out

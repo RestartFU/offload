@@ -420,15 +420,16 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 	write("gen.go", "package main // generated on the runner by an earlier job")
 	write("target/out", "build output")
 	write("vendor/mod/x.go", "package mod // go mod vendor, on the runner")
+	write("local-out/bin", "ignored only by the client's .git/info/exclude")
 	s := &Server{cfg: &Config{}}
-	s.pruneUntracked(context.Background(), &slot{Dir: dir}, []api.FileEntry{{Path: ".gitignore"}, {Path: "main.go"}})
+	s.pruneUntracked(context.Background(), &slot{Dir: dir}, []api.FileEntry{{Path: ".gitignore"}, {Path: "main.go"}}, "local-out/\n")
 	if _, err := os.Stat(filepath.Join(dir, "gen.go")); !os.IsNotExist(err) {
 		t.Fatal("runner-created source survived")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "vendor")); !os.IsNotExist(err) {
 		t.Fatal("emptied vendor/ left behind")
 	}
-	for _, p := range []string{"main.go", "target/out"} {
+	for _, p := range []string{"main.go", "target/out", "local-out/bin"} {
 		if _, err := os.Stat(filepath.Join(dir, p)); err != nil {
 			t.Fatalf("%s removed", p)
 		}
@@ -458,5 +459,15 @@ func TestDataSetKeepsRunnerMigratedDirectory(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(sl.Dir, "current", "state.db")); err != nil || string(b) != "runner only" {
 		t.Fatalf("runner state lost: %q %v", b, err)
+	}
+}
+
+func TestStockInstallEnvKeepsSystemPath(t *testing.T) {
+	env := stockInstallEnv(nil)
+	if !strings.Contains(env["PATH"], "/usr/bin") || !strings.HasPrefix(env["PATH"], "/root/go/bin:") {
+		t.Fatalf("PATH = %q", env["PATH"])
+	}
+	if stockInstallEnv(&api.EnvDef{Containerfile: "FROM node:22\n"}) != nil {
+		t.Fatal("a foreign image got install defaults")
 	}
 }

@@ -259,6 +259,9 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	unitEnv := env
 	if rt == "container" {
 		cenv := parallelEnv(ncpu)
+		for k, v := range stockInstallEnv(def) {
+			cenv[k] = v
+		}
 		for k, v := range prof.Env {
 			if k != "PATH" && k != "HOME" {
 				cenv[k] = v

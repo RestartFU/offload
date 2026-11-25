@@ -579,7 +579,9 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 		if r.Mem == 0 {
 			r.Mem = st.Defaults.Mem
 		}
-		if !st.Accepting {
+		// A job may queue on a runner briefly below its memory reserve (admission waits for
+		// memory); sessions start at once, so they need one that is accepting.
+		if !st.Accepting && !(kind == "job" && st.Reason == "host memory below reserve") {
 			reasons = append(reasons, h.Name+": "+st.Reason)
 			continue
 		}

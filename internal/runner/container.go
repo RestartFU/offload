@@ -51,6 +51,11 @@ type envBuild struct {
 	slot    *slot  // the workspace a COPY/ADD build snapshots its context from
 	dir     string // this attempt's private directory
 	ctxRel  string // that context's directory in the workspace ("" = no context)
+
+	unit         string    // the unit building this image (not the base or bootstrap steps)
+	hadWaiters   bool      // jobs asked for it (a build only sessions asked for has none)
+	sessionAsked time.Time // last time a session launch asked for it
+	abandoned    bool      // every job that wanted it left: stopped, not an error to report
 }
 
 func hash12(parts ...string) string {
@@ -221,6 +226,7 @@ func (s *Server) ensureImageLocked(j *job) bool {
 	j.Image = tag
 	if b := s.builds[tag]; b != nil {
 		b.waiters[j.ID] = j
+		b.hadWaiters = true
 		return false
 	}
 	if s.imageReadyLocked(tag) {
@@ -235,7 +241,7 @@ func (s *Server) ensureImageLocked(j *job) bool {
 		j.Reason = "waiting: memory for the environment build"
 		return false // builds take their memory from the same budget as jobs
 	}
-	b := &envBuild{tag: tag, waiters: map[string]*job{j.ID: j}, ctxRel: ctxRel}
+	b := &envBuild{tag: tag, waiters: map[string]*job{j.ID: j}, ctxRel: ctxRel, hadWaiters: true}
 	if ctxRel != "" {
 		b.slot = j.slot
 		b.slot.leases++ // held only while the context snapshot is copied
@@ -282,7 +288,16 @@ func (s *Server) build(b *envBuild, cf string) {
 		err = s.runBuild(baseTag(), baseContainerfile, "", dir, b.logPath)
 	}
 	if err == nil && !imageExists(b.tag) {
-		err = s.runBuild(b.tag, cf, ctxDir, dir, b.logPath)
+		unit := "offload-build-" + hash12(b.tag, time.Now().String()) + ".service"
+		s.mu.Lock()
+		b.unit = unit
+		abandoned := b.abandoned
+		s.mu.Unlock()
+		if abandoned {
+			err = errors.New("abandoned: no job wants it any more")
+		} else {
+			err = s.runBuildUnit(unit, b.tag, cf, ctxDir, dir, b.logPath)
+		}
 	}
 	if err == nil && !s.bootstrapped(b.tag) {
 		// Never a project image's own bootstrap script: it would write the shared toolchains.
@@ -303,6 +318,8 @@ func (s *Server) build(b *envBuild, cf string) {
 	if err == nil {
 		s.readyImages[b.tag] = true
 		s.touchImage(b.tag)
+	} else if b.abandoned {
+		err = nil // stopped on purpose; whoever asks next starts it afresh
 	} else {
 		s.buildErrs[b.tag] = err
 		for _, j := range b.waiters {
@@ -319,6 +336,10 @@ func (s *Server) build(b *envBuild, cf string) {
 }
 
 func (s *Server) runBuild(tag, cf, ctxDir, dir, logPath string) error {
+	return s.runBuildUnit("offload-build-"+hash12(tag, time.Now().String())+".service", tag, cf, ctxDir, dir, logPath)
+}
+
+func (s *Server) runBuildUnit(unit, tag, cf, ctxDir, dir, logPath string) error {
 	file := filepath.Join(dir, "Containerfile."+hash12(tag))
 	if err := os.WriteFile(file, []byte(cf), 0o644); err != nil {
 		return err
@@ -327,7 +348,6 @@ func (s *Server) runBuild(tag, cf, ctxDir, dir, logPath string) error {
 		ctxDir = filepath.Join(dir, "empty")
 		_ = os.MkdirAll(ctxDir, 0o755)
 	}
-	unit := "offload-build-" + hash12(tag, time.Now().String()) + ".service"
 	args := []string{
 		"--user", "--quiet", "--collect", "--wait",
 		"--unit=" + unit, "--slice=" + s.cfg.Slice,
@@ -680,6 +700,49 @@ type runSpec struct {
 	Argv                                []string
 }
 
+var basePathRE = regexp.MustCompile(`(?:^|\s)PATH=(\S+)`) // PATH=, not GOPATH=
+
+// stockInstallEnv points `go install` and `cargo install` at writable places (the container's
+// own, on PATH) for images that leave that to us: the stock base, or one built on it that sets
+// none of GOPATH, GOBIN, CARGO_INSTALL_ROOT or PATH. The shared toolchain bins are read-only.
+// An image that decides for itself is left alone.
+func stockInstallEnv(def *api.EnvDef) map[string]string {
+	if def != nil {
+		cf := def.Containerfile
+		if !strings.Contains(cf, imageRepo+"/base") && !strings.Contains(cf, "offload/base") {
+			return nil
+		}
+		for _, k := range []string{"GOPATH", "GOBIN", "CARGO_INSTALL_ROOT", "PATH"} {
+			if strings.Contains(cf, k) {
+				return nil
+			}
+		}
+	}
+	m := basePathRE.FindStringSubmatch(baseContainerfile)
+	if m == nil || !strings.Contains(m[1], "/usr/bin") {
+		return nil // never hand a workload a PATH without the system directories
+	}
+	return map[string]string{"GOPATH": "/root/go", "PATH": "/root/go/bin:" + m[1], "CARGO_INSTALL_ROOT": "/usr/local"}
+}
+
+// leaveBuildsLocked takes a finished job off the builds it waited for. A build every job left
+// (and no session asked for lately) is stopped: it would hold build_mem for nothing.
+func (s *Server) leaveBuildsLocked(j *job) {
+	for _, b := range s.builds {
+		if _, ok := b.waiters[j.ID]; !ok {
+			continue
+		}
+		delete(b.waiters, j.ID)
+		if len(b.waiters) == 0 && b.hadWaiters && !b.done && time.Since(b.sessionAsked) > time.Minute {
+			b.abandoned = true
+			if b.unit != "" {
+				log.Printf("build %s: no job wants it any more; stopping it", b.tag)
+				stopUnit(b.unit)
+			}
+		}
+	}
+}
+
 // ownerLabel marks this runner's containers, so cleanup never touches another runner's (two
 // runners of one user share podman's container namespace).
 func (s *Server) ownerLabel() string { return "dev.offload.runner=" + hash12(s.cfg.StateDir) }
@@ -789,7 +852,8 @@ func (s *Server) sessionImageLocked(def *api.EnvDef) (string, bool, error) {
 	if s.imageReadyLocked(tag) {
 		return tag, true, nil
 	}
-	if s.builds[tag] != nil {
+	if b := s.builds[tag]; b != nil {
+		b.sessionAsked = time.Now()
 		return tag, false, nil
 	}
 	if err := s.buildErrs[tag]; err != nil {
@@ -803,7 +867,7 @@ func (s *Server) sessionImageLocked(def *api.EnvDef) (string, bool, error) {
 	if ok, _ := s.fitsLocked(api.Resources{Mem: s.cfg.buildMem}); !ok {
 		return tag, false, nil // not yet: the client retries
 	}
-	b := &envBuild{tag: tag, waiters: map[string]*job{}}
+	b := &envBuild{tag: tag, waiters: map[string]*job{}, sessionAsked: time.Now()}
 	s.builds[tag] = b
 	go s.build(b, cf)
 	return tag, false, nil
@@ -813,10 +877,9 @@ func (s *Server) sessionImageLocked(def *api.EnvDef) (string, bool, error) {
 // own), but parallelism, relays, git config, profile settings and the job's own variables.
 func (s *Server) containerEnv(prof *Profile, ncpu int, j *job) map[string]string {
 	env := parallelEnv(ncpu)
-	// The shared toolchain bin directories are read-only: `go install` and `cargo install` put
-	// what a job installs in the container's own /usr/local/bin (on PATH, gone with it).
-	env["GOBIN"] = "/usr/local/bin"
-	env["CARGO_INSTALL_ROOT"] = "/usr/local"
+	for k, v := range stockInstallEnv(j.Spec.Environment) {
+		env[k] = v
+	}
 	if prof != nil {
 		for k, v := range prof.Env {
 			if k != "PATH" && k != "HOME" {

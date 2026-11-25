@@ -28,8 +28,11 @@ func validGitRef(g *api.GitRef) bool {
 
 // validBranch applies git's own ref-name rules (feature/café is fine, "a..b" isn't).
 func validBranch(b string) bool {
-	if len(b) > 255 || strings.HasPrefix(b, "-") {
+	if len(b) > 255 || strings.HasPrefix(b, "-") || strings.ContainsAny(b, "\x00\n") {
 		return false
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return true // no git on this host: the job runs without .git anyway (see gitPlan)
 	}
 	_, err := gitCmd(".", "check-ref-format", "refs/heads/"+b)
 	return err == nil
@@ -265,7 +268,7 @@ func validTagName(n string) bool {
 // pruneUntracked removes files a previous job created in the slot that git doesn't ignore and
 // the client didn't send (generated sources, say): they would otherwise survive into builds of
 // other branches. Ignored files (target/, node_modules/ …) stay; that's what keeps slots warm.
-func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.FileEntry) {
+func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.FileEntry, ignoreRules string) {
 	// A scratch repository with an empty index: everything in the slot is "untracked", minus
 	// what the tree's .gitignore files ignore, whether or not this job gets a .git.
 	scratch, err := os.MkdirTemp("", "offload-prune-")
@@ -276,6 +279,12 @@ func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.Fi
 	if _, err := gitCmdCtx(ctx, scratch, "init", "-q", "--bare"); err != nil {
 		return
 	}
+	// The client's rules from outside the tree (.git/info/exclude, its global excludes file):
+	// what it ignores by those stays too.
+	if ignoreRules != "" {
+		_ = os.MkdirAll(filepath.Join(scratch, "info"), 0o755)
+		_ = os.WriteFile(filepath.Join(scratch, "info", "exclude"), []byte(ignoreRules), 0o644)
+	}
 	out, err := gitCmdCtx(ctx, sl.Dir, "--git-dir="+scratch, "--work-tree=.", "ls-files", "-z", "--others", "--exclude-standard", "--exclude=/.git")
 	if err != nil || out == "" {
 		return
@@ -284,6 +293,7 @@ func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.Fi
 	for _, e := range manifest {
 		sent[e.Path] = true
 	}
+
 	root, err := os.OpenRoot(sl.Dir)
 	if err != nil {
 		return

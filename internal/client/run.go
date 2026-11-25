@@ -134,7 +134,7 @@ func Run(o RunOptions) (int, error) {
 			return 1, fmt.Errorf("reading workspace: %w", err)
 		}
 		spec.WorkspaceKey, spec.Manifest, spec.Dir = ws.Key, ws.Manifest, ws.Dir
-		spec.GitTree = ws.GitTree
+		spec.GitTree, spec.IgnoreRules = ws.GitTree, ws.IgnoreRules
 		spec.WriteBack = !o.NoWriteBack
 		if !o.Host { // --host runs on the runner itself: no environment, even if the repo has one
 			if spec.Environment, err = LoadEnvDef(ws.Root, o.Environment); err != nil {
