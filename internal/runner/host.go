@@ -163,8 +163,19 @@ func startUnit(ctx context.Context, u unitSpec) error {
 	for k, v := range u.Env {
 		args = append(args, "--setenv="+k+"="+v)
 	}
+	// systemd expands $VAR and ${VAR} in a unit's command line; commands must reach the job
+	// literally (`sh -c 'x=1; echo ${x}'`).
+	argv := u.Argv
+	if systemdVersion() >= 254 {
+		args = append(args, "--expand-environment=no")
+	} else {
+		argv = make([]string, len(u.Argv))
+		for i, a := range u.Argv {
+			argv[i] = strings.ReplaceAll(a, "$", "$$")
+		}
+	}
 	args = append(args, "--")
-	args = append(args, u.Argv...)
+	args = append(args, argv...)
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "systemd-run", args...).CombinedOutput()
@@ -173,6 +184,21 @@ func startUnit(ctx context.Context, u unitSpec) error {
 	}
 	return nil
 }
+
+var systemdVer = sync.OnceValue(func() int {
+	out, err := exec.Command("systemctl", "--version").Output()
+	if err != nil {
+		return 0
+	}
+	f := strings.Fields(string(out)) // "systemd 255 (255.4-1ubuntu8)"
+	if len(f) < 2 {
+		return 0
+	}
+	n, _ := strconv.Atoi(f[1])
+	return n
+})
+
+func systemdVersion() int { return systemdVer() }
 
 // stopUnit asks systemd to stop a unit and keeps asking (retryStops) until it confirms the unit
 // is gone: a user manager that is briefly unavailable must not leave work running for good.

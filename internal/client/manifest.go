@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/gob"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -242,7 +243,15 @@ func hashFiles(root string, files []string) ([]api.FileEntry, error) {
 					continue // not really in the tree (behind a symlink): absent, like a deleted file
 				}
 				fi, err := tree.Lstat(p)
-				if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					continue // deleted since it was listed
+				}
+				if err != nil { // can't tell what's there: a missing entry would delete it remotely
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("%s: %w", p, err)
+					}
+					mu.Unlock()
 					continue
 				}
 				e := api.FileEntry{Path: p, Mode: uint32(fi.Mode().Perm())}

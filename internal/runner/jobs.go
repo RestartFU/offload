@@ -142,31 +142,23 @@ func (s *Server) restore() {
 			j.slot = s.findSlot(j.Slot)
 		}
 		switch j.State {
-		case api.StateUploading:
-			j.State, j.Reason = api.StateFailed, "runner restarted during upload"
+		case api.StateUploading: // finished the normal way, so its slot is released (or dropped)
 			if j.StopRequested {
-				j.State, j.Reason = api.StateCancelled, "cancelled"
+				s.finishLocked(j, api.StateCancelled, nil, "cancelled")
+			} else {
+				s.finishLocked(j, api.StateFailed, nil, "runner restarted during upload")
 			}
-			now := time.Now()
-			j.FinishedAt = &now
-			j.save()
 		case api.StateQueued:
 			j.queuedAt = j.CreatedAt
 			if j.StopRequested {
-				j.State, j.Reason = api.StateCancelled, "cancelled"
-				now := time.Now()
-				j.FinishedAt = &now
-				j.save()
+				s.finishLocked(j, api.StateCancelled, nil, "cancelled")
 				break
 			}
 			if len(j.Spec.Relay) > 0 || j.Spec.Network == "client" {
 				j.relay = newRelay() // its sockets are created when it starts
 			}
 			if len(j.Spec.SecretNames) > 0 { // secrets were only in memory
-				j.State, j.Reason = api.StateFailed, "runner restarted before the job started; its secrets were dropped"
-				now := time.Now()
-				j.FinishedAt = &now
-				j.save()
+				s.finishLocked(j, api.StateFailed, nil, "runner restarted before the job started; its secrets were dropped")
 			}
 		case api.StateRunning:
 			if j.StopRequested { // cancelled before the restart: keep stopping it
@@ -701,6 +693,11 @@ func (s *Server) admit() {
 				j.Reason = "waiting: building environment"
 			}
 			continue // a build never blocks other jobs
+		}
+		if why := s.neverFitsLocked(j.Resources); why != "" {
+			// E.g. queued before the runner's capacity was lowered: it would block the queue.
+			s.finishLocked(j, api.StateFailed, nil, why)
+			continue
 		}
 		ok, why := s.fitsLocked(j.Resources)
 		if !ok {

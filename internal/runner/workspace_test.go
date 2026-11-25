@@ -419,10 +419,14 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 	write("main.go", "package main")
 	write("gen.go", "package main // generated on the runner by an earlier job")
 	write("target/out", "build output")
+	write("vendor/mod/x.go", "package mod // go mod vendor, on the runner")
 	s := &Server{cfg: &Config{}}
 	s.pruneUntracked(context.Background(), &slot{Dir: dir}, []api.FileEntry{{Path: ".gitignore"}, {Path: "main.go"}})
 	if _, err := os.Stat(filepath.Join(dir, "gen.go")); !os.IsNotExist(err) {
 		t.Fatal("runner-created source survived")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "vendor")); !os.IsNotExist(err) {
+		t.Fatal("emptied vendor/ left behind")
 	}
 	for _, p := range []string{"main.go", "target/out"} {
 		if _, err := os.Stat(filepath.Join(dir, p)); err != nil {

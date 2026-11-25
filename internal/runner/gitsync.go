@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -203,7 +204,15 @@ func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.Fi
 			continue
 		}
 		if _, err := cleanRel(p); err == nil && parentsState(root, p) == parentsReal {
-			_ = root.Remove(p)
+			if root.Remove(p) == nil {
+				// Directories this leaves empty go too: an empty vendor/ still switches Go to
+				// vendor mode. Removal stops at the first directory that still has anything.
+				for d := path.Dir(p); d != "." && d != "/"; d = path.Dir(d) {
+					if root.Remove(d) != nil {
+						break
+					}
+				}
+			}
 		}
 	}
 }

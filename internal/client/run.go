@@ -510,34 +510,44 @@ func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, 
 	if !api.Terminal(j.State) {
 		return nil
 	}
-	if j.WriteBack == nil { // finished with nothing to write back (or cancelled): just forget it
-		if err := os.Remove(baselinePath(j.ID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	readBaseline := func() (*baseline, error) {
+		b, err := os.ReadFile(baselinePath(j.ID))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil // not started from this machine, or already applied
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading the write-back baseline: %w", err)
+		}
+		var bl baseline
+		if err := json.Unmarshal(b, &bl); err != nil {
+			return nil, err
+		}
+		return &bl, nil
+	}
+	// Lock order everywhere: the checkout, then the job. Without the checkout lock yet, peek at
+	// the baseline for its root, lock, and read it again under both locks.
+	if !checkoutLocked {
+		bl, err := readBaseline()
+		if bl == nil || err != nil {
 			return err
 		}
-		return nil
+		unlockCheckout, err := lockFile(checkoutLock(bl.Root))
+		if err != nil {
+			return err
+		}
+		defer unlockCheckout()
 	}
 	unlock, err := lockFile(lockPath("job-" + j.ID)) // two attaches of one job apply it once
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	b, err := os.ReadFile(baselinePath(j.ID))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil // not started from this machine, or already applied
-	}
-	if err != nil {
-		return fmt.Errorf("reading the write-back baseline: %w", err)
-	}
-	var bl baseline
-	if err := json.Unmarshal(b, &bl); err != nil {
+	bl, err := readBaseline()
+	if bl == nil || err != nil {
 		return err
 	}
-	if !checkoutLocked {
-		unlockCheckout, err := lockFile(checkoutLock(bl.Root))
-		if err != nil {
-			return err
-		}
-		defer unlockCheckout()
+	if j.WriteBack == nil { // finished with nothing to write back (or cancelled): just forget it
+		return os.Remove(baselinePath(j.ID))
 	}
 	if err := applyWriteBackLocked(ctx, h, j, bl.Root, bl.Manifest, quiet); err != nil {
 		return err
@@ -888,6 +898,24 @@ func firstN(s []string, n int) []string {
 }
 
 // fetchArtifacts downloads and unpacks a job's artifacts into dest.
+// unchangedSince reports whether rel is still what the job was sent (or gone): same content and
+// mode for a file, same target for a symlink.
+func unchangedSince(tree *os.Root, rel string, orig api.FileEntry) bool {
+	fi, err := tree.Lstat(rel)
+	if errors.Is(err, os.ErrNotExist) {
+		return true // deleted here: nothing to lose
+	}
+	if err != nil {
+		return false
+	}
+	if orig.Link != "" {
+		cur, err := tree.Readlink(rel)
+		return err == nil && fi.Mode()&os.ModeSymlink != 0 && cur == orig.Link
+	}
+	cur, now, err := hashFileIn(tree, rel)
+	return err == nil && cur == orig.Hash && now.Mode().Perm() == os.FileMode(orig.Mode).Perm()
+}
+
 // fetchArtifacts extracts a job's artifacts into dest. protect, when set, gives the content the
 // job was sent for a path: a tracked file changed here since then is kept, and the artifact is
 // saved beside it as <file>.offload-incoming[.N].
@@ -928,24 +956,20 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string, protect func(
 		if err := mkdirReal(tree, path.Dir(name)); err != nil {
 			return fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
 		}
+		// A tracked path changed here since upload (content, mode or link target) is never
+		// replaced, whatever kind of entry would replace it.
+		still := func() bool { return true }
+		if protect != nil {
+			if orig, tracked := protect(name); tracked {
+				still = func() bool { return unchangedSince(tree, name, orig) }
+			}
+		}
 		switch hd.Typeflag {
 		case tar.TypeDir:
 			if err := mkdirReal(tree, name); err != nil {
 				return fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
 			}
 		case tar.TypeReg:
-			var still func() bool
-			if protect != nil {
-				if orig, tracked := protect(name); tracked && orig.Link == "" {
-					still = func() bool {
-						cur, fi, err := hashFileIn(tree, name)
-						if errors.Is(err, os.ErrNotExist) {
-							return true // deleted here: nothing to lose
-						}
-						return err == nil && cur == orig.Hash && fi.Mode().Perm() == os.FileMode(orig.Mode).Perm()
-					}
-				}
-			}
 			if err := writeInIf(tree, name, tr, os.FileMode(hd.Mode).Perm(), "", still); err != nil {
 				var ce *conflictError
 				if errors.As(err, &ce) {
@@ -958,6 +982,20 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string, protect func(
 		case tar.TypeSymlink:
 			if fi, err := tree.Lstat(name); err == nil && fi.IsDir() {
 				return fmt.Errorf("refusing artifact %q: would replace a directory", hd.Name)
+			}
+			if !still() {
+				saved := ""
+				for i := 0; i < 100 && saved == ""; i++ {
+					cand := name + ".offload-incoming"
+					if i > 0 {
+						cand = fmt.Sprintf("%s.%d", cand, i)
+					}
+					if tree.Symlink(hd.Linkname, cand) == nil {
+						saved = cand
+					}
+				}
+				logf(false, "artifact %s not written over local edits (saved as %s)", name, saved)
+				continue
 			}
 			_ = tree.Remove(name)
 			if err := tree.Symlink(hd.Linkname, name); err != nil {

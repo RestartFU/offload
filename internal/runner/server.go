@@ -29,6 +29,7 @@ import (
 
 	"github.com/RestartFU/offload/internal/api"
 	"github.com/RestartFU/offload/internal/tsapi"
+	"github.com/RestartFU/offload/internal/units"
 )
 
 // Server is a running runner.
@@ -750,6 +751,17 @@ func (s *Server) allocatedLocked() api.Resources {
 }
 
 // fitsLocked reports whether r can start now, or why not.
+// neverFitsLocked says why a request can't run here even on an idle runner ("" if it can).
+func (s *Server) neverFitsLocked(r api.Resources) string {
+	if r.CPU > s.cfg.Capacity.CPU+1e-9 {
+		return fmt.Sprintf("needs %.1f cpu; this runner's capacity is %.1f", r.CPU, s.cfg.Capacity.CPU)
+	}
+	if r.Mem > s.cfg.memCap {
+		return fmt.Sprintf("needs %s of memory; this runner's capacity is %s", units.FormatSize(r.Mem), units.FormatSize(s.cfg.memCap))
+	}
+	return ""
+}
+
 func (s *Server) fitsLocked(r api.Resources) (bool, string) {
 	a := s.allocatedLocked()
 	if a.CPU+r.CPU > s.cfg.Capacity.CPU+1e-9 {

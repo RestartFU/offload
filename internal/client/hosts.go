@@ -515,7 +515,7 @@ func PickFor(hosts []*Host, spec api.JobSpec, kind string) (*Host, error) {
 		switch {
 		case spec.Platform != "" && plat != spec.Platform:
 			why = append(why, h.Name+": is "+plat)
-		case spec.Environment != nil && st.Runtime != "container":
+		case (spec.Environment != nil || spec.Network == "client") && spec.Runtime != "host" && st.Runtime != "container":
 			why = append(why, h.Name+": no container runtime")
 		default:
 			ok = append(ok, h)

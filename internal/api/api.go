@@ -9,7 +9,7 @@ const DefaultPort = 7420
 // Proto versions the runner protocol and how workloads are wired (mounts, relay sockets, the
 // stdin wrapper). A client only uses runners of its own version (`offload host upgrade` brings
 // them in line), and a runner stops workloads started by another version when it starts.
-const Proto = 6
+const Proto = 7
 
 // ProtoHeader carries the client's protocol version on every request; runners refuse other
 // versions (except for status, pairing and upgrades, which is how versions get back in step).

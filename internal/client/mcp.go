@@ -153,8 +153,17 @@ func MCP(o MCPOptions) error {
 	out := &activityWriter{w: os.Stdout, started: time.Now()}
 	done := make(chan error, 2)
 	inDone := make(chan error, 1)
+	errDone := make(chan struct{})
 	go func() { done <- pumpOut(ctx, h, se.ID, "stdout", out) }()
-	go func() { _ = pumpOut(ctx, h, se.ID, "stderr", os.Stderr) }()
+	go func() { _ = pumpOut(ctx, h, se.ID, "stderr", os.Stderr); close(errDone) }()
+	// When the session ends, let stderr catch up (its last lines are often the diagnostic),
+	// but not forever.
+	drainStderr := func() {
+		select {
+		case <-errDone:
+		case <-time.After(5 * time.Second):
+		}
+	}
 	if o.Prepare {
 		_ = os.Stdin.Close() // nothing to send; wait for the prepare command to finish
 	} else {
@@ -164,6 +173,7 @@ func MCP(o MCPOptions) error {
 	case <-ctx.Done():
 		return interrupted(o)
 	case err := <-done:
+		drainStderr()
 		if err == nil && o.Prepare {
 			return prepareResult(ctx, h, se.ID)
 		}
