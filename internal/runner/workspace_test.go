@@ -421,6 +421,7 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 	write("target/out", "build output")
 	write("vendor/mod/x.go", "package mod // go mod vendor, on the runner")
 	write("local-out/bin", "ignored only by the client's .git/info/exclude")
+	os.MkdirAll(filepath.Join(dir, "vendor2", "deep"), 0o755) // left empty by an aborted job
 	s := &Server{cfg: &Config{}}
 	s.pruneUntracked(context.Background(), &slot{Dir: dir}, []api.FileEntry{{Path: ".gitignore"}, {Path: "main.go"}}, "local-out/\n", "")
 	if _, err := os.Stat(filepath.Join(dir, "gen.go")); !os.IsNotExist(err) {
@@ -428,6 +429,9 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "vendor")); !os.IsNotExist(err) {
 		t.Fatal("emptied vendor/ left behind")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "vendor2")); !os.IsNotExist(err) {
+		t.Fatal("already-empty vendor2/ left behind")
 	}
 	for _, p := range []string{"main.go", "target/out", "local-out/bin"} {
 		if _, err := os.Stat(filepath.Join(dir, p)); err != nil {

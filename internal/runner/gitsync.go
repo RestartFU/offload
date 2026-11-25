@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -326,6 +327,33 @@ func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.Fi
 					}
 				}
 			}
+		}
+	}
+	// Directories left empty that the client doesn't have (an aborted `go mod vendor` leaves an
+	// empty vendor/, which still puts Go in vendor mode). Ignored ones, and any holding ignored
+	// output, stay.
+	dirs, err := gitCmdCtx(ctx, sl.Dir, "--git-dir="+scratch, "--work-tree=.", "-c", "core.excludesFile="+excludes,
+		"ls-files", "-z", "--others", "--exclude-standard", "--directory", "--exclude=/.git")
+	if err != nil {
+		return
+	}
+	for _, d := range strings.Split(dirs, "\x00") {
+		d = strings.TrimSuffix(d, "/")
+		if d == "" || d == ".git" || sent[d] {
+			continue
+		}
+		if fi, err := root.Lstat(d); err != nil || !fi.IsDir() || parentsState(root, d) != parentsReal {
+			continue
+		}
+		var all []string
+		_ = fs.WalkDir(root.FS(), d, func(p string, e fs.DirEntry, err error) error {
+			if err == nil && e.IsDir() {
+				all = append(all, p)
+			}
+			return nil
+		})
+		for k := len(all) - 1; k >= 0; k-- { // deepest first; Remove only takes empty ones
+			_ = root.Remove(all[k])
 		}
 	}
 }

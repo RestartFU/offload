@@ -259,8 +259,8 @@ pick:
 		return interrupted(o)
 	case err := <-done:
 		drainStderr()
-		if err == nil && o.Prepare {
-			return prepareResult(ctx, h, se.ID)
+		if err == nil {
+			return prepareResult(ctx, h, se.ID, o.Prepare) // the server's own exit status
 		}
 		return err
 	case err := <-inDone:
@@ -275,6 +275,9 @@ pick:
 			return nil
 		case err := <-done:
 			drainStderr()
+			if err == nil {
+				return prepareResult(ctx, h, se.ID, o.Prepare)
+			}
 			return err
 		}
 	}
@@ -327,16 +330,20 @@ func interrupted(o MCPOptions) error {
 
 // prepareResult turns a finished prepare session's exit into the command's result: anything but
 // a recorded exit 0 is a failure.
-func prepareResult(ctx context.Context, h *Host, id string) error {
+func prepareResult(ctx context.Context, h *Host, id string, prepare bool) error {
+	what := "the MCP server"
+	if prepare {
+		what = "prepare"
+	}
 	var se api.Session
 	if err := h.do(ctx, "GET", "/v1/sessions/"+id, nil, &se); err != nil {
-		return fmt.Errorf("prepare: can't read its result: %w", err)
+		return fmt.Errorf("%s: can't read its result: %w", what, err)
 	}
 	if se.ExitCode == nil {
-		return fmt.Errorf("prepare ended without an exit status (%s)", se.Reason)
+		return fmt.Errorf("%s ended without an exit status (%s)", what, se.Reason)
 	}
 	if *se.ExitCode != 0 {
-		return fmt.Errorf("prepare failed: exit %d", *se.ExitCode)
+		return fmt.Errorf("%s exited with status %d", what, *se.ExitCode)
 	}
 	return nil
 }

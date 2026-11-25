@@ -853,6 +853,12 @@ func snapshotArtifacts(paths []string) map[string]fileSig {
 		if checkRel(p) != nil {
 			continue
 		}
+		// Its existing parents too: one deleted during the job must stay deleted (deletedHere).
+		for d := path.Dir(p); d != "." && d != "/"; d = path.Dir(d) {
+			if fi, err := tree.Lstat(d); err == nil {
+				snap[d] = sigOf(tree, d, fi)
+			}
+		}
 		if fi, err := tree.Lstat(p); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
 			snap[p] = sigOf(tree, p, fi) // the link itself, never what it points at
 			continue

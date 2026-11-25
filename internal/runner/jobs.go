@@ -41,7 +41,8 @@ type job struct {
 	cancelled   atomic.Bool // set by DELETE; read by uploads without taking s.mu
 	abortUpload func()      // interrupts the upload being read right now (set while syncing)
 	mounts      []string    // runtime paths (sockets, secrets) this job's container may see
-
+	planNeeded  []string    // the upload plan, while the source hasn't arrived (see handleCreateJob)
+	planHave    []string
 }
 
 // exitRecord is written by the unit wrapper when the command ends.
@@ -350,7 +351,11 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		for _, x := range s.jobs {
 			if x.Spec.SubmitID == id {
 				_ = os.RemoveAll(j.dir)
-				out.json(x.view())
+				v := x.view()
+				if x.State == api.StateUploading { // it still needs the source: the same plan
+					v.Needed, v.GitHave = x.planNeeded, x.planHave
+				}
+				out.json(v)
 				return
 			}
 		}
@@ -419,6 +424,9 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 	s.jobs[j.ID] = j
 	out.json(j.view())
+	// The plan is only for the client that submitted; kept in memory (not in job records or
+	// listings) until the source arrives, for a submission retried after a lost answer.
+	j.planNeeded, j.planHave = j.Needed, j.GitHave
 	j.Needed, j.GitHave = nil, nil
 	s.kick()
 }
@@ -544,6 +552,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j.State, j.queuedAt = api.StateQueued, time.Now()
+	j.planNeeded, j.planHave = nil, nil
 	if e := j.Spec.Environment; e != nil {
 		ctx := contextRel(e.ContextDir)
 		if problem := contextProblem(manifest, ctx); problem != "" && usesContext(e.Containerfile) {
