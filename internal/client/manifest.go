@@ -57,8 +57,11 @@ func LoadWorkspace(cwd string) (*Workspace, error) {
 		}
 	} else {
 		err := filepath.WalkDir(cwd, func(p string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil // gone while we walked
+			}
+			if err != nil { // an unreadable directory: its files must not look deleted
+				return err
 			}
 			if d.IsDir() && p != cwd && (skipDirs[d.Name()] || strings.HasPrefix(d.Name(), ".cache")) {
 				return filepath.SkipDir
@@ -121,8 +124,11 @@ func gitFiles(root string) ([]string, error) {
 		}
 		full := filepath.Join(root, filepath.FromSlash(f))
 		fi, err := os.Lstat(full)
-		if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
 			continue // deleted in the work tree but still in the index
+		}
+		if err != nil { // can't tell: leaving it out would delete it on the runner
+			return nil, fmt.Errorf("%s: %w", f, err)
 		}
 		if fi.IsDir() {
 			if !gitlinks[f] {

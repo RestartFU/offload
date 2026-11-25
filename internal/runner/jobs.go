@@ -688,23 +688,25 @@ func (s *Server) admit() {
 	}
 	sort.Slice(queued, func(a, b int) bool { return queued[a].queuedAt.Before(queued[b].queuedAt) })
 	for _, j := range queued {
+		if why := s.neverFitsLocked(j.Resources); why != "" {
+			// E.g. queued before the runner's capacity was lowered: it would block the queue.
+			s.finishLocked(j, api.StateFailed, nil, why)
+			continue
+		}
 		if j.Runtime == "container" && !s.ensureImageLocked(j) {
 			if j.State == api.StateQueued {
 				j.Reason = "waiting: building environment"
 			}
 			continue // a build never blocks other jobs
 		}
-		if why := s.neverFitsLocked(j.Resources); why != "" {
-			// E.g. queued before the runner's capacity was lowered: it would block the queue.
-			s.finishLocked(j, api.StateFailed, nil, why)
-			continue
-		}
 		ok, why := s.fitsLocked(j.Resources)
 		if !ok {
 			if j.Reason != "waiting: "+why {
 				j.Reason = "waiting: " + why
 			}
-			if time.Since(j.queuedAt) > 2*time.Minute {
+			// A job waiting long for allocated capacity stops smaller ones passing it, so it
+			// can't starve. Host memory pressure is different: smaller jobs may still fit.
+			if time.Since(j.queuedAt) > 2*time.Minute && !strings.Contains(why, "MemAvailable") {
 				return
 			}
 			continue

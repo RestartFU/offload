@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -211,6 +213,11 @@ func dataFiles(cfg DataSetConfig) (string, []string, error) {
 	return root, files, err
 }
 
+func hex12(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:6])
+}
+
 // dataKey is a data set's name on runners: namespaced by this client, so another laptop's data
 // set of the same name is a different one.
 func dataKey(name string) string { return clientID() + "." + name }
@@ -244,17 +251,24 @@ func preferData(hosts []*Host, data map[string]string) []*Host {
 // SyncData brings a data set up to date on a runner, sending only changed files.
 func SyncData(ctx context.Context, h *Host, name string, cfg DataSetConfig, quiet bool) error {
 	start := time.Now()
-	root, files, err := dataFiles(cfg)
+	// One sync of a data set to a runner at a time from this machine: an older scan must never
+	// land after a newer one and delete what it added.
+	unlock, err := lockFile(lockPath("data-" + dataKey(name) + "-" + hex12(h.URL)))
 	if err != nil {
-		return fmt.Errorf("data set %s: %w", name, err)
+		return err
 	}
-	manifest, err := hashFiles(root, files)
-	if err != nil {
-		return fmt.Errorf("data set %s: %w", name, err)
-	}
-	// Plan, then upload against that plan's revision; if another client synced in between,
-	// the runner answers 409 and we plan again.
+	defer unlock()
+	// Scan, plan, then upload against that plan's revision; if another client synced in
+	// between, the runner answers 409 and we scan and plan again.
 	for attempt := 0; ; attempt++ {
+		root, files, err := dataFiles(cfg)
+		if err != nil {
+			return fmt.Errorf("data set %s: %w", name, err)
+		}
+		manifest, err := hashFiles(root, files)
+		if err != nil {
+			return fmt.Errorf("data set %s: %w", name, err)
+		}
 		var plan struct {
 			Needed  []string `json:"needed"`
 			Changed bool     `json:"changed"` // deletions, symlinks or modes changed: apply even with no files

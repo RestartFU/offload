@@ -343,6 +343,14 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		case parentsReal:
 			if err := root.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				stillDirty = append(stillDirty, p)
+				break
+			}
+			// Directories left empty go too (an empty vendor/ from another branch still puts Go
+			// in vendor mode); one that still holds anything (ignored output) stays.
+			for d := path.Dir(p); d != "." && d != "/" && !wantDirs[d]; d = path.Dir(d) {
+				if root.Remove(d) != nil {
+					break
+				}
 			}
 		case parentsUnknown:
 			stillDirty = append(stillDirty, p)

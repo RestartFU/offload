@@ -759,6 +759,9 @@ func (s *Server) neverFitsLocked(r api.Resources) string {
 	if r.Mem > s.cfg.memCap {
 		return fmt.Sprintf("needs %s of memory; this runner's capacity is %s", units.FormatSize(r.Mem), units.FormatSize(s.cfg.memCap))
 	}
+	if total := meminfo("MemTotal"); total > 0 && r.Mem > total-s.cfg.memReserve {
+		return fmt.Sprintf("needs %s of memory; this host has %s, %s of it reserved", units.FormatSize(r.Mem), units.FormatSize(total), units.FormatSize(s.cfg.memReserve))
+	}
 	return ""
 }
 

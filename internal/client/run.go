@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -143,6 +144,10 @@ func Run(o RunOptions) (int, error) {
 		}
 	}
 
+	var snap map[string]fileSig
+	if len(o.Artifacts) > 0 {
+		snap = snapshotArtifacts(o.Artifacts)
+	}
 	for attempt := 0; ; attempt++ {
 		// Every write-back job gets a baseline bound to its ID, so `offload attach` can still
 		// apply its edits if this terminal goes away before it finishes.
@@ -184,7 +189,12 @@ func Run(o RunOptions) (int, error) {
 				continue
 			}
 		}
-		finish(ctx, h, &j, ws, o)
+		if err := finish(ctx, h, &j, ws, o, snap); err != nil {
+			logf(false, "%v", err)
+			if code == 0 {
+				code = 1 // a build whose output didn't arrive must not look like a success
+			}
+		}
 		return code, nil
 	}
 }
@@ -254,6 +264,11 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 			return nil, j, fmt.Errorf("%s: %w", h.Name, err)
 		}
 		rememberJob(j.ID, h)
+		if !o.Detach {
+			// Before the upload that makes the job runnable: a job may ask for credentials or
+			// dial out the moment it starts, and the runner only waits briefly for a client.
+			startCallbacks(ctx, h, j, cfg, o.Quiet)
+		}
 		if pendingBaseline != "" {
 			// Bound to the job before the source upload that makes it runnable: whatever happens
 			// to this connection afterwards, `offload attach` can still write its edits back.
@@ -336,19 +351,10 @@ func cancelJob(h *Host, id string) {
 func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bool, cfg *Config) (int, *api.Job, error) {
 	var j api.Job
 	err := h.do(ctx, "GET", "/v1/jobs/"+id, nil, &j)
-	if err == nil && (len(j.Spec.Relay) > 0 || j.Spec.Network == "client") && cfg != nil {
+	if _, started := callbacksStarted.Load(id); err == nil && !started {
 		cbctx, stopCallbacks := context.WithCancel(ctx)
 		defer stopCallbacks()
-		allow := map[string]bool{"dial": j.Spec.Network == "client"}
-		for _, r := range j.Spec.Relay {
-			switch r {
-			case "git":
-				allow["git-credential"] = true
-			case "ssh-agent":
-				allow["ssh-agent"] = true
-			}
-		}
-		go serveCallbacks(cbctx, h, "/v1/jobs/"+id, cfg, quiet, allow)
+		startCallbacks(cbctx, h, j, cfg, quiet)
 	}
 	if err == nil && j.State == api.StateQueued {
 		why := strings.TrimPrefix(j.Reason, "waiting: ")
@@ -452,6 +458,27 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 	}
 }
 
+// callbacksStarted marks jobs whose credential/network callbacks submit already serves.
+var callbacksStarted sync.Map
+
+// startCallbacks answers a job's relay and dial requests from this machine until ctx ends.
+func startCallbacks(ctx context.Context, h *Host, j api.Job, cfg *Config, quiet bool) {
+	if (len(j.Spec.Relay) == 0 && j.Spec.Network != "client") || cfg == nil {
+		return
+	}
+	allow := map[string]bool{"dial": j.Spec.Network == "client"}
+	for _, r := range j.Spec.Relay {
+		switch r {
+		case "git":
+			allow["git-credential"] = true
+		case "ssh-agent":
+			allow["ssh-agent"] = true
+		}
+	}
+	callbacksStarted.Store(j.ID, true)
+	go serveCallbacks(ctx, h, "/v1/jobs/"+j.ID, cfg, quiet, allow)
+}
+
 // baseline is what a job was sent, kept until its write-back is applied (by `run` when it sees
 // the job finish, or later by `offload attach`).
 type baseline struct {
@@ -506,7 +533,7 @@ func saveBaseline(ws *Workspace) (string, error) {
 
 // consumeWriteBack applies a finished job's write-back from its baseline, once. With
 // checkoutLocked the caller already holds the checkout's lock.
-func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, quiet bool) error {
+func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, quiet bool, written *[]string) error {
 	if !api.Terminal(j.State) {
 		return nil
 	}
@@ -549,40 +576,53 @@ func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, 
 	if j.WriteBack == nil { // finished with nothing to write back (or cancelled): just forget it
 		return os.Remove(baselinePath(j.ID))
 	}
-	if err := applyWriteBackLocked(ctx, h, j, bl.Root, bl.Manifest, quiet); err != nil {
+	if err := applyWriteBackLocked(ctx, h, j, bl.Root, bl.Manifest, quiet, written); err != nil {
 		return err
 	}
 	return os.Remove(baselinePath(j.ID))
 }
 
 // finish applies write-back and artifacts and prints a one-line summary. Both run under the
-// checkout's lock, and artifacts never overwrite a tracked file edited here meanwhile.
-func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOptions) {
+// checkout's lock. It returns an error when requested artifacts didn't all arrive.
+func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOptions, snap map[string]fileSig) error {
 	if ws != nil {
-		if unlock, err := lockFile(checkoutLock(ws.Root)); err == nil {
-			defer unlock()
-		} else {
-			logf(false, "write-back: %v", err)
-			return
+		unlock, err := lockFile(checkoutLock(ws.Root))
+		if err != nil {
+			return fmt.Errorf("write-back: %w", err)
 		}
+		defer unlock()
 	}
-	if err := consumeWriteBack(ctx, h, j, true, o.Quiet); err != nil {
+	var wrote []string
+	if err := consumeWriteBack(ctx, h, j, true, o.Quiet, &wrote); err != nil {
 		logf(false, "write-back: %v", err)
 	}
-	if j.HasArtifact && len(o.Artifacts) > 0 {
-		var protect func(string) (api.FileEntry, bool)
-		if ws != nil {
-			sent := map[string]api.FileEntry{}
-			for _, e := range ws.Manifest {
-				sent[e.Path] = e
+	// What write-back just wrote is the job's own result, not a local change: artifacts may
+	// replace it.
+	if snap != nil && ws != nil && len(wrote) > 0 {
+		if tree, err := os.OpenRoot("."); err == nil {
+			for _, w := range wrote {
+				rel := w
+				if d := filepath.ToSlash(ws.Dir); d != "" && d != "." {
+					var ok bool
+					if rel, ok = strings.CutPrefix(w, d+"/"); !ok {
+						continue
+					}
+				}
+				if fi, err := tree.Lstat(rel); err == nil {
+					snap[rel] = sigOf(tree, rel, fi)
+				}
 			}
-			protect = func(name string) (api.FileEntry, bool) { // artifact paths are cwd-relative
-				e, ok := sent[path.Join(filepath.ToSlash(ws.Dir), name)]
-				return e, ok
-			}
+			tree.Close()
 		}
-		if err := fetchArtifacts(ctx, h, j.ID, ".", protect); err != nil {
-			logf(false, "artifacts: %v", err)
+	}
+	var artErr error
+	if len(o.Artifacts) > 0 && j.State == api.StateExited {
+		if !j.HasArtifact {
+			artErr = fmt.Errorf("the job produced none of the requested artifacts (%s)", strings.Join(o.Artifacts, ", "))
+		} else if kept, err := fetchArtifacts(ctx, h, j.ID, ".", snap); err != nil {
+			artErr = fmt.Errorf("artifacts: %w", err)
+		} else if kept > 0 {
+			artErr = fmt.Errorf("%d artifact(s) not written over local changes (saved beside them)", kept)
 		}
 	}
 	if j.StartedAt != nil && j.FinishedAt != nil && j.State == api.StateExited {
@@ -592,6 +632,51 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 		}
 		logf(o.Quiet, "%s:%s exit %d in %s%s", h.Name, j.ID, *j.ExitCode, j.FinishedAt.Sub(*j.StartedAt).Round(100*time.Millisecond), peak)
 	}
+	return artErr
+}
+
+// fileSig is what a path looked like (metadata only, cheap for large output trees).
+type fileSig struct {
+	Size, MTime, CTime int64
+	Ino                uint64
+	Mode               fs.FileMode
+	Link               string
+}
+
+func sigOf(root *os.Root, rel string, fi fs.FileInfo) fileSig {
+	sig := fileSig{Size: fi.Size(), MTime: fi.ModTime().UnixNano(), Ino: inode(fi), Mode: fi.Mode()}
+	sig.CTime, _ = changeTime(fi)
+	if fi.Mode()&fs.ModeSymlink != 0 {
+		sig.Link, _ = root.Readlink(rel)
+	}
+	return sig
+}
+
+// snapshotArtifacts records what the --get destinations look like before the job runs, so the
+// download never replaces anything that appeared or changed here meanwhile.
+func snapshotArtifacts(paths []string) map[string]fileSig {
+	snap := map[string]fileSig{}
+	tree, err := os.OpenRoot(".")
+	if err != nil {
+		return snap
+	}
+	defer tree.Close()
+	for _, p := range paths {
+		p = path.Clean(filepath.ToSlash(p))
+		if checkRel(p) != nil {
+			continue
+		}
+		_ = fs.WalkDir(tree.FS(), p, func(rel string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if fi, err := d.Info(); err == nil {
+				snap[rel] = sigOf(tree, rel, fi)
+			}
+			return nil
+		})
+	}
+	return snap
 }
 
 // applyWriteBack applies a finished job's edits to root. One write-back per checkout at a time:
@@ -603,10 +688,11 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, sent 
 		return err
 	}
 	defer unlock()
-	return applyWriteBackLocked(ctx, h, j, root, sent, quiet)
+	return applyWriteBackLocked(ctx, h, j, root, sent, quiet, nil)
 }
 
-func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string, sent []api.FileEntry, quiet bool) error {
+// written, when set, receives the root-relative paths written back.
+func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string, sent []api.FileEntry, quiet bool, written *[]string) error {
 	base := map[string]api.FileEntry{}
 	for _, e := range sent {
 		base[e.Path] = e
@@ -705,6 +791,9 @@ func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string,
 	}
 	if len(wrote) > 0 {
 		logf(quiet, "wrote back %d file(s) the job changed: %s", len(wrote), strings.Join(firstN(wrote, 8), ", "))
+		if written != nil {
+			*written = wrote
+		}
 	}
 	if len(skipped) > 0 {
 		logf(false, "not written back (changed locally during the job): %s", strings.Join(firstN(skipped, 8), ", "))
@@ -898,43 +987,39 @@ func firstN(s []string, n int) []string {
 }
 
 // fetchArtifacts downloads and unpacks a job's artifacts into dest.
-// unchangedSince reports whether rel is still what the job was sent (or gone): same content and
-// mode for a file, same target for a symlink.
-func unchangedSince(tree *os.Root, rel string, orig api.FileEntry) bool {
+// unchangedSinceSnap reports whether rel is as the snapshot saw it (or absent both times, or
+// deleted here since: nothing to lose).
+func unchangedSinceSnap(tree *os.Root, rel string, snap map[string]fileSig) bool {
 	fi, err := tree.Lstat(rel)
 	if errors.Is(err, os.ErrNotExist) {
-		return true // deleted here: nothing to lose
+		return true
 	}
 	if err != nil {
 		return false
 	}
-	if orig.Link != "" {
-		cur, err := tree.Readlink(rel)
-		return err == nil && fi.Mode()&os.ModeSymlink != 0 && cur == orig.Link
-	}
-	cur, now, err := hashFileIn(tree, rel)
-	return err == nil && cur == orig.Hash && now.Mode().Perm() == os.FileMode(orig.Mode).Perm()
+	before, had := snap[rel]
+	return had && sigOf(tree, rel, fi) == before
 }
 
-// fetchArtifacts extracts a job's artifacts into dest. protect, when set, gives the content the
-// job was sent for a path: a tracked file changed here since then is kept, and the artifact is
-// saved beside it as <file>.offload-incoming[.N].
-func fetchArtifacts(ctx context.Context, h *Host, id, dest string, protect func(string) (api.FileEntry, bool)) error {
+// fetchArtifacts extracts a job's artifacts into dest. With a snapshot (see snapshotArtifacts),
+// a path that appeared or changed here since it was taken is kept, and the artifact is saved
+// beside it as <file>.offload-incoming[.N]; kept counts those.
+func fetchArtifacts(ctx context.Context, h *Host, id, dest string, snap map[string]fileSig) (kept int, err error) {
 	resp, err := h.request(ctx, "GET", "/v1/jobs/"+id+"/artifacts", nil)
 	if err != nil {
-		return err
+		return kept, err
 	}
 	defer resp.Body.Close()
 	gz, err := gzip.NewReader(resp.Body)
 	if err != nil {
-		return err
+		return kept, err
 	}
 	if err := os.MkdirAll(dest, 0o755); err != nil {
-		return err
+		return kept, err
 	}
 	tree, err := os.OpenRoot(dest) // confined: entries (and symlinks they create) can't escape dest
 	if err != nil {
-		return err
+		return kept, err
 	}
 	defer tree.Close()
 	tr := tar.NewReader(gz)
@@ -945,43 +1030,42 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string, protect func(
 			break
 		}
 		if err != nil {
-			return err
+			return kept, err
 		}
 		name := path.Clean(hd.Name)
 		if err := checkRel(name); err != nil {
-			return fmt.Errorf("refusing artifact path %q", hd.Name)
+			return kept, fmt.Errorf("refusing artifact path %q", hd.Name)
 		}
 		// Every entry type goes through real directories only: an existing symlink in the
 		// destination (even one pointing inside it) must not alias another path.
 		if err := mkdirReal(tree, path.Dir(name)); err != nil {
-			return fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
+			return kept, fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
 		}
-		// A tracked path changed here since upload (content, mode or link target) is never
-		// replaced, whatever kind of entry would replace it.
+		// Nothing that appeared or changed here since the snapshot is replaced, whatever kind
+		// of entry would replace it.
 		still := func() bool { return true }
-		if protect != nil {
-			if orig, tracked := protect(name); tracked {
-				still = func() bool { return unchangedSince(tree, name, orig) }
-			}
+		if snap != nil {
+			still = func() bool { return unchangedSinceSnap(tree, name, snap) }
 		}
 		switch hd.Typeflag {
 		case tar.TypeDir:
 			if err := mkdirReal(tree, name); err != nil {
-				return fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
+				return kept, fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
 			}
 		case tar.TypeReg:
 			if err := writeInIf(tree, name, tr, os.FileMode(hd.Mode).Perm(), "", still); err != nil {
 				var ce *conflictError
 				if errors.As(err, &ce) {
-					logf(false, "artifact %s not written over local edits (saved as %s)", name, ce.saved)
+					logf(false, "artifact %s not written over local changes (saved as %s)", name, ce.saved)
+					kept++
 					continue
 				}
-				return err
+				return kept, err
 			}
 			n++
 		case tar.TypeSymlink:
 			if fi, err := tree.Lstat(name); err == nil && fi.IsDir() {
-				return fmt.Errorf("refusing artifact %q: would replace a directory", hd.Name)
+				return kept, fmt.Errorf("refusing artifact %q: would replace a directory", hd.Name)
 			}
 			if !still() {
 				saved := ""
@@ -994,15 +1078,16 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string, protect func(
 						saved = cand
 					}
 				}
-				logf(false, "artifact %s not written over local edits (saved as %s)", name, saved)
+				logf(false, "artifact %s not written over local changes (saved as %s)", name, saved)
+				kept++
 				continue
 			}
 			_ = tree.Remove(name)
 			if err := tree.Symlink(hd.Linkname, name); err != nil {
-				return err
+				return kept, err
 			}
 		}
 	}
 	logf(false, "downloaded %d artifact file(s) into %s", n, dest)
-	return nil
+	return kept, nil
 }

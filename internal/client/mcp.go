@@ -93,7 +93,17 @@ func MCP(o MCPOptions) error {
 	if on != "" {
 		h, err = FindHost(hosts, on)
 	} else if sc != nil {
-		h, err = PickFor(preferData(hosts, sc.Data), api.JobSpec{Resources: res, Environment: spec.Environment}, "")
+		// Client-defined sessions run in a container unless --host: only runners that can
+		// start one are candidates, warm data sets decide among those.
+		want := api.JobSpec{Resources: res, Environment: spec.Environment, Runtime: "container", Network: sc.Network}
+		if o.Host {
+			want.Runtime = "host"
+		}
+		fit, _ := eligible(hosts, want)
+		if len(fit) == 0 {
+			fit = hosts // PickFor explains why none fits
+		}
+		h, err = PickFor(preferData(fit, sc.Data), want, "")
 	} else {
 		h, err = Pick(hosts, res, profile, "", "session")
 	}
@@ -194,6 +204,7 @@ func MCP(o MCPOptions) error {
 			case <-ctx.Done():
 				return nil
 			case err := <-done:
+				drainStderr()
 				return err
 			case <-time.After(100 * time.Millisecond):
 			}

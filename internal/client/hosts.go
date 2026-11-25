@@ -507,24 +507,32 @@ func (h *Host) free() api.Resources {
 // Without an explicit platform, runners matching this machine's OS/arch are preferred (files
 // fetched with --get then run here).
 func PickFor(hosts []*Host, spec api.JobSpec, kind string) (*Host, error) {
+	ok, why := eligible(hosts, spec)
+	if len(ok) == 0 && len(hosts) > 0 {
+		return nil, fmt.Errorf("no runner fits: %s", strings.Join(why, "; "))
+	}
+	return Pick(ok, spec.Resources, spec.Profile, spec.WorkspaceKey, kind)
+}
+
+// eligible keeps the runners that can run spec at all (platform, container runtime), with the
+// reasons the others can't.
+func eligible(hosts []*Host, spec api.JobSpec) ([]*Host, []string) {
 	var ok []*Host
 	var why []string
+	needContainer := spec.Runtime != "host" && (spec.Runtime == "container" || spec.Environment != nil || spec.Network == "client")
 	for _, h := range hosts {
 		st := h.Status
 		plat := st.OS + "/" + st.Arch
 		switch {
 		case spec.Platform != "" && plat != spec.Platform:
 			why = append(why, h.Name+": is "+plat)
-		case (spec.Environment != nil || spec.Network == "client") && spec.Runtime != "host" && st.Runtime != "container":
+		case needContainer && st.Runtime != "container":
 			why = append(why, h.Name+": no container runtime")
 		default:
 			ok = append(ok, h)
 		}
 	}
-	if len(ok) == 0 && len(hosts) > 0 {
-		return nil, fmt.Errorf("no runner fits: %s", strings.Join(why, "; "))
-	}
-	return Pick(ok, spec.Resources, spec.Profile, spec.WorkspaceKey, kind)
+	return ok, why
 }
 
 // Pick chooses the best runner for a request: it must be accepting, have the profile and be able
