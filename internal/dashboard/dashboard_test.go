@@ -177,4 +177,9 @@ func TestFleetOneRowPerRunnerID(t *testing.T) {
 	if len(v.Runners) != 1 || v.Runners[0].URL != "http://build.example:7420" || v.Runners[0].Name != "build" {
 		t.Fatalf("runners: %+v", v.Runners)
 	}
+	// The other address is kept to fall back on, once.
+	f.addLocked(&client.Host{Name: "build", URL: "http://100.64.0.1:7420", Status: &api.Status{ID: "r1"}})
+	if r := f.runners["r1"]; len(r.alts) != 1 || r.alts[0].URL != "http://100.64.0.1:7420" {
+		t.Fatalf("alternates: %+v", r.alts)
+	}
 }

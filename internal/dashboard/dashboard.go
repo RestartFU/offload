@@ -339,7 +339,7 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	resp, err := h.Request(ctx, "GET", base+"&follow=1&tail="+strconv.FormatInt(tail, 10), nil)
+	resp, done, err := openStream(ctx, h, base+"&follow=1&tail="+strconv.FormatInt(tail, 10))
 	if err != nil {
 		var ae *client.APIError
 		if errors.As(err, &ae) && ae.Code == 404 {
@@ -358,11 +358,13 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	// The runner ends a follow every few minutes (each reconnect is authorized again), and a
 	// connection can drop: reconnect from where it stopped until the workload is over, then read
-	// the rest. Give up, saying why, on an answer retrying can't change or after a few minutes.
+	// the rest. A drop that brought no output counts as a failure and waits before retrying.
+	// Give up, saying why, on an answer retrying can't change or after about five minutes.
 	follow, failures := true, 0
 	for {
 		n, readErr, writeErr := copyFlush(w, flusher, resp.Body)
 		resp.Body.Close()
+		done()
 		off += n
 		if writeErr != nil || ctx.Err() != nil {
 			return // the viewer went away
@@ -372,19 +374,34 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		if n > 0 {
 			failures = 0
+		} else if readErr != nil {
+			failures++
 		}
 		for {
+			if failures > 60 {
+				fmt.Fprintf(w, "\n[offload dashboard] stopped following this log: the runner keeps dropping the connection\n")
+				return
+			}
+			if failures > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+				}
+			}
 			var st struct {
 				State string `json:"state"`
 			}
-			err := h.Do(ctx, "GET", state, nil, &st)
+			sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			err := h.Do(sctx, "GET", state, nil, &st)
+			cancel()
 			if err == nil {
 				follow = !api.Terminal(st.State)
 				path := base + "&offset=" + strconv.FormatInt(off, 10)
 				if follow {
 					path += "&follow=1"
 				}
-				if resp, err = h.Request(ctx, "GET", path, nil); err == nil {
+				if resp, done, err = openStream(ctx, h, path); err == nil {
 					break
 				}
 			}
@@ -392,17 +409,30 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			var ae *client.APIError
-			if failures++; (errors.As(err, &ae) && ae.Code < 500) || failures > 60 {
+			if errors.As(err, &ae) && ae.Code < 500 {
 				fmt.Fprintf(w, "\n[offload dashboard] stopped following this log: %v\n", err)
 				return
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(5 * time.Second):
-			}
+			failures++
 		}
 	}
+}
+
+// openStream starts a streaming request that must answer within 15 seconds; the body then has
+// no deadline. done releases the request once its body is closed.
+func openStream(ctx context.Context, h *client.Host, path string) (*http.Response, func(), error) {
+	ctx, cancel := context.WithCancel(ctx)
+	timer := time.AfterFunc(15*time.Second, cancel)
+	resp, err := h.Request(ctx, "GET", path, nil)
+	if !timer.Stop() && err == nil { // it fired just as the answer came: the body is cut off
+		resp.Body.Close()
+		err = context.DeadlineExceeded
+	}
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return resp, cancel, nil
 }
 
 // copyFlush copies src to w, flushing after every read so output shows as it arrives. readErr

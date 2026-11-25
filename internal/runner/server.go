@@ -904,7 +904,11 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]string{"status": "upgraded; restarting"})
 	log.Printf("binary replaced; exiting so systemd restarts the new version")
-	go func() { time.Sleep(300 * time.Millisecond); os.Exit(0) }()
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		s.saveMetrics() // os.Exit skips Serve's shutdown, and with it the sampler's final save
+		os.Exit(0)
+	}()
 }
 
 // allocatedBusyLocked counts running jobs and live sessions.

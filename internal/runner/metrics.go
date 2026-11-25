@@ -31,6 +31,7 @@ const (
 )
 
 type metricsState struct {
+	saveMu  sync.Mutex // serializes writes of metrics.json
 	mu      sync.Mutex // guards the fields up to cpuSecs; held only briefly, never around I/O
 	latest  api.Metrics
 	raw     []api.MetricPoint // newest last, MetricsStep apart
@@ -78,8 +79,8 @@ func (s *Server) loadMetrics() {
 	m.saved = time.Now()
 }
 
-// sampleLoop takes a sample every MetricsStep until ctx ends. It is the only writer of
-// metrics.json: saves never overlap, and the last one is done when samplerDone closes.
+// sampleLoop takes a sample every MetricsStep until ctx ends. Its last save is done when
+// samplerDone closes.
 func (s *Server) sampleLoop(ctx context.Context) {
 	defer func() {
 		if s.samplerDone != nil {
@@ -102,11 +103,26 @@ func (s *Server) sampleLoop(ctx context.Context) {
 	}
 }
 
+// lockOrDone locks mu, or gives up when ctx ends: at shutdown the final save mustn't wait for
+// a scheduler step that is stuck on systemd.
+func lockOrDone(ctx context.Context, mu *sync.Mutex) bool {
+	for !mu.TryLock() {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return true
+}
+
 // sample takes one sample. It reports whether the minute averages are due to be saved.
 func (s *Server) sample(ctx context.Context) (save bool) {
 	now := time.Now()
 	// Snapshot the scheduler's view under s.mu, then read /proc and cgroups without it.
-	s.mu.Lock()
+	if !lockOrDone(ctx, &s.mu) {
+		return false
+	}
 	var refs []workloadRef
 	pt := api.MetricPoint{T: now.Unix()}
 	for _, j := range s.jobs {
@@ -194,7 +210,9 @@ func (s *Server) sample(ctx context.Context) (save bool) {
 
 	// Publish CPU time only for workloads still live: one that finished while we read has
 	// already taken its value, and nothing would remove a late entry. Lock order: s.mu, m.mu.
-	s.mu.Lock()
+	if !lockOrDone(ctx, &s.mu) {
+		return false
+	}
 	defer s.mu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -237,6 +255,8 @@ func appendMinute(pts []api.MetricPoint, p api.MetricPoint) []api.MetricPoint {
 }
 
 func (s *Server) saveMetrics() {
+	s.metrics.saveMu.Lock() // the sampler and an upgrade's exit can both save
+	defer s.metrics.saveMu.Unlock()
 	m := &s.metrics
 	m.mu.Lock()
 	pts := append([]api.MetricPoint(nil), m.minute...)

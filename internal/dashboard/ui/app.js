@@ -171,6 +171,7 @@ async function pollFleet() {
   try {
     const first = !state.fleet;
     state.fleet = await api("/api/fleet");
+    for (const r of state.fleet.runners) if (r.status) r.status.allocated = { cpu: 0, mem: 0, ...r.status.allocated }; // zeros are omitted
     state.fleetErr = null;
     if (first && state.view === "overview") scheduleData(); // series need the runner list
     state.fleetAt = Date.now();
@@ -488,7 +489,8 @@ const SERIES = {
   mem: [["mem_used", "Whole host in use", "--series-1"], ["mem_work", "Used by offload", "--series-2"], ["mem_alloc", "Allocated limits", "--series-3"]],
 };
 
-// combine sums every runner's series into one, aligned on step buckets.
+// combine sums every runner's series into one, aligned on step buckets. Within a runner, points
+// in a bucket are averaged weighted by n (the samples each stands for; absent means 1).
 function combine(seriesByRunner) {
   const all = Object.values(seriesByRunner).filter((x) => x && x.points.length);
   if (!all.length) return null;
@@ -498,14 +500,15 @@ function combine(seriesByRunner) {
     const per = new Map();
     for (const p of sr.points) {
       const b = Math.floor(p.t / step) * step;
-      const acc = per.get(b) || { n: 0 };
-      for (const k of Object.keys(p)) if (k !== "t") acc[k] = (acc[k] || 0) + p[k];
-      acc.n++;
+      const acc = per.get(b) || { w: 0, v: {} };
+      const w = p.n || 1;
+      for (const k of Object.keys(p)) if (k !== "t" && k !== "n") acc.v[k] = (acc.v[k] || 0) + w * p[k];
+      acc.w += w;
       per.set(b, acc);
     }
     for (const [b, acc] of per) {
       const tot = buckets.get(b) || { t: b };
-      for (const k of Object.keys(acc)) if (k !== "n") tot[k] = (tot[k] || 0) + acc[k] / acc.n;
+      for (const [k, v] of Object.entries(acc.v)) tot[k] = (tot[k] || 0) + v / acc.w;
       buckets.set(b, tot);
     }
   }
@@ -517,12 +520,12 @@ function renderCharts() {
   if (!el) return;
   const runners = metricRunners();
   const st = runners.map((r) => r.status);
-  const data = combine(state.series);
+  const loading = state.seriesFor !== state.range + "|" + state.runner;
+  const data = loading ? null : combine(state.series); // never another filter's data under these labels
   const capCPU = sum(st, (x) => x.capacity.cpu), hostCPUs = sum(st, (x) => x.host_cpus);
   const capMem = sum(st, (x) => x.capacity.mem), memTotal = sum(runners, (r) => r.metrics?.mem_total);
   const sub = $("#ov-charts-sub");
   if (sub) sub.textContent = state.runner ? state.runner : runners.length > 1 ? `All ${runners.length} runners, added together` : "";
-  const loading = state.seriesFor !== state.range + "|" + state.runner; // never another filter's data
   const cards = [
     chartCard("CPU", "Cores", data, SERIES.cpu, { ref: capCPU, refLabel: `capacity ${fmtCores(capCPU)}`, max: Math.max(hostCPUs, capCPU), fmt: fmtCores, unit: " cores" }, loading),
     chartCard("Memory", "Bytes", data, SERIES.mem, { ref: capMem, refLabel: `capacity ${fmtBytes(capMem)}`, max: Math.max(memTotal, capMem), fmt: fmtBytes, unit: "" }, loading),
@@ -539,7 +542,7 @@ function chartCard(title, unit, data, series, o, loading) {
       series.map(([, label, color]) => h("span", {}, h("i", { style: { background: `var(${color})` } }), label)),
       o.ref ? h("span", {}, h("i", { class: "ref" }), "Capacity offload hands out") : null),
     box);
-  requestAnimationFrame(() => drawChart(box, data, series, o));
+  requestAnimationFrame(() => drawChart(box, data, series, { ...o, loading }));
   return card;
 }
 
@@ -561,7 +564,7 @@ function drawChart(box, data, series, o) {
   const m = { l: 52, r: W < 560 ? 76 : 112, t: 10, b: 24 };
   const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "chart" });
   if (!data || data.points.length < 2) {
-    svg.append(s("text", { x: W / 2, y: H / 2, "text-anchor": "middle", class: "empty" }, data ? "Collecting samples…" : "No usage data yet"));
+    svg.append(s("text", { x: W / 2, y: H / 2, "text-anchor": "middle", class: "empty" }, data ? "Collecting samples…" : o.loading ? "Loading…" : "No usage data yet"));
     box.replaceChildren(svg);
     return;
   }
@@ -677,7 +680,7 @@ function renderActivity() {
   const started = jobs.filter((e) => e.started_at);
   const waits = started.map((e) => e.queue_wait);
   const cpuH = sum(jobs, (e) => e.cpu_seconds) / 3600;
-  const warm = jobs.filter((e) => e.sync_files > 0);
+  const warm = jobs.filter((e) => e.sync_files > 0 && e.started_at); // the sync finished
   const warmRate = warm.length ? 1 - sum(warm, (e) => e.uploaded) / Math.max(1, sum(warm, (e) => e.sync_files)) : null;
   const stats = h("div", { class: "stats" },
     kpi("Jobs finished", String(jobs.length), `${pct(ok / jobs.length)} succeeded`),
@@ -916,8 +919,9 @@ function drawerInfo(w) {
     add("Repository", sp.workspace_key ? h("span", { class: "mono" }, sp.workspace_key) : "none (throwaway directory)");
     add("Directory", sp.dir && sp.dir !== "." ? h("span", { class: "mono" }, sp.dir) : null);
     add("Git", sp.git ? h("span", { class: "mono" }, (sp.git.branch ? sp.git.branch + " @ " : "") + sp.git.head.slice(0, 12)) : null);
-    const up = r.uploaded || 0;
-    add("Synced files", r.sync_files ? `${r.sync_files} · ` + (up === 0 ? "all already on the runner" : up === r.sync_files ? "all uploaded" : `${up} uploaded, ${r.sync_files - up} already on the runner`) : null);
+    const up = r.uploaded || 0, synced = r.state === "queued" || r.started_at; // the upload finished
+    add("Synced files", !r.sync_files ? null : !synced ? `${r.sync_files}` :
+      `${r.sync_files} · ` + (up === 0 ? "all already on the runner" : up === r.sync_files ? "all uploaded" : `${up} uploaded, ${r.sync_files - up} already on the runner`));
   } else {
     add("Profile", r.profile);
     add("Clients attached", String(r.attached));

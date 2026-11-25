@@ -1,12 +1,14 @@
 package runner
 
 import (
+	"context"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -260,5 +262,19 @@ func TestTailStartsAtALine(t *testing.T) {
 	}
 	if got := tailOffset(httptest.NewRequest("GET", "/?tail=1000", nil), p, 0); got != 200<<10-1000 {
 		t.Errorf("huge line: offset %d", got)
+	}
+}
+
+func TestLockOrDoneGivesUpAtShutdown(t *testing.T) {
+	var mu sync.Mutex
+	mu.Lock() // a scheduler step stuck on systemd
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if lockOrDone(ctx, &mu) {
+		t.Fatal("locked a held mutex")
+	}
+	mu.Unlock()
+	if !lockOrDone(t.Context(), &mu) {
+		t.Fatal("couldn't lock a free mutex")
 	}
 }
