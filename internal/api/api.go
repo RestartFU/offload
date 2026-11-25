@@ -98,6 +98,9 @@ type JobSpec struct {
 	// IgnoreRules and IgnoreGlobal are the client's ignore rules that don't travel in the tree
 	// (.git/info/exclude; core.excludesFile), in gitignore syntax: pruning honors them too,
 	// ranked as git ranks them.
+	// SubmitID is chosen by the client: submitting the same spec again (after a lost answer)
+	// returns the job it already created instead of starting a second one.
+	SubmitID     string `json:"submit_id,omitempty"`
 	IgnoreRules  string `json:"ignore_rules,omitempty"`
 	IgnoreGlobal string `json:"ignore_global,omitempty"`
 }

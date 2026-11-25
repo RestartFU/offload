@@ -346,6 +346,15 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if id := spec.SubmitID; id != "" { // a retry of a submission whose answer was lost
+		for _, x := range s.jobs {
+			if x.Spec.SubmitID == id {
+				_ = os.RemoveAll(j.dir)
+				out.json(x.view())
+				return
+			}
+		}
+	}
 	if spec.WorkspaceKey == "" {
 		if err := os.MkdirAll(filepath.Join(j.dir, "work"), 0o755); err != nil {
 			out.err(500, err.Error())

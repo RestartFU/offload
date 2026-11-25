@@ -157,6 +157,7 @@ func Run(o RunOptions) (int, error) {
 		snap = snapshotArtifacts(o.Artifacts)
 	}
 	for attempt := 0; ; attempt++ {
+		spec.SubmitID = randomName() // one per submission (an OOM retry is a new job)
 		// Every write-back job gets a baseline bound to its ID, so `offload attach` can still
 		// apply its edits if this terminal goes away before it finishes.
 		pendingBaseline := ""
@@ -257,6 +258,19 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 			return nil, j, err
 		}
 		err = h.do(ctx, "POST", "/v1/jobs", spec, &j)
+		for retry := 0; err != nil && retry < 5 && ctx.Err() == nil; retry++ {
+			var ae *APIError
+			if errors.As(err, &ae) {
+				break // the runner answered
+			}
+			// The answer was lost, maybe after the runner created the job: ask again with the
+			// same SubmitID, which returns that job rather than a second one.
+			select {
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+			}
+			err = h.do(ctx, "POST", "/v1/jobs", spec, &j)
+		}
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Code == 403 && o.On == "" {
 			logf(false, "%s: %s; using another runner", h.Name, ae.Msg)
@@ -618,6 +632,9 @@ func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, 
 			if j.WriteBackError != "" {
 				return &collectError{j.WriteBackError}
 			}
+			if _, err := os.Stat(baselinePath(j.ID) + ".done"); err == nil {
+				return nil // applied already
+			}
 			if j.WriteBack != nil && len(j.WriteBack.Modified) > 0 {
 				return fmt.Errorf("the job changed %d file(s), but this machine has no record of what it sent (started elsewhere, or already applied): not writing them back", len(j.WriteBack.Modified))
 			}
@@ -656,6 +673,9 @@ func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, 
 	if err := applyWriteBackLocked(ctx, h, j, bl.Root, bl.Manifest, quiet, written); err != nil {
 		return err
 	}
+	// Remember it was applied, so attaching to this job again (to read its log) isn't taken for
+	// edits that never arrived.
+	_ = os.WriteFile(baselinePath(j.ID)+".done", nil, 0o600)
 	return os.Remove(baselinePath(j.ID))
 }
 
@@ -1246,6 +1266,23 @@ func firstN(s []string, n int) []string {
 }
 
 // fetchArtifacts downloads and unpacks a job's artifacts into dest.
+// deletedHere reports whether a directory above rel (or rel itself, for a directory entry) was
+// there when the snapshot was taken and is gone now.
+func deletedHere(tree *os.Root, rel string, isDir bool, snap map[string]fileSig) bool {
+	d := path.Dir(rel)
+	if isDir {
+		d = rel
+	}
+	for ; d != "." && d != "/" && d != ""; d = path.Dir(d) {
+		if _, had := snap[d]; had {
+			if _, err := tree.Lstat(d); errors.Is(err, os.ErrNotExist) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // unchangedSinceSnap reports whether rel is as the snapshot saw it (or absent both times, or
 // deleted here since: nothing to lose).
 func unchangedSinceSnap(tree *os.Root, rel string, snap map[string]fileSig) bool {
@@ -1311,10 +1348,22 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string, snap map[stri
 		if err := checkRel(name); err != nil {
 			return kept, fmt.Errorf("refusing artifact path %q", hd.Name)
 		}
+		// A directory deleted here while the job ran stays deleted: what the job put under it
+		// goes to .offload-incoming/<job>/ instead of recreating it.
+		relocated := false
+		if snap != nil && deletedHere(tree, name, hd.Typeflag == tar.TypeDir, snap) {
+			name, relocated = path.Join(incomingDir, id, name), true
+		}
 		// Every entry type goes through real directories only: an existing symlink in the
 		// destination (even one pointing inside it) must not alias another path.
 		if err := mkdirReal(tree, path.Dir(name)); err != nil {
 			return kept, fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
+		}
+		if relocated && hd.Typeflag != tar.TypeDir {
+			if kept == 0 {
+				logf(false, "artifacts under a directory deleted here were saved in %s", path.Join(incomingDir, id))
+			}
+			kept++
 		}
 		// Nothing that appeared or changed here since the snapshot is replaced, whatever kind
 		// of entry would replace it.

@@ -81,7 +81,10 @@ func globRE(pattern string) *regexp.Regexp {
 	for i := 0; i < len(rs); i++ {
 		switch c := rs[i]; c {
 		case '*':
-			if i+1 < len(rs) && rs[i+1] == '*' {
+			if i+2 < len(rs) && rs[i+1] == '*' && rs[i+2] == '/' && (i == 0 || rs[i-1] == '/') {
+				b.WriteString("(?:.*/)?") // "**/": zero or more directories
+				i += 2
+			} else if i+1 < len(rs) && rs[i+1] == '*' {
 				b.WriteString(".*")
 				i++
 			} else {

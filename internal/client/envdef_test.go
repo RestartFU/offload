@@ -215,3 +215,14 @@ func TestGlobMatchUnicode(t *testing.T) {
 		t.Fatal("? must match one character, not one byte")
 	}
 }
+
+func TestGlobDoubleStarZeroDirs(t *testing.T) {
+	for _, p := range []string{"a.png", "shots/a.png", "shots/2026/a.png"} {
+		if !globMatch("**/*.png", p) {
+			t.Errorf("**/*.png should match %s", p)
+		}
+	}
+	if globMatch("**/*.png", "a.jpg") {
+		t.Error("matched the wrong extension")
+	}
+}

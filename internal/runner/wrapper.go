@@ -478,7 +478,7 @@ func packArtifacts(dest string, paths []string) (missing []string, err error) {
 		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
 			return nil, fmt.Errorf("artifact path %q must stay inside the working directory", p)
 		}
-		err := fs.WalkDir(root.FS(), clean, func(path string, d fs.DirEntry, err error) error {
+		visit := func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -529,7 +529,15 @@ func packArtifacts(dest string, paths []string) (missing []string, err error) {
 			packed[path] = true
 			found++
 			return nil
-		})
+		}
+		var err error
+		if fi, lerr := root.Lstat(clean); lerr == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			// A requested path that is a symlink (dist/latest -> v2) is the link itself: one
+			// entry, never what it points at (a dangling one too).
+			err = visit(clean, nil, nil)
+		} else {
+			err = fs.WalkDir(root.FS(), clean, visit)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "offload: artifact %s: %v\n", p, err)
 			missing = append(missing, p)
