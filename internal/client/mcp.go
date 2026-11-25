@@ -91,6 +91,11 @@ func MCP(o MCPOptions) error {
 			return err
 		}
 	}
+	if on == "" && sc != nil && len(sc.Volumes) > 0 && !o.Prepare {
+		if p := preparedOn(profile, Discover(ctx, cfg)); p != nil {
+			on = p.Name // its volumes are filled there: wait for it rather than start empty elsewhere
+		}
+	}
 	var h *Host
 	var se api.Session
 	excluded := map[string]bool{}
@@ -260,7 +265,10 @@ pick:
 	case err := <-done:
 		drainStderr()
 		if err == nil {
-			return prepareResult(ctx, h, se.ID, o.Prepare) // the server's own exit status
+			err = prepareResult(ctx, h, se.ID, o.Prepare) // the server's own exit status
+			if err == nil && o.Prepare && sc != nil && len(sc.Volumes) > 0 {
+				rememberPrepared(profile, h)
+			}
 		}
 		return err
 	case err := <-inDone:
@@ -343,7 +351,38 @@ func prepareResult(ctx context.Context, h *Host, id string, prepare bool) error 
 		return fmt.Errorf("%s ended without an exit status (%s)", what, se.Reason)
 	}
 	if *se.ExitCode != 0 {
-		return fmt.Errorf("%s exited with status %d", what, *se.ExitCode)
+		return &ExitError{Code: *se.ExitCode, What: what}
+	}
+	return nil
+}
+
+// ExitError is a remote process's nonzero exit status, passed on as offload's own.
+type ExitError struct {
+	Code int
+	What string
+}
+
+func (e *ExitError) Error() string { return fmt.Sprintf("%s exited with status %d", e.What, e.Code) }
+
+// A profile prepared on a runner (--prepare filled its persistent volumes there) keeps using
+// that runner: another one would start from empty volumes. --on overrides it.
+func preparedPath(profile string) string { return filepath.Join(stateDir(), "prepared", profile) }
+
+func rememberPrepared(profile string, h *Host) {
+	_ = os.MkdirAll(filepath.Dir(preparedPath(profile)), 0o700)
+	_ = os.WriteFile(preparedPath(profile), []byte(h.URL+"\n"), 0o600)
+}
+
+func preparedOn(profile string, hosts []*Host) *Host {
+	b, err := os.ReadFile(preparedPath(profile))
+	if err != nil {
+		return nil
+	}
+	url := strings.TrimSpace(string(b))
+	for _, h := range hosts {
+		if h.URL == url {
+			return h
+		}
 	}
 	return nil
 }

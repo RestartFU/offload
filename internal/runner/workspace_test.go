@@ -415,15 +415,17 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 		os.MkdirAll(filepath.Dir(filepath.Join(dir, p)), 0o755)
 		os.WriteFile(filepath.Join(dir, p), []byte(c), 0o644)
 	}
-	write(".gitignore", "target/\n")
+	write(".gitignore", "target/\nnode_modules/\n")
 	write("main.go", "package main")
 	write("gen.go", "package main // generated on the runner by an earlier job")
 	write("target/out", "build output")
 	write("vendor/mod/x.go", "package mod // go mod vendor, on the runner")
 	write("local-out/bin", "ignored only by the client's .git/info/exclude")
-	os.MkdirAll(filepath.Join(dir, "vendor2", "deep"), 0o755) // left empty by an aborted job
+	os.MkdirAll(filepath.Join(dir, "vendor2", "deep"), 0o755)                  // left empty by an aborted job
+	os.MkdirAll(filepath.Join(dir, "web", "node_modules", "empty-pkg"), 0o755) // ignored: kept
+	write("web/index.js", "untracked source the client sent")
 	s := &Server{cfg: &Config{}}
-	s.pruneUntracked(context.Background(), &slot{Dir: dir}, []api.FileEntry{{Path: ".gitignore"}, {Path: "main.go"}}, "local-out/\n", "")
+	s.pruneUntracked(context.Background(), &slot{Dir: dir}, []api.FileEntry{{Path: ".gitignore"}, {Path: "main.go"}, {Path: "web/index.js"}}, "local-out/\n", "")
 	if _, err := os.Stat(filepath.Join(dir, "gen.go")); !os.IsNotExist(err) {
 		t.Fatal("runner-created source survived")
 	}
@@ -432,6 +434,9 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "vendor2")); !os.IsNotExist(err) {
 		t.Fatal("already-empty vendor2/ left behind")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "web", "node_modules", "empty-pkg")); err != nil {
+		t.Fatal("pruning entered an ignored directory")
 	}
 	for _, p := range []string{"main.go", "target/out", "local-out/bin"} {
 		if _, err := os.Stat(filepath.Join(dir, p)); err != nil {

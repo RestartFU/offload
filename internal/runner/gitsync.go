@@ -299,8 +299,12 @@ func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.Fi
 	}
 	excludes := filepath.Join(scratch, "global-excludes") // the client's, never the runner user's
 	_ = os.WriteFile(excludes, []byte(ignoreGlobal), 0o644)
-	out, err := gitCmdCtx(ctx, sl.Dir, "--git-dir="+scratch, "--work-tree=.", "-c", "core.excludesFile="+excludes, "ls-files", "-z", "--others", "--exclude-standard", "--exclude=/.git")
-	if err != nil || out == "" {
+	lsFiles := func(extra ...string) (string, error) {
+		return gitCmdCtx(ctx, sl.Dir, append([]string{"--git-dir=" + scratch, "--work-tree=.", "-c", "core.excludesFile=" + excludes,
+			"ls-files", "-z", "--others", "--exclude-standard", "--exclude=/.git"}, extra...)...)
+	}
+	out, err := lsFiles()
+	if err != nil {
 		return
 	}
 	sent := make(map[string]bool, len(manifest))
@@ -332,10 +336,17 @@ func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.Fi
 	// Directories left empty that the client doesn't have (an aborted `go mod vendor` leaves an
 	// empty vendor/, which still puts Go in vendor mode). Ignored ones, and any holding ignored
 	// output, stay.
-	dirs, err := gitCmdCtx(ctx, sl.Dir, "--git-dir="+scratch, "--work-tree=.", "-c", "core.excludesFile="+excludes,
-		"ls-files", "-z", "--others", "--exclude-standard", "--directory", "--exclude=/.git")
+	dirs, err := lsFiles("--directory")
 	if err != nil {
 		return
+	}
+	ignored := map[string]bool{} // ignored directories (node_modules/, target/ …) are never entered
+	if out, err := lsFiles("--ignored", "--directory"); err == nil {
+		for _, d := range strings.Split(out, "\x00") {
+			if d, ok := strings.CutSuffix(d, "/"); ok {
+				ignored[d] = true
+			}
+		}
 	}
 	for _, d := range strings.Split(dirs, "\x00") {
 		d = strings.TrimSuffix(d, "/")
@@ -347,9 +358,13 @@ func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.Fi
 		}
 		var all []string
 		_ = fs.WalkDir(root.FS(), d, func(p string, e fs.DirEntry, err error) error {
-			if err == nil && e.IsDir() {
-				all = append(all, p)
+			if err != nil || !e.IsDir() {
+				return nil
 			}
+			if ignored[p] {
+				return fs.SkipDir
+			}
+			all = append(all, p)
 			return nil
 		})
 		for k := len(all) - 1; k >= 0; k-- { // deepest first; Remove only takes empty ones

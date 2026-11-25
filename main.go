@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -143,6 +144,10 @@ func main() {
 		err = client.Hosts()
 	case "mcp":
 		err = cmdMCP(args)
+		var ee *client.ExitError
+		if errors.As(err, &ee) {
+			code = ee.Code // the MCP server's own status, as `run` passes its command's
+		}
 	case "host":
 		err = cmdHost(args)
 	case "env":

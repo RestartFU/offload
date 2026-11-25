@@ -78,6 +78,7 @@ type Host struct {
 	http     *http.Client
 	sock     string // unix socket path for a local runner
 	derived  bool   // Token is the one stored for this URL by `host pair`, not configured
+	named    bool   // Name comes from client.toml
 }
 
 // dialRaw opens a plain connection to the runner (for stream upgrades).
@@ -355,7 +356,9 @@ func Discover(ctx context.Context, cfg *Config) []*Host {
 	var fixed []*Host
 	for _, hc := range cfg.Hosts {
 		if !hc.Disabled {
-			fixed = append(fixed, newHost(hc.Name, hc.URL, hc.Token, hc.Priority))
+			fh := newHost(hc.Name, hc.URL, hc.Token, hc.Priority)
+			fh.named = hc.Name != ""
+			fixed = append(fixed, fh)
 		}
 	}
 	if cfg.Local == nil || *cfg.Local {
@@ -420,8 +423,8 @@ func probe(ctx context.Context, cands []*Host) []*Host {
 			var st api.Status
 			if err := h.do(pctx, "GET", "/v1/status", nil, &st); err == nil {
 				h.Status = &st
-				if st.Name != "" && h.Name != "local" {
-					h.Name = st.Name
+				if st.Name != "" && h.Name != "local" && !h.named {
+					h.Name = st.Name // a name from client.toml stays; the advertised one also finds it
 				}
 			}
 		}(h)
@@ -630,7 +633,7 @@ func checkProto(h *Host) error {
 
 func FindHost(hosts []*Host, name string) (*Host, error) {
 	for _, h := range hosts {
-		if strings.EqualFold(h.Name, name) || (h.Status != nil && strings.EqualFold(h.Status.Hostname, name)) {
+		if strings.EqualFold(h.Name, name) || (h.Status != nil && (strings.EqualFold(h.Status.Hostname, name) || strings.EqualFold(h.Status.Name, name))) {
 			return h, nil
 		}
 	}
@@ -682,11 +685,14 @@ func locateJob(ctx context.Context, hosts []*Host, ref string) (*Host, string, e
 			}
 		}
 	}
+	kind := "jobs"
+	if strings.HasPrefix(id, "s-") {
+		kind = "sessions"
+	}
 	for _, h := range hosts {
-		var j api.Job
-		if err := h.do(ctx, "GET", "/v1/jobs/"+id, nil, &j); err == nil {
+		if err := h.do(ctx, "GET", "/v1/"+kind+"/"+id, nil, nil); err == nil {
 			return h, id, nil
 		}
 	}
-	return nil, "", fmt.Errorf("job %s not found on any runner", id)
+	return nil, "", fmt.Errorf("%s not found on any runner", id)
 }
