@@ -1377,9 +1377,16 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string, snap map[stri
 			name, relocated = path.Join(incomingDir, id, name), true
 		}
 		// Every entry type goes through real directories only: an existing symlink in the
-		// destination (even one pointing inside it) must not alias another path.
+		// destination (even one pointing inside it) must not alias another path. A parent that
+		// is a symlink here (an in-tree dist/current link) stays as it is; the entry goes aside.
 		if err := mkdirReal(tree, path.Dir(name)); err != nil {
-			return kept, fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
+			if relocated {
+				return kept, fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
+			}
+			name, relocated = path.Join(incomingDir, id, name), true
+			if err := mkdirReal(tree, path.Dir(name)); err != nil {
+				return kept, fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
+			}
 		}
 		if relocated && hd.Typeflag != tar.TypeDir {
 			if kept == 0 {

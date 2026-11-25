@@ -3,6 +3,7 @@ package runner
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/RestartFU/offload/internal/units"
 )
 
 // meminfo reads one field of /proc/meminfo in bytes.
@@ -125,6 +128,8 @@ type unitSpec struct {
 	Stdout      string // file path; stdout and stderr are appended here
 	Stderr      string // optional separate stderr file
 	Delegate    bool   // let podman create sub-cgroups (--cgroups=split)
+	StopRecord  string // where systemd's own view of how the unit ended is written (see RunStopped)
+	Self        string // this executable, for the ExecStopPost hook
 	Argv        []string
 }
 
@@ -159,6 +164,11 @@ func startUnit(ctx context.Context, u unitSpec) error {
 	}
 	if u.IOWeight > 0 {
 		args = append(args, "-p", fmt.Sprintf("IOWeight=%d", u.IOWeight))
+	}
+	if u.StopRecord != "" && u.Self != "" {
+		// Runs even when the whole unit (wrapper included) was killed, e.g. by the kernel's or
+		// systemd-oomd's OOM handling: then this is the only record of why it ended.
+		args = append(args, "-p", "ExecStopPost="+u.Self+" runner stopped "+u.StopRecord)
 	}
 	for k, v := range u.Env {
 		args = append(args, "--setenv="+k+"="+v)
@@ -270,3 +280,31 @@ func parallelEnv(n int) map[string]string {
 }
 
 func contextBG() context.Context { return context.Background() }
+
+// stopRecord is systemd's account of how a unit ended ($SERVICE_RESULT, $EXIT_CODE,
+// $EXIT_STATUS of ExecStopPost).
+type stopRecord struct {
+	Result string `json:"result"`
+	Code   string `json:"code,omitempty"`
+	Status string `json:"status,omitempty"`
+}
+
+// RunStopped is "offload runner stopped PATH", the ExecStopPost hook of job and session units.
+func RunStopped(path string) int {
+	_ = writeFileJSON(path, stopRecord{Result: os.Getenv("SERVICE_RESULT"), Code: os.Getenv("EXIT_CODE"), Status: os.Getenv("EXIT_STATUS")})
+	return 0
+}
+
+// killedReason explains a unit that ended without its wrapper's exit record.
+func killedReason(dir string, mem int64) string {
+	var rec stopRecord
+	if b, err := os.ReadFile(filepath.Join(dir, "stop.json")); err == nil && json.Unmarshal(b, &rec) == nil {
+		if rec.Result == "oom-kill" {
+			return fmt.Sprintf("out of memory (limit %s; the whole unit was killed, by its limit or host memory pressure)", units.FormatSize(mem))
+		}
+		if rec.Result != "" && rec.Result != "success" {
+			return "killed before it could report an exit status (systemd: " + rec.Result + ")"
+		}
+	}
+	return "killed before it could report an exit status"
+}

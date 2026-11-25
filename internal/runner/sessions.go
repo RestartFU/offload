@@ -353,6 +353,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	u := unitSpec{
 		Name: se.Unit, Slice: s.cfg.Slice, Dir: home, Env: unitEnv, Delegate: rt == "container",
+		StopRecord: filepath.Join(se.dir, "stop.json"), Self: s.self,
 		Argv:      append(append(pipe, "--"), command...),
 		CPUWeight: cpuWeight(res.CPU), CPUQuotaPct: int(math.Ceil(res.CPUMax * 100)),
 		AllowedCPUs: allowed, MemoryMax: res.Mem, OOMScoreAdj: s.cfg.Policy.OOMScoreAdj,
@@ -640,7 +641,7 @@ func (s *Server) checkSessions() {
 			s.finishSessionLocked(se, &code, reason)
 		case !active:
 			if se.inactive++; se.inactive >= 3 {
-				s.finishSessionLocked(se, nil, "process ended without an exit status")
+				s.finishSessionLocked(se, nil, killedReason(se.dir, se.Resources.Mem))
 			}
 		case se.Attached == 0 && time.Since(se.LastSeen) > s.cfg.sessionGrace:
 			if se.Reason == "" {

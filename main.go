@@ -429,6 +429,11 @@ func cmdRunner(args []string) (int, error) {
 			op = args[1]
 		}
 		return runner.CredentialHelper(op, os.Stdin, os.Stdout), nil
+	case "stopped": // ExecStopPost hook of job and session units
+		if len(args) < 2 {
+			die("internal: runner stopped PATH")
+		}
+		return runner.RunStopped(args[1]), nil
 	case "pipe":
 		fs := flag.NewFlagSet("pipe", flag.ExitOnError)
 		dir := fs.String("dir", "", "")

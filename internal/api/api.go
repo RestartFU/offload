@@ -1,9 +1,11 @@
 // Package api holds the wire types shared by the offload client and runner.
 package api
 
-import "strings"
-
-import "time"
+import (
+	"path"
+	"strings"
+	"time"
+)
 
 // DefaultPort is the TCP port a runner listens on inside the tailnet.
 const DefaultPort = 7420
@@ -314,4 +316,49 @@ func SkipDir(name string) bool {
 		return true
 	}
 	return strings.HasPrefix(name, ".cache")
+}
+
+// CommandWords is the command a job's argv really runs: past "sh -c '…'" (its first command)
+// and leading VAR=value assignments. Profiles match on its first word.
+func CommandWords(argv []string) []string {
+	if len(argv) >= 3 {
+		switch path.Base(argv[0]) {
+		case "sh", "bash", "zsh", "dash":
+			for i := 1; i+1 < len(argv); i++ {
+				if argv[i] == "-c" || argv[i] == "-lc" || argv[i] == "-ec" {
+					first := strings.FieldsFunc(argv[i+1], func(r rune) bool { return r == ';' || r == '&' || r == '|' || r == '\n' })
+					if len(first) > 0 {
+						argv = strings.Fields(first[0])
+					}
+					break
+				}
+			}
+		}
+	}
+	for len(argv) > 0 && strings.Contains(argv[0], "=") && !strings.HasPrefix(argv[0], "-") {
+		argv = argv[1:]
+	}
+	return argv
+}
+
+// MatchProfile is the job profile a runner picks for argv when none is named ("" if none):
+// the alphabetically first job profile whose match globs fit the command's base name.
+func MatchProfile(profiles map[string]ProfileInfo, argv []string) string {
+	words := CommandWords(argv)
+	if len(words) == 0 {
+		return ""
+	}
+	cmd := path.Base(words[0])
+	best := ""
+	for name, p := range profiles {
+		if p.Kind != "job" {
+			continue
+		}
+		for _, m := range p.Match {
+			if ok, _ := path.Match(m, cmd); ok && (best == "" || name < best) {
+				best = name
+			}
+		}
+	}
+	return best
 }

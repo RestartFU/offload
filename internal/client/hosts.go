@@ -524,7 +524,7 @@ func PickFor(hosts []*Host, spec api.JobSpec, kind string) (*Host, error) {
 	if len(ok) == 0 && len(hosts) > 0 {
 		return nil, fmt.Errorf("no runner fits: %s", strings.Join(why, "; "))
 	}
-	return Pick(ok, spec.Resources, spec.Profile, spec.WorkspaceKey, kind)
+	return pick(ok, spec.Resources, spec.Profile, spec.WorkspaceKey, kind, spec.Argv)
 }
 
 // eligible keeps the runners that can run spec at all (platform, container runtime), with the
@@ -551,6 +551,12 @@ func eligible(hosts []*Host, spec api.JobSpec) ([]*Host, []string) {
 // Pick chooses the best runner for a request: it must be accepting, have the profile and be able
 // to fit the job eventually. Free capacity now, a warm workspace and priority decide among them.
 func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, error) {
+	return pick(hosts, want, profile, key, kind, nil)
+}
+
+// pick is Pick; with argv and no profile, each runner is judged by the profile it would match
+// for that command (as it will when it gets the job), not by its global defaults.
+func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []string) (*Host, error) {
 	var best *Host
 	bestScore := -1e18
 	var reasons []string
@@ -565,6 +571,10 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 		}
 		st := h.Status
 		r := want
+		profile := profile
+		if profile == "" && len(argv) > 0 {
+			profile = api.MatchProfile(st.Profiles, argv)
+		}
 		if p, ok := st.Profiles[profile]; profile != "" {
 			if !ok || (kind != "" && p.Kind != kind) {
 				reasons = append(reasons, h.Name+": no "+profile+" profile")

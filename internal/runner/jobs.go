@@ -927,6 +927,7 @@ func (s *Server) startJobLocked(j *job) error {
 	}
 	u := unitSpec{
 		Name: j.Unit, Slice: s.cfg.Slice, Dir: dir, Env: unitEnv, Argv: argv, Delegate: container,
+		StopRecord: filepath.Join(j.dir, "stop.json"), Self: s.self,
 		CPUWeight: cpuWeight(j.Resources.CPU), CPUQuotaPct: int(math.Ceil(j.Resources.CPUMax * 100)),
 		AllowedCPUs: j.AllowedCPUs, MemoryMax: j.Resources.Mem, OOMScoreAdj: s.cfg.Policy.OOMScoreAdj,
 		Stdout: filepath.Join(j.dir, "output.log"),
@@ -1014,7 +1015,7 @@ func (s *Server) checkRunning() {
 		default:
 			// The unit is gone without a record: give the wrapper a moment, then call it killed.
 			if j.inactive++; j.inactive >= 3 {
-				state, reason := api.StateFailed, "killed before it could report an exit status"
+				state, reason := api.StateFailed, killedReason(j.dir, j.Resources.Mem)
 				if j.cancel {
 					state, reason = api.StateCancelled, "cancelled"
 				}

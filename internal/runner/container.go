@@ -581,11 +581,7 @@ func (s *Server) cacheMounts() []string {
 // credentials never reach another. npm's cache holds runnable tool trees (npx), so it is scoped
 // too. scope "" (no workspace) gets no persistent caches at all.
 func (s *Server) workloadMounts(scope string) []string {
-	var out []string
-	for name, dst := range toolchainDirs {
-		_ = os.MkdirAll(s.cacheDir(name), 0o755)
-		out = append(out, s.cacheDir(name)+":"+dst+":ro")
-	}
+
 	// Repository caches live in cache/scoped/<key> (aged out by GC), session caches in
 	// cache/sessions/<profile> (scope "session:<profile>"): distinct trees, no name games.
 	base := ""
@@ -593,6 +589,21 @@ func (s *Server) workloadMounts(scope string) []string {
 		base = s.cacheDir("sessions", name)
 	} else if scope != "" && validKey(scope) {
 		base = s.cacheDir("scoped", scope)
+	}
+	var out []string
+	for name, dst := range toolchainDirs {
+		_ = os.MkdirAll(s.cacheDir(name), 0o755)
+		if name == "rustup" && base != "" {
+			// Read-only shared toolchains under a writable layer of this repository's own, so a
+			// project's rust-toolchain.toml (a pinned nightly) can install what it needs
+			// without touching what other repositories run.
+			upper, work := filepath.Join(base, "rustup-upper"), filepath.Join(base, "rustup-work")
+			_ = os.MkdirAll(upper, 0o755)
+			_ = os.MkdirAll(work, 0o755)
+			out = append(out, s.cacheDir(name)+":"+dst+":O,upperdir="+upper+",workdir="+work)
+			continue
+		}
+		out = append(out, s.cacheDir(name)+":"+dst+":ro")
 	}
 	if base != "" {
 		for name, dst := range map[string]string{

@@ -57,26 +57,7 @@ func commandSig(argv []string) string {
 }
 
 // effectiveArgv returns the command a shell wrapper would run first, minus VAR=value prefixes.
-func effectiveArgv(argv []string) []string {
-	if len(argv) >= 3 {
-		switch path.Base(argv[0]) {
-		case "sh", "bash", "zsh", "dash":
-			for i := 1; i+1 < len(argv); i++ {
-				if argv[i] == "-c" || argv[i] == "-lc" || argv[i] == "-ec" {
-					first := strings.FieldsFunc(argv[i+1], func(r rune) bool { return r == ';' || r == '&' || r == '|' || r == '\n' })
-					if len(first) > 0 {
-						argv = strings.Fields(first[0])
-					}
-					break
-				}
-			}
-		}
-	}
-	for len(argv) > 0 && strings.Contains(argv[0], "=") && !strings.HasPrefix(argv[0], "-") {
-		argv = argv[1:]
-	}
-	return argv
-}
+func effectiveArgv(argv []string) []string { return api.CommandWords(argv) }
 
 func histKey(spec api.JobSpec) string {
 	k := spec.WorkspaceKey
