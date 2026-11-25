@@ -253,7 +253,7 @@ func SyncData(ctx context.Context, h *Host, name string, cfg DataSetConfig, quie
 	start := time.Now()
 	// One sync of a data set to a runner at a time from this machine: an older scan must never
 	// land after a newer one and delete what it added.
-	unlock, err := lockFile(lockPath("data-" + dataKey(name) + "-" + hex12(h.URL)))
+	unlock, err := lockFileCtx(ctx, lockPath("data-"+dataKey(name)+"-"+hex12(h.URL)))
 	if err != nil {
 		return err
 	}

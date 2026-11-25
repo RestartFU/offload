@@ -136,6 +136,9 @@ func Attach(ref string) (int, error) {
 	if err == nil && done != nil {
 		if werr := consumeWriteBack(ctx, h, done, false, false, nil); werr != nil {
 			logf(false, "write-back: %v", werr)
+			if code == 0 {
+				code = 1 // the job's edits didn't all arrive
+			}
 		}
 	}
 	return code, err
@@ -339,6 +342,33 @@ func pairOne(ctx context.Context, h *Host, code string) error {
 		fmt.Printf("%s: %s\n", h.Name, out["status"])
 	}
 	return nil
+}
+
+// lockFileCtx is lockFile, giving up when ctx ends (Ctrl-C while another process holds it).
+func lockFileCtx(ctx context.Context, path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 // lockFile takes an exclusive lock on path (created if needed) and returns its release.

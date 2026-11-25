@@ -741,12 +741,23 @@ func (s *Server) allocatedLocked() api.Resources {
 			a.Mem += j.Resources.Mem
 		}
 	}
+	held := s.heldLocked()
+	a.CPU += held.CPU
+	a.Mem += held.Mem
+	return a
+}
+
+// heldLocked is what live sessions and environment builds hold: capacity that doesn't come back
+// when running jobs finish (sessions live for hours; builds take build_mem each).
+func (s *Server) heldLocked() api.Resources {
+	var a api.Resources
 	for _, se := range s.sessions {
 		if !api.Terminal(se.State) {
 			a.CPU += se.Resources.CPU
 			a.Mem += se.Resources.Mem
 		}
 	}
+	a.Mem += int64(len(s.builds)) * s.cfg.buildMem
 	return a
 }
 

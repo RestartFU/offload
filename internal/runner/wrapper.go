@@ -80,11 +80,13 @@ func RunExec(o ExecOptions) int {
 		fmt.Fprintf(os.Stderr, "offload: %v\n", runErr)
 	}
 	if len(o.Artifacts) > 0 {
-		if err := packArtifacts(filepath.Join(o.JobDir, "artifacts.tar.gz"), o.Artifacts); err != nil {
+		missing, err := packArtifacts(filepath.Join(o.JobDir, "artifacts.tar.gz"), o.Artifacts)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "offload: artifacts: %v\n", err)
 		} else {
 			rec.Artifact = true
 		}
+		rec.ArtifactsMissing = missing
 	}
 	if o.WriteBack != "" && o.Record != "" {
 		wb, err := collectWriteBack(o.WriteBack, o.Record, filepath.Join(o.JobDir, "writeback.tar.gz"))
@@ -418,31 +420,38 @@ func oomKilled() bool {
 }
 
 // packArtifacts tars the given paths (files or directories, relative to the working directory).
-func packArtifacts(dest string, paths []string) error {
+// packArtifacts archives the requested paths and returns those it couldn't pack (missing or
+// unreadable), so a partial set never looks complete.
+func packArtifacts(dest string, paths []string) (missing []string, err error) {
 	// Confined to the working directory: an artifact path (or a parent of it) that a job turned
 	// into a symlink can't make the runner pack files from elsewhere on the host.
 	root, err := os.OpenRoot(".")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer root.Close()
 	f, err := os.Create(dest)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)
 	found := 0
+	packed := map[string]bool{} // overlapping requests (dist and dist/app) pack each entry once
 	for _, p := range paths {
 		clean := filepath.ToSlash(filepath.Clean(p))
 		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
-			return fmt.Errorf("artifact path %q must stay inside the working directory", p)
+			return nil, fmt.Errorf("artifact path %q must stay inside the working directory", p)
 		}
 		err := fs.WalkDir(root.FS(), clean, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
+			if packed[path] {
+				return nil
+			}
+			packed[path] = true
 			info, err := root.Lstat(path)
 			if err != nil {
 				return err
@@ -475,18 +484,19 @@ func packArtifacts(dest string, paths []string) error {
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "offload: artifact %s: %v\n", p, err)
+			missing = append(missing, p)
 		}
 	}
 	if err := tw.Close(); err != nil {
-		return err
+		return missing, err
 	}
 	if err := gz.Close(); err != nil {
-		return err
+		return missing, err
 	}
 	if found == 0 {
-		return errors.New("none of the requested artifacts exist")
+		return missing, errors.New("none of the requested artifacts exist")
 	}
-	return nil
+	return missing, nil
 }
 
 // checkBinary makes sure an uploaded binary runs on this machine before we swap it in, and

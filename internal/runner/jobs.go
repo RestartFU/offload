@@ -46,13 +46,14 @@ type job struct {
 
 // exitRecord is written by the unit wrapper when the command ends.
 type exitRecord struct {
-	Code      int            `json:"code"`
-	Signal    string         `json:"signal,omitempty"`
-	OOM       bool           `json:"oom,omitempty"`
-	Error     string         `json:"error,omitempty"`
-	PeakMem   int64          `json:"peak_mem,omitempty"`
-	Artifact  bool           `json:"artifacts,omitempty"`
-	WriteBack *api.WriteBack `json:"write_back,omitempty"`
+	Code             int            `json:"code"`
+	Signal           string         `json:"signal,omitempty"`
+	OOM              bool           `json:"oom,omitempty"`
+	Error            string         `json:"error,omitempty"`
+	PeakMem          int64          `json:"peak_mem,omitempty"`
+	Artifact         bool           `json:"artifacts,omitempty"`
+	ArtifactsMissing []string       `json:"artifacts_missing,omitempty"`
+	WriteBack        *api.WriteBack `json:"write_back,omitempty"`
 }
 
 // contextRel normalizes an environment's build context directory ("" means the workspace root).
@@ -706,7 +707,11 @@ func (s *Server) admit() {
 			}
 			// A job waiting long for allocated capacity stops smaller ones passing it, so it
 			// can't starve. Host memory pressure is different: smaller jobs may still fit.
-			if time.Since(j.queuedAt) > 2*time.Minute && !strings.Contains(why, "MemAvailable") {
+			// Only when it could start once running jobs finish: if sessions or builds hold what
+			// it needs, holding everyone else back would only stall the queue.
+			held := s.heldLocked()
+			canFitLater := held.CPU+j.Resources.CPU <= s.cfg.Capacity.CPU+1e-9 && held.Mem+j.Resources.Mem <= s.cfg.memCap
+			if time.Since(j.queuedAt) > 2*time.Minute && canFitLater && !strings.Contains(why, "MemAvailable") {
 				return
 			}
 			continue
@@ -916,6 +921,7 @@ func (s *Server) checkRunning() {
 			}
 			code := rec.Code
 			j.Signal, j.HasArtifact, j.WriteBack, j.PeakMem = rec.Signal, rec.Artifact, rec.WriteBack, rec.PeakMem
+			j.ArtifactsMissing = rec.ArtifactsMissing
 			s.learn(j, rec)
 			s.finishLocked(j, state, &code, reason)
 		case active:

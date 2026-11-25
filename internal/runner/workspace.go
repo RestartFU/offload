@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path"
 	"regexp"
@@ -299,7 +300,7 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 			return err
 		}
 		if fi, err := root.Lstat(p); err == nil && !fi.Mode().IsRegular() {
-			if err := root.RemoveAll(p); err != nil {
+			if err := clearForReplacement(root, p, fi, keepRunner); err != nil {
 				return err
 			}
 		}
@@ -366,7 +367,11 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		}
 		if e.Link != "" {
 			if cur, err := root.Readlink(e.Path); err != nil || cur != e.Link {
-				_ = root.RemoveAll(e.Path)
+				if fi, err := root.Lstat(e.Path); err == nil {
+					if err := clearForReplacement(root, e.Path, fi, keepRunner); err != nil {
+						return err
+					}
+				}
 				if err := root.Symlink(e.Link, e.Path); err != nil {
 					return err
 				}
@@ -402,6 +407,21 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 	sort.Strings(stillDirty)
 	rec.Dirty, rec.Stages = stillDirty, nil
 	return s.save(rec)
+}
+
+// clearForReplacement makes way for a file or symlink at p. In a data set (keepRunner) a
+// directory there may hold what only the runner has (a session's saves): it is moved aside as
+// <p>.offload-displaced-<time>, never deleted.
+func clearForReplacement(root *os.Root, p string, fi fs.FileInfo, keepRunner bool) error {
+	if keepRunner && fi.IsDir() {
+		aside := fmt.Sprintf("%s.offload-displaced-%d", p, time.Now().UnixNano())
+		if err := root.Rename(p, aside); err != nil {
+			return err
+		}
+		log.Printf("data set: %s became a file or link on the client; the runner's directory is kept as %s", p, aside)
+		return nil
+	}
+	return root.RemoveAll(p)
 }
 
 const (

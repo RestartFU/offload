@@ -114,7 +114,10 @@ type Job struct {
 	Signal      string     `json:"signal,omitempty"`
 	Reason      string     `json:"reason,omitempty"`
 	HasArtifact bool       `json:"has_artifacts,omitempty"`
-	WriteBack   *WriteBack `json:"write_back,omitempty"`
+	// ArtifactsMissing lists requested artifact paths the job didn't produce (or that couldn't
+	// be read): the archive, if any, holds the rest.
+	ArtifactsMissing []string   `json:"artifacts_missing,omitempty"`
+	WriteBack        *WriteBack `json:"write_back,omitempty"`
 	// PeakMem is the job's peak memory use (cgroup memory.peak), once it has finished.
 	PeakMem int64 `json:"peak_mem,omitempty"`
 	// AutoMem is set when the runner chose the memory limit (from history or the profile)

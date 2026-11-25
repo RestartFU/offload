@@ -103,7 +103,10 @@ func MCP(o MCPOptions) error {
 		if len(fit) == 0 {
 			fit = hosts // PickFor explains why none fits
 		}
-		h, err = PickFor(preferData(fit, sc.Data), want, "")
+		// Warm data wins among runners that can take the session now; otherwise any that can.
+		if h, err = PickFor(preferData(fit, sc.Data), want, ""); err != nil {
+			h, err = PickFor(fit, want, "")
+		}
 	} else {
 		h, err = Pick(hosts, res, profile, "", "session")
 	}
@@ -190,6 +193,7 @@ func MCP(o MCPOptions) error {
 		return err
 	case err := <-inDone:
 		if err != nil {
+			drainStderr() // the server's last words (why it stopped reading) are usually there
 			return err
 		}
 		// Input closed: let answers already in flight arrive, then end the session. Wait at

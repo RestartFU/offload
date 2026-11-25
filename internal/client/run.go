@@ -533,7 +533,7 @@ func saveBaseline(ws *Workspace) (string, error) {
 
 // consumeWriteBack applies a finished job's write-back from its baseline, once. With
 // checkoutLocked the caller already holds the checkout's lock.
-func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, quiet bool, written *[]string) error {
+func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, quiet bool, written map[string]fileSig) error {
 	if !api.Terminal(j.State) {
 		return nil
 	}
@@ -592,27 +592,23 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 		}
 		defer unlock()
 	}
-	var wrote []string
-	if err := consumeWriteBack(ctx, h, j, true, o.Quiet, &wrote); err != nil {
-		logf(false, "write-back: %v", err)
+	wrote := map[string]fileSig{}
+	var wbErr error
+	if err := consumeWriteBack(ctx, h, j, true, o.Quiet, wrote); err != nil {
+		wbErr = fmt.Errorf("write-back: %w (run `offload attach %s:%s` to retry)", err, h.Name, j.ID)
 	}
-	// What write-back just wrote is the job's own result, not a local change: artifacts may
-	// replace it.
-	if snap != nil && ws != nil && len(wrote) > 0 {
-		if tree, err := os.OpenRoot("."); err == nil {
-			for _, w := range wrote {
-				rel := w
-				if d := filepath.ToSlash(ws.Dir); d != "" && d != "." {
-					var ok bool
-					if rel, ok = strings.CutPrefix(w, d+"/"); !ok {
-						continue
-					}
-				}
-				if fi, err := tree.Lstat(rel); err == nil {
-					snap[rel] = sigOf(tree, rel, fi)
+	// What write-back installed is the job's own result, not a local change: artifacts may
+	// replace exactly those files (identified as they were installed, before any later edit).
+	if snap != nil && ws != nil {
+		for w, sig := range wrote {
+			rel := w
+			if d := filepath.ToSlash(ws.Dir); d != "" && d != "." {
+				var ok bool
+				if rel, ok = strings.CutPrefix(w, d+"/"); !ok {
+					continue
 				}
 			}
-			tree.Close()
+			snap[rel] = sig
 		}
 	}
 	var artErr error
@@ -624,6 +620,9 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 		} else if kept > 0 {
 			artErr = fmt.Errorf("%d artifact(s) not written over local changes (saved beside them)", kept)
 		}
+		if len(j.ArtifactsMissing) > 0 && artErr == nil {
+			artErr = fmt.Errorf("the job didn't produce %s (the other artifacts were downloaded)", strings.Join(j.ArtifactsMissing, ", "))
+		}
 	}
 	if j.StartedAt != nil && j.FinishedAt != nil && j.State == api.StateExited {
 		peak := ""
@@ -632,7 +631,50 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 		}
 		logf(o.Quiet, "%s:%s exit %d in %s%s", h.Name, j.ID, *j.ExitCode, j.FinishedAt.Sub(*j.StartedAt).Round(100*time.Millisecond), peak)
 	}
+	if wbErr != nil {
+		return wbErr
+	}
 	return artErr
+}
+
+// verifyArchive checks a downloaded write-back archive is complete and intact (every entry's
+// hash) before anything from it is applied.
+func verifyArchive(f *os.File, want map[string]api.ChangedFile) error {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	defer f.Seek(0, io.SeekStart)
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	tr := tar.NewReader(gz)
+	seen := 0
+	for {
+		hd, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		c, ok := want[hd.Name]
+		if !ok {
+			return fmt.Errorf("unexpected entry %q", hd.Name)
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, tr); err != nil {
+			return err
+		}
+		if hex.EncodeToString(h.Sum(nil)) != c.Hash {
+			return fmt.Errorf("%s: corrupted in transfer", hd.Name)
+		}
+		seen++
+	}
+	if seen != len(want) {
+		return fmt.Errorf("incomplete: %d of %d files", seen, len(want))
+	}
+	return nil
 }
 
 // fileSig is what a path looked like (metadata only, cheap for large output trees).
@@ -692,7 +734,7 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, sent 
 }
 
 // written, when set, receives the root-relative paths written back.
-func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string, sent []api.FileEntry, quiet bool, written *[]string) error {
+func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string, sent []api.FileEntry, quiet bool, written map[string]fileSig) error {
 	base := map[string]api.FileEntry{}
 	for _, e := range sent {
 		base[e.Path] = e
@@ -708,12 +750,27 @@ func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string,
 	for _, c := range wb.Modified {
 		byPath[c.Path] = c
 	}
+	// Download it all first: a connection lost halfway must leave nothing half-applied.
+	_ = os.MkdirAll(stateDir(), 0o700)
+	archive, err := os.CreateTemp(stateDir(), ".writeback-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(archive.Name())
+	defer archive.Close()
 	resp, err := h.request(ctx, "GET", "/v1/jobs/"+j.ID+"/writeback", nil)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	gz, err := gzip.NewReader(resp.Body)
+	_, err = io.Copy(archive, resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return fmt.Errorf("downloading the job's edits: %w", err)
+	}
+	if err := verifyArchive(archive, byPath); err != nil {
+		return fmt.Errorf("downloading the job's edits: %w", err)
+	}
+	gz, err := gzip.NewReader(archive)
 	if err != nil {
 		return err
 	}
@@ -772,6 +829,15 @@ func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string,
 			}
 			if unchanged && tree.Rename(tmp, c.Path) == nil {
 				wrote = append(wrote, c.Path)
+				if fi, err := tree.Lstat(c.Path); err == nil && written != nil {
+					written[c.Path] = sigOf(tree, c.Path, fi) // this exact file is the job's
+				}
+				continue
+			}
+			// Already there (an earlier attempt applied it before failing): nothing to do.
+			if herr == nil && cur == c.Hash && before.Mode().Perm() == os.FileMode(c.Mode).Perm() {
+				_ = tree.Remove(tmp)
+				wrote = append(wrote, c.Path)
 				continue
 			}
 			if saved, ok := linkBeside(tree, tmp, c.Path); ok {
@@ -791,9 +857,7 @@ func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string,
 	}
 	if len(wrote) > 0 {
 		logf(quiet, "wrote back %d file(s) the job changed: %s", len(wrote), strings.Join(firstN(wrote, 8), ", "))
-		if written != nil {
-			*written = wrote
-		}
+
 	}
 	if len(skipped) > 0 {
 		logf(false, "not written back (changed locally during the job): %s", strings.Join(firstN(skipped, 8), ", "))

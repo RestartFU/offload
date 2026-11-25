@@ -231,6 +231,10 @@ func (s *Server) ensureImageLocked(j *job) bool {
 		s.touchImage(tag)
 		return true
 	}
+	if ok, _ := s.fitsLocked(api.Resources{Mem: s.cfg.buildMem}); !ok {
+		j.Reason = "waiting: memory for the environment build"
+		return false // builds take their memory from the same budget as jobs
+	}
 	b := &envBuild{tag: tag, waiters: map[string]*job{j.ID: j}, ctxRel: ctxRel}
 	if ctxRel != "" {
 		b.slot = j.slot
@@ -780,6 +784,9 @@ func (s *Server) sessionImageLocked(def *api.EnvDef) (string, bool, error) {
 	if imageExists(tag) && s.bootstrapped(tag) {
 		s.readyImages[tag] = true
 		return tag, true, nil
+	}
+	if ok, _ := s.fitsLocked(api.Resources{Mem: s.cfg.buildMem}); !ok {
+		return tag, false, nil // not yet: the client retries
 	}
 	b := &envBuild{tag: tag, waiters: map[string]*job{}}
 	s.builds[tag] = b

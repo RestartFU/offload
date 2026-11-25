@@ -124,8 +124,8 @@ func gitFiles(root string) ([]string, error) {
 		}
 		full := filepath.Join(root, filepath.FromSlash(f))
 		fi, err := os.Lstat(full)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue // deleted in the work tree but still in the index
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			continue // deleted in the work tree (or its directory became a file), still in the index
 		}
 		if err != nil { // can't tell: leaving it out would delete it on the runner
 			return nil, fmt.Errorf("%s: %w", f, err)
@@ -249,7 +249,7 @@ func hashFiles(root string, files []string) ([]api.FileEntry, error) {
 					continue // not really in the tree (behind a symlink): absent, like a deleted file
 				}
 				fi, err := tree.Lstat(p)
-				if errors.Is(err, fs.ErrNotExist) {
+				if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 					continue // deleted since it was listed
 				}
 				if err != nil { // can't tell what's there: a missing entry would delete it remotely

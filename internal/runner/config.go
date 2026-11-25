@@ -213,7 +213,7 @@ func (c *Config) finish() error {
 	if c.buildMem, err = units.ParseSize(c.Container.BuildMem); err != nil {
 		return err
 	}
-	if c.buildMem == 0 {
+	if c.buildMem == 0 || c.buildMem > c.memCap { // a build must fit the budget it is counted in
 		c.buildMem = min(8<<30, c.memCap)
 	}
 	if c.imageRetain, err = durationOr(c.Container.ImageRetain, 14*24*time.Hour); err != nil {
