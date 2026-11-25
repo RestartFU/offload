@@ -188,7 +188,6 @@ func parallelEnv(n int) map[string]string {
 		"NEXTEST_TEST_THREADS":       s,
 		"RUST_TEST_THREADS":          s,
 		"UV_CONCURRENT_BUILDS":       s,
-		"npm_config_jobs":            s,
 	}
 }
 

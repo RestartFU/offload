@@ -1,5 +1,7 @@
 # Use from an MCP client:  {"command": "offload", "args": ["mcp", "minecraft-bedrock"]}
 # First time (optional, avoids MCP startup timeouts):  offload mcp minecraft-bedrock --prepare
+# Needs an mcpelauncher-agent that approves the launcher's Google credentials prompt (it does since
+# bedrock-mc/mcpelauncher-agent "Approve the launcher's Google credentials prompt on Linux").
 description = "Minecraft Bedrock client (mcpelauncher fork) driven over MCP, headless"
 environment = "minecraft"           # ~/.config/offload/envs/minecraft/Containerfile
 command = ["minecraft-mcp"]

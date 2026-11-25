@@ -2,7 +2,7 @@
 # The fork and its KDE runtime install into a persistent volume on first use (see the session's
 # prepare step), so this image stays small and rebuilds never re-download them.
 FROM offload/base
-RUN apt-get update && apt-get install -y --no-install-recommends dbus dbus-x11 flatpak xauth xvfb && rm -rf /var/lib/apt/lists/* # offload:packages
+RUN apt-get update && apt-get install -y --no-install-recommends dbus dbus-x11 flatpak xauth xdotool xvfb && rm -rf /var/lib/apt/lists/* # offload:packages
 RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash >/dev/null
 RUN printf '%s\n' '#!/bin/sh' \
       "exec xvfb-run -a -s '-screen 0 1920x1080x24 -nolisten tcp' flatpak run --user --socket=x11 --nosocket=wayland --env=LIBGL_ALWAYS_SOFTWARE=1 --command=mcpelauncher-client io.mrarm.mcpelauncher \"\$@\"" \

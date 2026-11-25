@@ -104,6 +104,14 @@ socket. The client shim posts stdin lines with sequence numbers, which makes ret
 idempotent, and streams stdout from a byte offset, which makes reconnects lossless. A session
 with no attached client for `session_grace` is stopped.
 
+## Minecraft (examples/minecraft)
+
+The launcher fork's flatpak runs inside the container: `nested_sandbox` unmasks /proc, drops the
+seccomp filter and grants SYS_ADMIN and NET_ADMIN in the container's own namespaces, and the
+environment starts a system D-Bus for `flatpak run`. The updates mod's Google credentials
+consent window is approved by mcpelauncher-agent itself (its `src/consent.ts`, via xdotool), so
+the session needs no laptop-side help.
+
 ## Keeping the host alive
 
 - One physical core (the siblings of the highest-numbered CPU) is left out of `capacity.cpus`.
@@ -113,13 +121,8 @@ with no attached client for `session_grace` is stopped.
 
 ## Not built yet
 
-- Minecraft (examples/minecraft): the fork's flatpak runs inside the container
-  (`nested_sandbox`: unmask /proc, no seccomp filter, SYS_ADMIN and NET_ADMIN in the container's
-  own namespaces; a system D-Bus is started for `flatpak run`). The client starts. It currently
-  blocks in the updates mod's Google credentials helper (`mcpelauncher-ui-qt
-  --request-google-credentials`), which needs something the laptop has and the container
-  doesn't.
-- A client network mode (connections dialed by the attached client) and socket/port forwarding.
+- A client network mode (connections dialed by the attached client) and socket/port forwarding,
+  so a session can run "as if on the laptop" (egress IP, DNS, LAN, localhost services).
 - Sharing built images between runners (a tailnet registry) once there is a second runner.
 - devcontainer "features".
 - Kubernetes backend: a runner deployed in-cluster that creates Pods and Jobs with its own
