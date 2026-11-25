@@ -4,11 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sync"
 
 	"github.com/RestartFU/offload/internal/api"
@@ -20,37 +18,9 @@ import (
 
 var dataLocks sync.Map // name -> *sync.Mutex
 
-// Clients name their data sets "<client id>.<name>", so two laptops' [data.assets] never mix.
-var clientDataName = regexp.MustCompile(`^[0-9a-f]{16}\.(.+)$`)
-
-var adoptMu sync.Mutex
-
-// adoptLegacyData moves a data set synced before names carried the client id ("<name>") to the
-// first client that asks for it ("<id>.<name>"), so it isn't synced again from scratch.
-func (s *Server) adoptLegacyData(name string) {
-	m := clientDataName.FindStringSubmatch(name)
-	if m == nil || !validKey(m[1]) {
-		return
-	}
-	adoptMu.Lock()
-	defer adoptMu.Unlock()
-	base := filepath.Join(s.cfg.StateDir, "data")
-	if _, err := os.Lstat(filepath.Join(base, name)); err == nil {
-		return
-	}
-	old := filepath.Join(base, m[1])
-	if fi, err := os.Lstat(old); err != nil || !fi.IsDir() {
-		return
-	}
-	if err := os.Rename(old, filepath.Join(base, name)); err != nil {
-		return
-	}
-	_ = os.Rename(old+".json", filepath.Join(base, name)+".json")
-	log.Printf("data set %s now belongs to client data set %s", m[1], name)
-}
-
+// dataSlot is a data set's slot. Clients name data sets "<client id>.<name>", so two laptops'
+// sets of the same name never mix.
 func (s *Server) dataSlot(name string) *slot {
-	s.adoptLegacyData(name)
 	dir := filepath.Join(s.cfg.StateDir, "data", name)
 	_ = os.MkdirAll(dir, 0o755)
 	return &slot{Key: name, Dir: dir}

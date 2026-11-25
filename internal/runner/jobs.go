@@ -159,6 +159,10 @@ func (s *Server) restore() {
 				j.save()
 			}
 		case api.StateRunning:
+			if j.StopRequested { // cancelled before the restart: keep stopping it
+				j.cancel = true
+				stopUnit(j.Unit)
+			}
 			if len(j.Spec.Relay) > 0 || j.Spec.Network == "client" {
 				// Its relay sockets are (re)created in its workload dir, still mounted in its
 				// container, by ensureRelays, which keeps retrying until they bind.
@@ -991,7 +995,11 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 			s.finishLocked(j, api.StateCancelled, nil, "cancelled")
 		}
 	case api.StateRunning:
-		j.cancel = true
+		j.cancel, j.StopRequested = true, true
+		if err := j.save(); err != nil { // recorded first: a restart must not forget the cancel
+			out.err(500, "can't record the cancel: "+err.Error())
+			return
+		}
 		stopUnit(j.Unit)
 	}
 	out.json(j.view())

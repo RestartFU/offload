@@ -9,7 +9,7 @@ const DefaultPort = 7420
 // Proto versions the runner protocol and how workloads are wired (mounts, relay sockets, the
 // stdin wrapper). A client only uses runners of its own version (`offload host upgrade` brings
 // them in line), and a runner stops workloads started by another version when it starts.
-const Proto = 5
+const Proto = 6
 
 // ProtoHeader carries the client's protocol version on every request; runners refuse other
 // versions (except for status, pairing and upgrades, which is how versions get back in step).
@@ -125,6 +125,8 @@ type Job struct {
 	ContextDigest string `json:"context_digest,omitempty"`
 	// Proto is the runner protocol version that started the job (mounts, relays, wrappers).
 	Proto int `json:"proto,omitempty"`
+	// StopRequested records a cancel before it is acknowledged, so a runner restart re-sends it.
+	StopRequested bool `json:"stop_requested,omitempty"`
 	// MemFrom says where the memory limit came from: "requested", "learned", "profile", "default".
 	MemFrom string `json:"mem_from,omitempty"`
 	// Needed lists the manifest paths the client must upload. Only set in the create response.
@@ -207,22 +209,23 @@ type DataPlan struct {
 
 // Session is a long-lived process (usually an MCP server) whose stdio is bridged over HTTP.
 type Session struct {
-	ID         string     `json:"id"`
-	Runner     string     `json:"runner"`
-	Profile    string     `json:"profile"`
-	State      string     `json:"state"`
-	Resources  Resources  `json:"resources"`
-	Unit       string     `json:"unit,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	LastSeen   time.Time  `json:"last_seen"`
-	Attached   int        `json:"attached"`
-	Runtime    string     `json:"runtime,omitempty"`
-	Image      string     `json:"image,omitempty"`
-	Network    string     `json:"network,omitempty"` // "client": the attached client must serve dial callbacks
-	Proto      int        `json:"proto,omitempty"`   // runner protocol version that started it
-	FinishedAt *time.Time `json:"finished_at,omitempty"`
-	ExitCode   *int       `json:"exit_code,omitempty"`
-	Reason     string     `json:"reason,omitempty"`
+	ID            string     `json:"id"`
+	Runner        string     `json:"runner"`
+	Profile       string     `json:"profile"`
+	State         string     `json:"state"`
+	Resources     Resources  `json:"resources"`
+	Unit          string     `json:"unit,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	LastSeen      time.Time  `json:"last_seen"`
+	Attached      int        `json:"attached"`
+	Runtime       string     `json:"runtime,omitempty"`
+	Image         string     `json:"image,omitempty"`
+	Network       string     `json:"network,omitempty"`        // "client": the attached client must serve dial callbacks
+	Proto         int        `json:"proto,omitempty"`          // runner protocol version that started it
+	StopRequested bool       `json:"stop_requested,omitempty"` // stop asked for; re-sent after a restart
+	FinishedAt    *time.Time `json:"finished_at,omitempty"`
+	ExitCode      *int       `json:"exit_code,omitempty"`
+	Reason        string     `json:"reason,omitempty"`
 }
 
 // ProfileInfo summarizes a runner profile in /v1/status.

@@ -3,6 +3,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -320,6 +321,18 @@ func (s *Server) tokenHashPaired(hash string) bool {
 func (s *Server) handleResetPairing(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Value(unixMarker{}) == nil {
 		writeErr(w, http.StatusForbidden, "local socket only: run `offload runner reset-pairing` on the runner")
+		return
+	}
+	var req struct {
+		Tokens string `json:"tokens"` // the tokens file the caller means: never reset another runner's
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Tokens == "" {
+		writeErr(w, 400, "want {\"tokens\": \"<tokens file>\"}")
+		return
+	}
+	mine, _ := filepath.Abs(s.tokensPath())
+	if req.Tokens != mine {
+		writeErr(w, http.StatusPreconditionFailed, "this runner uses "+mine+", not "+req.Tokens+": nothing was reset")
 		return
 	}
 	s.mu.Lock()
@@ -939,22 +952,31 @@ func ResetPairingLocal(tokensFile string) (string, error) {
 	if abs, err := filepath.Abs(tokensFile); err == nil {
 		tokensFile = abs
 	}
-	c := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", unixSocketPath())
-		}}}
-	resp, err := c.Post("http://local/v1/admin/reset-pairing", "application/json", nil)
+	// Only a runner confirmed not running (nothing listening on its socket) is reset directly;
+	// any other failure leaves everything as it was.
+	conn, err := net.DialTimeout("unix", unixSocketPath(), 2*time.Second)
 	if err != nil {
-		return ResetPairing(tokensFile) // not running: nothing can be in flight
+		return ResetPairing(tokensFile)
+	}
+	c := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			if conn != nil {
+				cc := conn
+				conn = nil
+				return cc, nil
+			}
+			var d net.Dialer
+			return d.Dial("unix", unixSocketPath())
+		}}}
+	body, _ := json.Marshal(map[string]string{"tokens": tokensFile})
+	resp, err := c.Post("http://local/v1/admin/reset-pairing", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("the runner is running but didn't answer the reset (nothing changed?): %w", err)
 	}
 	defer resp.Body.Close()
-	var out struct{ Code, Tokens, Error string }
+	var out struct{ Code, Error string }
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || resp.StatusCode != 200 {
 		return "", fmt.Errorf("runner refused the reset: %s %s", resp.Status, out.Error)
-	}
-	if abs, err := filepath.Abs(out.Tokens); err == nil && abs != tokensFile {
-		return "", fmt.Errorf("the running runner uses %s, not %s: reset the right one (--config)", out.Tokens, tokensFile)
 	}
 	return out.Code, nil
 }

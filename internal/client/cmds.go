@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -263,6 +264,41 @@ func Pair(names []string, all bool, code string) error {
 			fmt.Printf("%s: its token is set in client.toml, nothing to pair\n", h.Name)
 			continue
 		}
+		unlock, err := lockFile(runnerTokenPath(h.URL) + ".lock") // one pairing per runner at a time
+		if err != nil {
+			return err
+		}
+		err = pairOne(ctx, h, code)
+		unlock()
+		if err != nil {
+			return fmt.Errorf("%s: %w", h.Name, err)
+		}
+	}
+	return nil
+}
+
+// pairOne pairs with one runner; the caller holds its lock.
+func pairOne(ctx context.Context, h *Host, code string) error {
+	pending := runnerTokenPath(h.URL) + ".pending"
+	// A pending token is left by an attempt whose answer never arrived: the runner may have
+	// switched to it. Find out before minting another.
+	if b, err := os.ReadFile(pending); err == nil {
+		probe := *h
+		probe.Token = strings.TrimSpace(string(b))
+		var ae *APIError
+		switch err := probe.do(ctx, "GET", "/v1/sessions", nil, nil); {
+		case err == nil:
+			if err := os.Rename(pending, runnerTokenPath(h.URL)); err != nil {
+				return err
+			}
+			h.Token = probe.Token
+		case errors.As(err, &ae) && ae.Code == 403:
+			_ = os.Remove(pending) // never accepted
+		default:
+			return fmt.Errorf("can't tell whether the last pairing took effect (%v); try again", err)
+		}
+	}
+	{
 		// Every pairing mints a fresh token, so re-pairing after a reset never revives an old one.
 		// The request authenticates with what we have (the stored token, or an older client's
 		// derived one); the runner then retires that.
@@ -278,7 +314,6 @@ func Pair(names []string, all bool, code string) error {
 		body := map[string]any{"hash": hex.EncodeToString(sum[:]), "code": code, "rotate": true}
 		// Saved before asking, so a runner that accepted it (and retired the old one) never
 		// leaves us without a usable token.
-		pending := runnerTokenPath(h.URL) + ".pending"
 		if err := os.MkdirAll(filepath.Dir(pending), 0o700); err != nil {
 			return err
 		}
@@ -287,13 +322,32 @@ func Pair(names []string, all bool, code string) error {
 		}
 		var out map[string]string
 		if err := auth.do(ctx, "POST", "/v1/admin/pair", body, &out); err != nil {
-			os.Remove(pending)
-			return fmt.Errorf("%s: %w", h.Name, err)
+			var ae *APIError
+			if errors.As(err, &ae) { // the runner answered: it did not take the new token
+				os.Remove(pending)
+			} // otherwise keep it: the next `host pair` checks whether it was taken
+			return err
 		}
 		if err := os.Rename(pending, runnerTokenPath(h.URL)); err != nil {
-			return fmt.Errorf("%s: paired; the new token is in %s (rename failed: %v)", h.Name, pending, err)
+			return fmt.Errorf("paired; the new token is in %s (rename failed: %v)", pending, err)
 		}
 		fmt.Printf("%s: %s\n", h.Name, out["status"])
 	}
 	return nil
+}
+
+// lockFile takes an exclusive lock on path (created if needed) and returns its release.
+func lockFile(path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }

@@ -60,6 +60,9 @@ func (s *Server) restoreSessions() {
 		se.Attached = 0 // no client connection survives a runner restart
 		if !api.Terminal(se.State) {
 			se.LastSeen = time.Now()
+			if se.StopRequested {
+				stopUnit(se.Unit)
+			}
 			if se.Network == "client" {
 				se.relay = newRelay() // sockets: ensureRelays
 			}
@@ -535,7 +538,11 @@ func (s *Server) handleStopSession(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !api.Terminal(se.State) {
-		se.Reason = "stopped by client"
+		se.Reason, se.StopRequested = "stopped by client", true
+		if err := se.save(); err != nil {
+			out.err(500, "can't record the stop: "+err.Error())
+			return
+		}
 		stopUnit(se.Unit)
 	}
 	out.json(se.Session)
@@ -575,6 +582,8 @@ func (s *Server) checkSessions() {
 		case se.Attached == 0 && time.Since(se.LastSeen) > s.cfg.sessionGrace:
 			if se.Reason == "" {
 				se.Reason = "idle: no client for " + s.cfg.sessionGrace.String()
+				se.StopRequested = true
+				_ = se.save()
 				log.Printf("session %s: %s", se.ID, se.Reason)
 				stopUnit(se.Unit)
 			}

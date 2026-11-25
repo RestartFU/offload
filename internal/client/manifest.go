@@ -95,29 +95,47 @@ func gitFiles(root string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("git ls-files: %w", err)
 	}
+	// Submodules are the index's gitlinks (mode 160000). A directory that merely replaced a
+	// tracked file still shows that file's index entry, but its contents are listed on their own.
+	gitlinks := map[string]bool{}
+	if staged, err := git(root, "ls-files", "-z", "--stage"); err == nil {
+		for _, rec := range strings.Split(staged, "\x00") {
+			if meta, path, ok := strings.Cut(rec, "\t"); ok && strings.HasPrefix(meta, "160000 ") {
+				gitlinks[path] = true
+			}
+		}
+	}
 	seen := map[string]bool{}
 	var files []string
+	add := func(f string) {
+		if !seen[f] {
+			seen[f] = true
+			files = append(files, f)
+		}
+	}
 	for _, f := range strings.Split(out, "\x00") {
-		if f == "" || seen[f] {
+		if f == "" {
 			continue
 		}
-		seen[f] = true
 		full := filepath.Join(root, filepath.FromSlash(f))
 		fi, err := os.Lstat(full)
 		if err != nil {
 			continue // deleted in the work tree but still in the index
 		}
-		if fi.IsDir() { // a submodule
+		if fi.IsDir() {
+			if !gitlinks[f] {
+				continue
+			}
 			sub, err := gitFiles(full)
 			if err != nil {
 				return nil, err
 			}
 			for _, s := range sub {
-				files = append(files, f+"/"+s)
+				add(f + "/" + s)
 			}
 			continue
 		}
-		files = append(files, f)
+		add(f)
 	}
 	return files, nil
 }

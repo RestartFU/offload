@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -179,5 +180,29 @@ func TestDataRootSymlinkIsFollowed(t *testing.T) {
 	}
 	if _, _, err := dataFiles(DataSetConfig{Path: filepath.Join(dir, "missing")}); err == nil {
 		t.Fatal("missing root accepted")
+	}
+}
+
+func TestGitFilesTrackedFileBecameDirectory(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	os.WriteFile(filepath.Join(dir, "a"), []byte("file"), 0o644)
+	run("add", "a")
+	run("commit", "-qm", "a")
+	os.Remove(filepath.Join(dir, "a"))
+	os.MkdirAll(filepath.Join(dir, "a"), 0o755)
+	os.WriteFile(filepath.Join(dir, "a", "b"), []byte("now a dir"), 0o644)
+	files, err := gitFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0] != "a/b" {
+		t.Fatalf("files = %v, want [a/b]", files)
 	}
 }

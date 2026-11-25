@@ -164,6 +164,9 @@ func MCP(o MCPOptions) error {
 	case <-ctx.Done():
 		return nil
 	case err := <-done:
+		if err == nil && o.Prepare {
+			return prepareResult(ctx, h, se.ID)
+		}
 		return err
 	case err := <-inDone:
 		if err != nil {
@@ -187,6 +190,22 @@ func MCP(o MCPOptions) error {
 		}
 		return nil
 	}
+}
+
+// prepareResult turns a finished prepare session's exit into the command's result: anything but
+// a recorded exit 0 is a failure.
+func prepareResult(ctx context.Context, h *Host, id string) error {
+	var se api.Session
+	if err := h.do(ctx, "GET", "/v1/sessions/"+id, nil, &se); err != nil {
+		return fmt.Errorf("prepare: can't read its result: %w", err)
+	}
+	if se.ExitCode == nil {
+		return fmt.Errorf("prepare ended without an exit status (%s)", se.Reason)
+	}
+	if *se.ExitCode != 0 {
+		return fmt.Errorf("prepare failed: exit %d", *se.ExitCode)
+	}
+	return nil
 }
 
 // activityWriter remembers when output last arrived.

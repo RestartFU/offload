@@ -142,6 +142,13 @@ func Run(o RunOptions) (int, error) {
 		}
 	}
 
+	pendingBaseline := ""
+	if o.Detach && ws != nil && spec.WriteBack {
+		if pendingBaseline, err = saveBaseline(ws); err != nil {
+			return 1, fmt.Errorf("can't save the write-back baseline for a detached job (use --no-write-back to skip): %w", err)
+		}
+		defer os.Remove(pendingBaseline) // a no-op once renamed to the job's
+	}
 	for attempt := 0; ; attempt++ {
 		h, j, err := submit(ctx, cfg, o, spec, ws)
 		if err != nil {
@@ -152,8 +159,11 @@ func Run(o RunOptions) (int, error) {
 		}
 		ref := h.Name + ":" + j.ID
 		if o.Detach {
-			if ws != nil {
-				saveBaseline(j.ID, ws) // `offload attach` applies the job's write-back later
+			if pendingBaseline != "" {
+				if err := os.Rename(pendingBaseline, baselinePath(j.ID)); err != nil {
+					cancelJob(h, j.ID)
+					return 1, fmt.Errorf("can't keep the job's write-back baseline (cancelled it): %w", err)
+				}
 			}
 			fmt.Println(ref)
 			return 0, nil
@@ -429,9 +439,13 @@ type baseline struct {
 
 func baselinePath(id string) string { return filepath.Join(stateDir(), "writeback", id+".json") }
 
-func saveBaseline(id string, ws *Workspace) {
-	dir := filepath.Dir(baselinePath(id))
-	_ = os.MkdirAll(dir, 0o700)
+// saveBaseline writes the baseline to a pending file before the job is submitted (renamed to
+// the job's once it has an ID), so a detached job never starts without one.
+func saveBaseline(ws *Workspace) (string, error) {
+	dir := filepath.Dir(baselinePath("x"))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
 	if old, err := os.ReadDir(dir); err == nil { // a week is longer than runners keep jobs
 		for _, e := range old {
 			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > 7*24*time.Hour {
@@ -439,9 +453,23 @@ func saveBaseline(id string, ws *Workspace) {
 			}
 		}
 	}
-	if b, err := json.Marshal(baseline{Root: ws.Root, Manifest: ws.Manifest}); err == nil {
-		_ = os.WriteFile(baselinePath(id), b, 0o600)
+	b, err := json.Marshal(baseline{Root: ws.Root, Manifest: ws.Manifest})
+	if err != nil {
+		return "", err
 	}
+	f, err := os.CreateTemp(dir, ".pending-*")
+	if err != nil {
+		return "", err
+	}
+	_, err = f.Write(b)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // applyDetachedWriteBack applies a finished detached job's write-back, once.
@@ -450,8 +478,11 @@ func applyDetachedWriteBack(ctx context.Context, h *Host, j *api.Job) error {
 		return nil
 	}
 	b, err := os.ReadFile(baselinePath(j.ID))
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		return nil // not started from this machine with -d, or already applied
+	}
+	if err != nil {
+		return fmt.Errorf("reading the write-back baseline: %w", err)
 	}
 	var bl baseline
 	if err := json.Unmarshal(b, &bl); err != nil {
@@ -516,11 +547,14 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, sent 
 		return err
 	}
 	defer tree.Close()
-	if err := mkdirReal(tree, path.Join(incomingDir, stageSub)); err != nil {
+	// A staging directory of this write-back's own (another job finishing in the same checkout
+	// has its own), removed when done; .offload-incoming itself goes once it is empty.
+	stage := path.Join(incomingDir, ".stage-"+j.ID)
+	if err := mkdirReal(tree, stage); err != nil {
 		return err
 	}
-	defer func() { // leave nothing behind unless a conflict was saved there
-		_ = tree.Remove(path.Join(incomingDir, stageSub))
+	defer func() {
+		_ = tree.RemoveAll(stage)
 		_ = tree.Remove(incomingDir)
 	}()
 	tr := tar.NewReader(gz)
@@ -542,7 +576,7 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, sent 
 		}
 		// Stage in a directory of our own first, so whatever happens to the destination's
 		// directory meanwhile, the verified incoming copy is never lost.
-		tmp, err := stageIncoming(tree, tr, os.FileMode(c.Mode).Perm(), c.Hash)
+		tmp, err := stageIncoming(tree, stage, tr, os.FileMode(c.Mode).Perm(), c.Hash)
 		if err != nil {
 			return fmt.Errorf("%s: %w", c.Path, err)
 		}
@@ -676,17 +710,14 @@ func writeIn(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHash 
 	return writeInIf(root, rel, r, mode, wantHash, nil)
 }
 
-const (
-	incomingDir = ".offload-incoming"
-	stageSub    = ".stage"
-)
+const incomingDir = ".offload-incoming"
 
-// stageIncoming writes r into a new file under .offload-incoming/.stage, verifying its hash and
-// setting its mode, and returns its path.
-func stageIncoming(root *os.Root, r io.Reader, mode os.FileMode, wantHash string) (string, error) {
+// stageIncoming writes r into a new file in the stage directory, verifying its hash and setting
+// its mode, and returns its path.
+func stageIncoming(root *os.Root, stage string, r io.Reader, mode os.FileMode, wantHash string) (string, error) {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
-	tmp := path.Join(incomingDir, stageSub, hex.EncodeToString(b))
+	tmp := path.Join(stage, hex.EncodeToString(b))
 	f, err := root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", err
