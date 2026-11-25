@@ -37,6 +37,7 @@ type Server struct {
 	slots    map[string][]*slot
 	cpuUse   map[int]int
 	features map[string]bool
+	history  map[string]*histEntry
 	wake     chan struct{}
 
 	whoisMu sync.Mutex
@@ -67,6 +68,7 @@ func New(cfg *Config, version string) (*Server, error) {
 			return nil, err
 		}
 	}
+	s.loadHistory()
 	s.restore()
 	return s, nil
 }
@@ -86,9 +88,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/jobs", s.handleCreateJob)
 	mux.HandleFunc("GET /v1/jobs/{id}", s.handleGetJob)
 	mux.HandleFunc("PUT /v1/jobs/{id}/source", s.handleUpload)
+	mux.HandleFunc("PUT /v1/jobs/{id}/git", s.handleGitBundle)
 	mux.HandleFunc("GET /v1/jobs/{id}/logs", s.handleJobLogs)
 	mux.HandleFunc("GET /v1/jobs/{id}/artifacts", s.handleArtifacts)
+	mux.HandleFunc("GET /v1/jobs/{id}/writeback", s.handleWriteBack)
 	mux.HandleFunc("DELETE /v1/jobs/{id}", s.handleCancelJob)
+	mux.HandleFunc("GET /v1/jobs/{id}/callbacks", s.handleCallbacks)
+	mux.HandleFunc("POST /v1/jobs/{id}/callbacks/{cid}", s.handleCallbackReply)
+	mux.HandleFunc("POST /v1/jobs/{id}/credential", s.handleCredential)
 	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /v1/sessions", s.handleCreateSession)
 	mux.HandleFunc("GET /v1/sessions/{id}", s.handleGetSession)
@@ -333,7 +340,7 @@ func (s *Server) status() api.Status {
 	}
 	sort.Strings(st.WarmKeys)
 	for name, p := range s.cfg.loadProfiles() {
-		st.Profiles[name] = api.ProfileInfo{Kind: p.Kind, Description: p.Description, Resources: p.resources()}
+		st.Profiles[name] = api.ProfileInfo{Kind: p.Kind, Match: p.Match, Description: p.Description, Resources: p.resources()}
 	}
 	for f, on := range s.features {
 		if on {

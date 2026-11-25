@@ -20,22 +20,28 @@ import (
 
 type job struct {
 	api.Job
-	dir      string
-	slot     *slot
-	cpus     []int
-	cancel   bool
-	syncing  bool // an upload is being applied to the slot
-	queuedAt time.Time
-	inactive int // consecutive checks the unit was gone without an exit record
+	dir     string
+	slot    *slot
+	cpus    []int
+	cancel  bool
+	syncing bool // an upload is being applied to the slot
+
+	relay       *relay            // credential relay, when Spec.Relay is set
+	secrets     map[string]string // in memory until the job starts, then only in tmpfs
+	secretFiles map[string][]byte
+	queuedAt    time.Time
+	inactive    int // consecutive checks the unit was gone without an exit record
 }
 
 // exitRecord is written by the unit wrapper when the command ends.
 type exitRecord struct {
-	Code     int    `json:"code"`
-	Signal   string `json:"signal,omitempty"`
-	OOM      bool   `json:"oom,omitempty"`
-	Error    string `json:"error,omitempty"`
-	Artifact bool   `json:"artifacts,omitempty"`
+	Code      int            `json:"code"`
+	Signal    string         `json:"signal,omitempty"`
+	OOM       bool           `json:"oom,omitempty"`
+	Error     string         `json:"error,omitempty"`
+	PeakMem   int64          `json:"peak_mem,omitempty"`
+	Artifact  bool           `json:"artifacts,omitempty"`
+	WriteBack *api.WriteBack `json:"write_back,omitempty"`
 }
 
 func (j *job) save() {
@@ -81,7 +87,16 @@ func (s *Server) restore() {
 			j.save()
 		case api.StateQueued:
 			j.queuedAt = j.CreatedAt
+			if len(j.Spec.SecretNames) > 0 { // secrets were only in memory
+				j.State, j.Reason = api.StateFailed, "runner restarted before the job started; its secrets were dropped"
+				now := time.Now()
+				j.FinishedAt = &now
+				j.save()
+			}
 		case api.StateRunning:
+			if len(j.Spec.Relay) > 0 {
+				j.relay = newRelay() // the SSH agent socket is gone, but git relaying resumes
+			}
 			if j.AllowedCPUs != "" {
 				j.cpus, _ = units.ParseCPUList(j.AllowedCPUs)
 				for _, c := range j.cpus {
@@ -162,6 +177,8 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "unknown profile "+spec.Profile)
 			return
 		}
+	} else if prof = matchProfile(profiles, spec.Argv); prof != nil {
+		spec.Profile = prof.Name
 	}
 	if spec.Client == "" {
 		spec.Client = r.Header.Get("X-Offload-Caller")
@@ -171,6 +188,34 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		Resources: s.cfg.effective(spec.Resources, prof), CreatedAt: time.Now(),
 	}}
 	j.dir = s.jobDir(j.ID)
+	// Secrets stay in memory; the record on disk only names them.
+	j.secrets, j.secretFiles = spec.Secrets, spec.SecretFiles
+	j.Spec.Secrets, j.Spec.SecretFiles = nil, nil
+	for k := range j.secrets {
+		j.Spec.SecretNames = append(j.Spec.SecretNames, k)
+	}
+	for k := range j.secretFiles {
+		j.Spec.SecretNames = append(j.Spec.SecretNames, k)
+	}
+	sort.Strings(j.Spec.SecretNames)
+	if len(spec.Relay) > 0 {
+		j.relay = newRelay()
+		if !spec.Detached {
+			j.relay.lastPoll = time.Now() // the client starts polling right after creating the job
+		}
+	}
+	j.MemFrom = "requested"
+	if spec.Resources.Mem == 0 {
+		j.AutoMem, j.MemFrom = true, "default"
+		if prof != nil && prof.Resources.Mem != "" {
+			j.MemFrom = "profile " + prof.Name
+		}
+		s.mu.Lock()
+		if m := s.suggestMemLocked(spec); m > 0 {
+			j.Resources.Mem, j.MemFrom = m, "learned"
+		}
+		s.mu.Unlock()
+	}
 	if j.Resources.Mem > s.cfg.memCap {
 		writeErr(w, 400, fmt.Sprintf("job asks for %s memory; this runner hands out at most %s", units.FormatSize(j.Resources.Mem), units.FormatSize(s.cfg.memCap)))
 		return
@@ -179,9 +224,11 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if err := os.WriteFile(filepath.Join(j.dir, "output.log"), nil, 0o600); err != nil {
-		writeErr(w, 500, err.Error())
-		return
+	for _, f := range []string{"output.log", "stderr.log"} {
+		if err := os.WriteFile(filepath.Join(j.dir, f), nil, 0o600); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 	}
 
 	s.mu.Lock()
@@ -219,12 +266,71 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		}
 		j.slot, j.Slot = sl, sl.id()
 		j.Needed, j.SyncFiles = needed, len(spec.Manifest)
+		if spec.Git != nil {
+			if !validGitRef(spec.Git) {
+				sl.inUse = ""
+				_ = os.RemoveAll(j.dir)
+				writeErr(w, 400, "invalid git ref")
+				return
+			}
+			var err error
+			if j.GitNeeded, j.GitHave, err = s.gitPlan(spec.WorkspaceKey, spec.Git.Head); err != nil {
+				j.Spec.Git = nil // git unavailable here; run without it
+				s.note(j, "git metadata unavailable on this runner: "+err.Error())
+			}
+		}
 	}
 	s.jobs[j.ID] = j
 	j.save()
 	writeJSON(w, j.Job)
-	j.Needed = nil
+	j.Needed, j.GitHave = nil, nil
 	s.kick()
+}
+
+// note appends an offload message to the job's stderr, so the caller sees it in order.
+func (s *Server) note(j *job, msg string) {
+	f, err := os.OpenFile(filepath.Join(j.dir, "stderr.log"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(f, "offload: %s\n", msg)
+	f.Close()
+}
+
+// handleGitBundle receives the commits a job's workspace is missing.
+func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	j := s.jobs[r.PathValue("id")]
+	ok := j != nil && j.State == api.StateUploading && j.Spec.Git != nil && !j.syncing
+	if ok {
+		j.syncing = true
+	}
+	s.mu.Unlock()
+	if !ok {
+		writeErr(w, 409, "job is not waiting for git history")
+		return
+	}
+	defer func() { s.mu.Lock(); j.syncing = false; s.mu.Unlock() }()
+	tmp, err := os.CreateTemp(j.dir, "bundle-*")
+	if err == nil {
+		_, err = tmp.ReadFrom(http.MaxBytesReader(w, r.Body, 16<<30))
+		if cerr := tmp.Close(); err == nil {
+			err = cerr
+		}
+		defer os.Remove(tmp.Name())
+	}
+	if err == nil {
+		err = s.gitReceive(j.Spec.WorkspaceKey, j.Spec.Git.Head, tmp.Name())
+	}
+	if err != nil {
+		s.note(j, "git history upload failed; running without .git: "+err.Error())
+		s.mu.Lock()
+		j.Spec.Git = nil
+		s.mu.Unlock()
+		writeErr(w, 400, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -247,6 +353,17 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	needed, err := sl.plan(manifest)
 	if err == nil {
 		err = sl.apply(manifest, needed, http.MaxBytesReader(w, r.Body, 8<<30))
+	}
+	s.mu.Lock()
+	g := j.Spec.Git
+	s.mu.Unlock()
+	if err == nil && g != nil {
+		if gerr := s.gitCheckout(sl, g); gerr != nil {
+			s.note(j, "running without .git: "+gerr.Error())
+		}
+	} else if err == nil {
+		// No git for this job: don't leave a stale .git describing some other commit.
+		_ = os.RemoveAll(filepath.Join(sl.Dir, ".git"))
 	}
 
 	s.mu.Lock()
@@ -353,6 +470,12 @@ func (s *Server) startJobLocked(j *job) error {
 		j.AllowedCPUs = units.FormatCPUList(j.cpus)
 	}
 	argv := append([]string{s.self, "runner", "exec", "--job-dir", j.dir}, artifactArgs(j.Spec.Artifacts)...)
+	if dir := s.setupCredentials(j, env); dir != "" {
+		argv = append(argv, "--secrets", dir)
+	}
+	if j.slot != nil && j.Spec.WriteBack {
+		argv = append(argv, "--write-back", j.slot.Dir, "--record", j.slot.recordPath())
+	}
 	argv = append(argv, "--")
 	argv = append(argv, j.Spec.Argv...)
 	u := unitSpec{
@@ -360,12 +483,14 @@ func (s *Server) startJobLocked(j *job) error {
 		CPUWeight: cpuWeight(j.Resources.CPU), CPUQuotaPct: int(math.Ceil(j.Resources.CPUMax * 100)),
 		AllowedCPUs: j.AllowedCPUs, MemoryMax: j.Resources.Mem, OOMScoreAdj: s.cfg.Policy.OOMScoreAdj,
 		Stdout: filepath.Join(j.dir, "output.log"),
+		Stderr: filepath.Join(j.dir, "stderr.log"),
 	}
 	if s.features["io"] {
 		u.IOWeight = s.cfg.Policy.IOWeight
 	}
 	if err := startUnit(contextBG(), u); err != nil {
 		s.releaseCPUsLocked(j.cpus)
+		s.cleanupCredentials(j)
 		j.cpus, j.AllowedCPUs, j.Unit = nil, "", ""
 		return err
 	}
@@ -407,7 +532,8 @@ func (s *Server) checkRunning() {
 				state, reason = api.StateCancelled, "cancelled"
 			}
 			code := rec.Code
-			j.Signal, j.HasArtifact = rec.Signal, rec.Artifact
+			j.Signal, j.HasArtifact, j.WriteBack, j.PeakMem = rec.Signal, rec.Artifact, rec.WriteBack, rec.PeakMem
+			s.learn(j, rec)
 			s.finishLocked(j, state, &code, reason)
 		case active:
 			j.inactive = 0
@@ -441,6 +567,7 @@ func readExit(path string) (*exitRecord, error) {
 func (s *Server) finishLocked(j *job, state string, code *int, reason string) {
 	now := time.Now()
 	j.State, j.ExitCode, j.Reason, j.FinishedAt = state, code, reason, &now
+	s.cleanupCredentials(j)
 	s.releaseCPUsLocked(j.cpus)
 	j.cpus = nil
 	if j.slot != nil {
@@ -538,7 +665,28 @@ func (s *Server) handleJobLogs(w http.ResponseWriter, r *http.Request) {
 		defer s.mu.Unlock()
 		return api.Terminal(j.State)
 	}
-	streamFile(w, r, filepath.Join(j.dir, "output.log"), offset, follow, done)
+	file := "output.log"
+	if r.URL.Query().Get("stream") == "stderr" {
+		file = "stderr.log"
+	}
+	streamFile(w, r, filepath.Join(j.dir, file), offset, follow, done)
+}
+
+func (s *Server) handleWriteBack(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	j := s.jobs[r.PathValue("id")]
+	s.mu.Unlock()
+	if j == nil {
+		writeErr(w, 404, "no such job")
+		return
+	}
+	p := filepath.Join(j.dir, "writeback.tar.gz")
+	if _, err := os.Stat(p); err != nil {
+		writeErr(w, 404, "no write-back")
+		return
+	}
+	w.Header().Set("Content-Type", "application/gzip")
+	http.ServeFile(w, r, p)
 }
 
 // streamFile copies path from offset to the response, polling for growth while follow is set

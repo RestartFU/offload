@@ -22,9 +22,10 @@ import (
 
 // InstallOptions configures `offload runner install` (the unprivileged half).
 type InstallOptions struct {
-	Name  string
-	Force bool // overwrite an existing runner.toml
-	Out   io.Writer
+	Name     string
+	Force    bool // overwrite an existing runner.toml
+	Profiles bool // overwrite the built-in profiles with this version's
+	Out      io.Writer
 }
 
 // reservedCPUs picks the hyperthread siblings of the highest-numbered CPU: one whole core left
@@ -184,7 +185,7 @@ func Install(o InstallOptions) error {
 	entries, _ := fs.ReadDir(profiles.Defaults, ".")
 	for _, e := range entries {
 		dst := filepath.Join(cfg.ProfilesDir, e.Name())
-		if _, err := os.Stat(dst); err == nil {
+		if _, err := os.Stat(dst); err == nil && !o.Profiles {
 			continue
 		}
 		b, _ := fs.ReadFile(profiles.Defaults, e.Name())

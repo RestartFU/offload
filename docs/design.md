@@ -32,6 +32,35 @@ Build output is ignored by git, so it never moves and stays warm. Files a previo
 are detected through size and mtime and sent again. There are up to `max_slots_per_key`
 concurrent slots per repository.
 
+## Routing
+
+The agent only writes `offload run -- <cmd>`. The client keeps a runner cache (15 minutes) and
+probes known runners directly; a full tailnet scan happens only when the cache is stale or none
+answer. A runner whose workspace slots are busy is skipped for the next one. The runner matches
+a profile from the command (`match` globs, looking through `sh -c`) and sizes memory from history.
+For each (workspace, "program subcommand") it keeps the last five peaks (`memory.peak`) and asks
+for the largest plus 25%. An OOM counts as twice its limit, and the client retries such a job
+once with double memory. A nested `offload run` (OFFLOAD_JOB is set) runs in place.
+
+## Git
+
+Each workspace key has a bare `shared.git` object store. Slots are ordinary repositories
+borrowing its objects through `objects/info/alternates`. The runner advertises up to 64 commits
+it holds, and the client sends `git bundle create HEAD ^have…`. The slot gets HEAD/branch and
+an index at HEAD (`read-tree`), so the synced working tree shows your uncommitted changes.
+
+## Credentials
+
+- Relays: per job, an SSH agent socket (framed request/response) and a git credential helper
+  (`offload runner credential`, local socket only) queue requests that the attached client
+  long-polls and answers with its own ssh-agent and `git credential fill`. With no client
+  attached, requests fail immediately.
+- Secrets: credential sets are resolved on the client (`cmd:`, `env:`, `file:`) and sent with
+  the job. The runner keeps them in memory, writes them to `$XDG_RUNTIME_DIR/offload/secrets/<job>`
+  (tmpfs) at start, and the wrapper exports them and deletes `env.json`. The directory is removed
+  when the job ends. Job records only list secret names. A runner restart drops queued jobs'
+  secrets and fails those jobs.
+
 ## Sessions (MCP)
 
 `runner pipe` owns the process. Stdout is appended to a file and stdin is accepted on a unix

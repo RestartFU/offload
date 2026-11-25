@@ -49,9 +49,26 @@ type JobSpec struct {
 	Manifest     []FileEntry `json:"manifest,omitempty"`
 	Dir          string      `json:"dir,omitempty"` // working directory relative to the workspace root
 	Artifacts    []string    `json:"artifacts,omitempty"`
-	Fresh        bool        `json:"fresh,omitempty"`     // start from an empty workspace (cold build)
-	Ephemeral    bool        `json:"ephemeral,omitempty"` // drop the workspace when the job ends
-	Client       string      `json:"client,omitempty"`    // free-form label of the caller
+	// Git gives the workspace a real .git at the client's HEAD. The runner keeps the history per
+	// repository; the client uploads only missing commits as a git bundle.
+	Git *GitRef `json:"git,omitempty"`
+	// Relay lists credential relays the job may use while a client is attached:
+	// "ssh-agent" (SSH_AUTH_SOCK) and "git" (credential helper). Answers come from the client.
+	Relay []string `json:"relay,omitempty"`
+	// Secrets (env name -> value) and SecretFiles (env name -> file content; the env var gets the
+	// file's path) exist only while the job runs, in tmpfs. The runner never stores them.
+	Secrets     map[string]string `json:"secrets,omitempty"`
+	SecretFiles map[string][]byte `json:"secret_files,omitempty"`
+	// Detached means no client will stay attached, so relay requests fail at once.
+	Detached bool `json:"detached,omitempty"`
+	// SecretNames records which secrets a job got (names only); set by the runner.
+	SecretNames []string `json:"secret_names,omitempty"`
+	// WriteBack asks the runner to return synced files the job changed, so the client can
+	// apply them locally (cargo fmt, lockfile updates, codegen).
+	WriteBack bool   `json:"write_back,omitempty"`
+	Fresh     bool   `json:"fresh,omitempty"`     // start from an empty workspace (cold build)
+	Ephemeral bool   `json:"ephemeral,omitempty"` // drop the workspace when the job ends
+	Client    string `json:"client,omitempty"`    // free-form label of the caller
 }
 
 // Job is a job record as returned by the runner.
@@ -71,10 +88,44 @@ type Job struct {
 	Signal      string     `json:"signal,omitempty"`
 	Reason      string     `json:"reason,omitempty"`
 	HasArtifact bool       `json:"has_artifacts,omitempty"`
+	WriteBack   *WriteBack `json:"write_back,omitempty"`
+	// PeakMem is the job's peak memory use (cgroup memory.peak), once it has finished.
+	PeakMem int64 `json:"peak_mem,omitempty"`
+	// AutoMem is set when the runner chose the memory limit (from history or the profile)
+	// rather than the caller; clients may retry such a job with more memory after an OOM.
+	AutoMem bool `json:"auto_mem,omitempty"`
+	// MemFrom says where the memory limit came from: "requested", "learned", "profile", "default".
+	MemFrom string `json:"mem_from,omitempty"`
 	// Needed lists the manifest paths the client must upload. Only set in the create response.
 	Needed []string `json:"needed,omitempty"`
 	// Manifest stats, for the create response.
 	SyncFiles int `json:"sync_files,omitempty"`
+	// GitNeeded means the runner lacks Spec.Git.Head: upload a bundle of HEAD minus GitHave.
+	GitNeeded bool     `json:"git_needed,omitempty"`
+	GitHave   []string `json:"git_have,omitempty"`
+}
+
+// GitRef is the client's checkout: commit and branch (empty when detached).
+type GitRef struct {
+	Head   string `json:"head"`
+	Branch string `json:"branch,omitempty"`
+}
+
+// WriteBack lists what a finished job changed in its workspace. Paths are relative to the
+// workspace root. The files themselves are served by GET /v1/jobs/{id}/writeback as tar.gz.
+type WriteBack struct {
+	Modified []ChangedFile `json:"modified,omitempty"` // synced files the job edited
+	Deleted  []string      `json:"deleted,omitempty"`  // synced files the job removed (reported only)
+}
+
+// ChangedFile is one file in a WriteBack. BaseHash is the content the client uploaded, so the
+// client can refuse to overwrite a file that also changed locally.
+type ChangedFile struct {
+	Path     string `json:"path"`
+	Hash     string `json:"hash"`
+	BaseHash string `json:"base_hash,omitempty"`
+	Mode     uint32 `json:"mode"`
+	Size     int64  `json:"size"`
 }
 
 // SessionSpec is the body of POST /v1/sessions.
@@ -102,7 +153,8 @@ type Session struct {
 
 // ProfileInfo summarizes a runner profile in /v1/status.
 type ProfileInfo struct {
-	Kind        string    `json:"kind"` // "job" or "session"
+	Kind        string    `json:"kind"`            // "job" or "session"
+	Match       []string  `json:"match,omitempty"` // commands that select this profile automatically
 	Description string    `json:"description,omitempty"`
 	Resources   Resources `json:"resources"`
 }

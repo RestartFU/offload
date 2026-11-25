@@ -4,6 +4,9 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,36 +16,190 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/RestartFU/offload/internal/api"
 )
 
 // These functions run inside the systemd unit, as the unit's main process. They own the user's
 // command, so the runner daemon can restart without killing work.
 
-// RunExec is "offload runner exec": run argv, then record its exit status (and whether the
-// cgroup OOM killer fired) and pack requested artifacts into the job directory.
-func RunExec(jobDir string, artifacts []string, argv []string) int {
-	code, sig, runErr := runChild(argv, nil, os.Stdout)
-	rec := exitRecord{Code: code, Signal: sig, OOM: oomKilled()}
+// ExecOptions configures "offload runner exec".
+type ExecOptions struct {
+	JobDir    string
+	Artifacts []string
+	WriteBack string // workspace root to scan for edited synced files ("" = off)
+	Record    string // the slot's record of synced files
+	Secrets   string // tmpfs directory with env.json (and secret files)
+	Argv      []string
+}
+
+// loadSecrets exports the job's secret env vars to the command, then deletes env.json. Secret
+// files stay (env vars point at them) until the runner removes the directory after the job.
+func loadSecrets(dir string) {
+	p := filepath.Join(dir, "env.json")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "offload: secrets: %v\n", err)
+		return
+	}
+	_ = os.Remove(p)
+	var vars map[string]string
+	if json.Unmarshal(b, &vars) == nil {
+		for k, v := range vars {
+			_ = os.Setenv(k, v)
+		}
+	}
+}
+
+// RunExec is "offload runner exec": run argv, then record its exit status, peak memory and
+// whether the cgroup OOM killer fired, pack requested artifacts, and collect write-back files.
+func RunExec(o ExecOptions) int {
+	if o.Secrets != "" {
+		loadSecrets(o.Secrets)
+	}
+	code, sig, runErr := runChild(o.Argv, nil, os.Stdout)
+	rec := exitRecord{Code: code, Signal: sig, OOM: oomKilled(), PeakMem: cgroupInt("memory.peak")}
 	if runErr != nil {
 		rec.Error = runErr.Error()
 		fmt.Fprintf(os.Stderr, "offload: %v\n", runErr)
 	}
-	if len(artifacts) > 0 {
-		if err := packArtifacts(filepath.Join(jobDir, "artifacts.tar.gz"), artifacts); err != nil {
+	if len(o.Artifacts) > 0 {
+		if err := packArtifacts(filepath.Join(o.JobDir, "artifacts.tar.gz"), o.Artifacts); err != nil {
 			fmt.Fprintf(os.Stderr, "offload: artifacts: %v\n", err)
 		} else {
 			rec.Artifact = true
 		}
 	}
-	if err := writeFileJSON(filepath.Join(jobDir, "exit.json"), rec); err != nil {
+	if o.WriteBack != "" && o.Record != "" {
+		wb, err := collectWriteBack(o.WriteBack, o.Record, filepath.Join(o.JobDir, "writeback.tar.gz"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "offload: write-back: %v\n", err)
+		}
+		rec.WriteBack = wb
+	}
+	if err := writeFileJSON(filepath.Join(o.JobDir, "exit.json"), rec); err != nil {
 		fmt.Fprintf(os.Stderr, "offload: write exit status: %v\n", err)
 	}
 	return code
+}
+
+// writeBackLimit caps how much edited source a job can send back.
+const writeBackLimit = 256 << 20
+
+// collectWriteBack finds synced files the job changed, packs them, and updates the slot record so
+// the next sync doesn't re-upload what the client is about to receive anyway.
+func collectWriteBack(root, recordPath, dest string) (*api.WriteBack, error) {
+	b, err := os.ReadFile(recordPath)
+	if err != nil {
+		return nil, err
+	}
+	var rec slotRecord
+	if err := json.Unmarshal(b, &rec); err != nil {
+		return nil, err
+	}
+	wb := &api.WriteBack{}
+	var total int64
+	paths := make([]string, 0, len(rec.Files))
+	for p := range rec.Files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		ent := rec.Files[p]
+		if ent.Link != "" {
+			continue
+		}
+		full := filepath.Join(root, filepath.FromSlash(p))
+		fi, err := os.Lstat(full)
+		if err != nil {
+			wb.Deleted = append(wb.Deleted, p)
+			continue
+		}
+		if !fi.Mode().IsRegular() || (fi.Size() == ent.Size && fi.ModTime().UnixNano() == ent.MTime) {
+			continue
+		}
+		h, err := fileHash(full)
+		if err != nil {
+			continue
+		}
+		if h != ent.Hash {
+			if total += fi.Size(); total > writeBackLimit {
+				return nil, fmt.Errorf("edited files exceed %d MiB; not sending them back", writeBackLimit>>20)
+			}
+			wb.Modified = append(wb.Modified, api.ChangedFile{Path: p, Hash: h, BaseHash: ent.Hash, Mode: uint32(fi.Mode().Perm()), Size: fi.Size()})
+		}
+		ent.Hash, ent.Size, ent.MTime, ent.Mode = h, fi.Size(), fi.ModTime().UnixNano(), uint32(fi.Mode().Perm())
+		rec.Files[p] = ent
+	}
+	if len(wb.Modified) > 0 {
+		if err := packFiles(dest, root, wb.Modified); err != nil {
+			return nil, err
+		}
+	}
+	if err := writeFileJSON(recordPath, rec); err != nil {
+		return nil, err
+	}
+	if len(wb.Modified) == 0 && len(wb.Deleted) == 0 {
+		return nil, nil
+	}
+	return wb, nil
+}
+
+func fileHash(p string) (string, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func packFiles(dest, root string, files []api.ChangedFile) error {
+	f, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	for _, c := range files {
+		src, err := os.Open(filepath.Join(root, filepath.FromSlash(c.Path)))
+		if err != nil {
+			return err
+		}
+		err = tw.WriteHeader(&tar.Header{Name: c.Path, Mode: int64(c.Mode), Size: c.Size, Typeflag: tar.TypeReg, Format: tar.FormatPAX})
+		if err == nil {
+			_, err = io.CopyN(tw, src, c.Size)
+		}
+		src.Close()
+		if err != nil {
+			return err
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	return gz.Close()
+}
+
+// cgroupInt reads a single-number file from this unit's cgroup (e.g. memory.peak).
+func cgroupInt(name string) int64 {
+	b, err := os.ReadFile(filepath.Join(ownCgroup(), name))
+	if err != nil {
+		return 0
+	}
+	v, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	return v
 }
 
 // RunPipe is "offload runner pipe": run argv with stdin fed from the unix socket sock and stdout

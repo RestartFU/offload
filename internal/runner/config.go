@@ -75,7 +75,8 @@ type Config struct {
 // Profile is a named job or session recipe (profiles_dir/<name>.toml).
 type Profile struct {
 	Name        string            `toml:"name"`
-	Kind        string            `toml:"kind"` // "job" (env + resource defaults) or "session"
+	Kind        string            `toml:"kind"`  // "job" (env + resource defaults) or "session"
+	Match       []string          `toml:"match"` // job profiles: commands (globs) that select it automatically
 	Description string            `toml:"description"`
 	Command     []string          `toml:"command"` // required for sessions
 	Env         map[string]string `toml:"env"`
@@ -263,6 +264,9 @@ func (c *Config) effective(req api.Resources, p *Profile) api.Resources {
 	}
 	if r.Mem <= 0 {
 		r.Mem = c.defMem
+	}
+	if req.Mem == 0 {
+		r.Mem = min(r.Mem, c.memCap) // defaults never exceed what this runner has
 	}
 	maxCPU := float64(len(c.cpus))
 	if r.CPUMax <= 0 {

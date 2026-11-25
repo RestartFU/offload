@@ -24,6 +24,16 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
 - **Keeps the server alive.** One core is never handed out, and the slice has a hard memory cap.
   Admission refuses work that would push host `MemAvailable` below a reserve. Jobs run with
   `OOMScoreAdjust=900` under systemd-oomd, while sshd and tailscaled get `-1000`.
+- **Automatic routing.** Agents type `offload run -- <cmd>` and nothing else. The client
+  picks the runner (warm workspace, free capacity, load, cached discovery), the runner picks the
+  profile from the command, and the memory limit comes from earlier runs. An out-of-memory kill
+  on a guessed limit is retried once with twice the memory.
+- **Feels local.** The runner gets a real `.git` at your HEAD (only missing commits travel, as a
+  bundle). Files the job edits are written back. stdout and stderr stay separate.
+- **Credentials without copying keys.** The job's `SSH_AUTH_SOCK` and git credential helper
+  are answered by the attached client from the laptop. Credential sets in `client.toml` (for
+  example `GH_TOKEN = "cmd:gh auth token"`) can be marked `auto` so every job gets them. They
+  live in tmpfs only for the job's lifetime.
 - **Survives restarts.** Jobs are systemd units, so the daemon can restart or upgrade
   (`offload host upgrade`) without killing work. Clients reattach from the last byte after
   network drops or laptop sleep.
@@ -60,6 +70,17 @@ Optional `~/.config/offload/client.toml`:
 ```toml
 discover = true   # probe tailnet peers (default)
 local = true      # use a runner on this machine too, at low priority (default)
+
+[credentials]
+relay = ["ssh-agent", "git"]   # default; answered from this machine while attached
+git_hosts = []                 # restrict git credential lending, e.g. ["github.com"]
+
+[credentials.sets.github]
+auto = true                    # every job gets it, no flags
+env = { GH_TOKEN = "cmd:gh auth token" }
+
+[credentials.sets.npm]         # only with: offload run --with npm -- …
+files = { NPM_CONFIG_USERCONFIG = "~/.npmrc" }
 
 [[host]]          # pin a runner explicitly, e.g. outside the tailnet
 name = "box"

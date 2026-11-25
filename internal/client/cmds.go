@@ -122,7 +122,9 @@ func Attach(ref string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	return follow(ctx, h, id, false, false, false)
+	cfg, _ := LoadConfig()
+	code, _, err := follow(ctx, h, id, false, false, cfg)
+	return code, err
 }
 
 // Cancel stops a job.

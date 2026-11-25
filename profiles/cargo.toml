@@ -1,6 +1,7 @@
 # Rust builds and tests. Use with: offload run --profile cargo -- cargo build
 kind = "job"
 description = "Rust (cargo) builds and tests"
+match = ["cargo", "cargo-*", "rustc", "rustup"]   # picked automatically for these commands
 
 [resources]
 cpu = 4        # guaranteed share

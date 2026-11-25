@@ -1,6 +1,7 @@
 # Go builds and tests. Use with: offload run --profile go -- go test ./...
 kind = "job"
 description = "Go builds and tests"
+match = ["go", "gofmt", "golangci-lint"]
 
 [resources]
 cpu = 4

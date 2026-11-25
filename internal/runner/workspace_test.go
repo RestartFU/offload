@@ -95,3 +95,17 @@ func TestCleanRel(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestCommandSig(t *testing.T) {
+	for want, argv := range map[string][]string{
+		"cargo test":  {"cargo", "+nightly", "test", "-p", "x"},
+		"cargo build": {"sh", "-c", "RUSTFLAGS=-g cargo build --release && ls"},
+		"python3":     {"python3", "-c", "print('hi')"},
+		"ci.sh":       {"./scripts/ci.sh"},
+		"go test":     {"/usr/bin/go", "test", "./..."},
+	} {
+		if got := commandSig(argv); got != want {
+			t.Errorf("commandSig(%q) = %q, want %q", argv, got, want)
+		}
+	}
+}

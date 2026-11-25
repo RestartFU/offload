@@ -53,7 +53,12 @@ Client:
       --cpu N          guaranteed cores         --cpu-max N      burst ceiling
       --mem SIZE       memory limit (8G)        --env K=V        extra environment (repeatable)
       --get PATH       bring PATH back after the job (repeatable)
+      --with SET       add a credential set from client.toml (auto sets are always added)
+      --secret NAME    pass this local env var to the job as a secret
+      --no-credentials no ssh-agent/git relays and no secrets
       --no-sync        don't upload the current directory
+      --no-git         don't give the runner the repository's git history
+      --no-write-back  don't copy files the job edited (cargo fmt, lockfiles…) back here
       --fresh          start from an empty workspace (cold build)
       --ephemeral      drop the workspace afterwards
       --detach, -d     print the job id and return
@@ -67,7 +72,7 @@ Client:
   offload host upgrade NAME|--all    push this binary to runners
 
 Runner (on the server):
-  offload runner install [--name N]              config, profiles, systemd user units
+  offload runner install [--name N] [--profiles] config, profiles, systemd user units
   sudo offload runner install-system --user U    linger, cgroup delegation, keep-alive, firewall
   offload runner serve [--config PATH]           the daemon (run by systemd)
 
@@ -177,13 +182,18 @@ func cmdRun(args []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	var o client.RunOptions
-	var env, get multi
+	var env, get, with, secrets multi
 	fs.StringVar(&o.On, "on", "", "runner name")
 	fs.StringVar(&o.Profile, "profile", "", "runner profile")
 	res := resourceFlags(fs)
 	fs.Var(&env, "env", "K=V")
 	fs.Var(&get, "get", "artifact path")
+	fs.Var(&with, "with", "credential set")
+	fs.Var(&secrets, "secret", "env var to pass as a secret")
+	fs.BoolVar(&o.NoCreds, "no-credentials", false, "")
 	fs.BoolVar(&o.NoSync, "no-sync", false, "")
+	fs.BoolVar(&o.NoWriteBack, "no-write-back", false, "")
+	fs.BoolVar(&o.NoGit, "no-git", false, "")
 	fs.BoolVar(&o.Fresh, "fresh", false, "")
 	fs.BoolVar(&o.Ephemeral, "ephemeral", false, "")
 	fs.BoolVar(&o.Detach, "detach", false, "")
@@ -210,6 +220,7 @@ func cmdRun(args []string) (int, error) {
 		o.Env[k] = v
 	}
 	o.Artifacts = get
+	o.With, o.Secrets = with, secrets
 	o.Argv = rest
 	return client.Run(o)
 }
@@ -265,8 +276,9 @@ func cmdRunner(args []string) (int, error) {
 		fs := flag.NewFlagSet("install", flag.ExitOnError)
 		name := fs.String("name", "", "runner name (default: hostname)")
 		force := fs.Bool("force", false, "overwrite runner.toml")
+		profiles := fs.Bool("profiles", false, "overwrite the built-in profiles")
 		_ = fs.Parse(args[1:])
-		return 0, runner.Install(runner.InstallOptions{Name: *name, Force: *force, Out: os.Stdout})
+		return 0, runner.Install(runner.InstallOptions{Name: *name, Force: *force, Profiles: *profiles, Out: os.Stdout})
 	case "install-system":
 		fs := flag.NewFlagSet("install-system", flag.ExitOnError)
 		user := fs.String("user", os.Getenv("SUDO_USER"), "user that runs the runner")
@@ -279,6 +291,9 @@ func cmdRunner(args []string) (int, error) {
 	case "exec":
 		fs := flag.NewFlagSet("exec", flag.ExitOnError)
 		dir := fs.String("job-dir", "", "")
+		wb := fs.String("write-back", "", "")
+		secrets := fs.String("secrets", "", "")
+		record := fs.String("record", "", "")
 		var arts multi
 		fs.Var(&arts, "artifact", "")
 		fl, rest := splitArgs(args[1:])
@@ -286,7 +301,13 @@ func cmdRunner(args []string) (int, error) {
 		if *dir == "" || len(rest) == 0 {
 			die("internal: runner exec --job-dir DIR -- CMD")
 		}
-		return runner.RunExec(*dir, arts, rest), nil
+		return runner.RunExec(runner.ExecOptions{JobDir: *dir, Artifacts: arts, WriteBack: *wb, Record: *record, Secrets: *secrets, Argv: rest}), nil
+	case "credential":
+		op := ""
+		if len(args) > 1 {
+			op = args[1]
+		}
+		return runner.CredentialHelper(op, os.Stdin, os.Stdout), nil
 	case "pipe":
 		fs := flag.NewFlagSet("pipe", flag.ExitOnError)
 		dir := fs.String("dir", "", "")

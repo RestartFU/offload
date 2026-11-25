@@ -27,6 +27,7 @@ type Workspace struct {
 	Key      string // stable runner-side workspace name
 	Dir      string // cwd relative to Root
 	Manifest []api.FileEntry
+	Git      *api.GitRef // HEAD and branch, nil outside git or before the first commit
 }
 
 // skipDirs are never synced when the tree is not a git repository.
@@ -40,6 +41,12 @@ func LoadWorkspace(cwd string) (*Workspace, error) {
 	var files []string
 	if top, err := git(cwd, "rev-parse", "--show-toplevel"); err == nil {
 		ws.Root = strings.TrimSpace(top)
+		if head, err := git(ws.Root, "rev-parse", "--verify", "-q", "HEAD"); err == nil {
+			ws.Git = &api.GitRef{Head: strings.TrimSpace(head)}
+			if br, err := git(ws.Root, "symbolic-ref", "-q", "--short", "HEAD"); err == nil {
+				ws.Git.Branch = strings.TrimSpace(br)
+			}
+		}
 		files, err = gitFiles(ws.Root)
 		if err != nil {
 			return nil, err
@@ -283,4 +290,33 @@ func writeTar(w io.Writer, root string, manifest []api.FileEntry, needed []strin
 		return err
 	}
 	return gz.Close()
+}
+
+// gitBundle writes a bundle of HEAD minus the commits the runner already has (those we also
+// have locally) to a temp file and returns its path.
+func gitBundle(root string, have []string) (string, error) {
+	f, err := os.CreateTemp("", "offload-*.bundle")
+	if err != nil {
+		return "", err
+	}
+	f.Close()
+	args := []string{"bundle", "create", "-q", f.Name(), "HEAD"}
+	if len(have) > 0 {
+		cmd := exec.Command("git", "-C", root, "cat-file", "--batch-check=%(objectname) %(objecttype)")
+		cmd.Stdin = strings.NewReader(strings.Join(have, "\n") + "\n")
+		out, _ := cmd.Output()
+		for _, line := range strings.Split(string(out), "\n") {
+			if sha, typ, ok := strings.Cut(line, " "); ok && typ == "commit" {
+				args = append(args, "^"+sha)
+			}
+		}
+	}
+	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("git bundle: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return f.Name(), nil
 }

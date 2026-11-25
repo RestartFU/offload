@@ -12,21 +12,34 @@ runs there under CPU/memory limits, and output streams back with the command's e
 ## Run something
 
 ```bash
-offload run -- cargo build --release                 # best runner, defaults
-offload run --profile cargo -- cargo test -p foo     # profile = sensible limits + env
-offload run --mem 16G --cpu 8 -- cargo build        # ask for more (guaranteed cpu, hard mem)
+offload run -- cargo test                     # that's it
+offload run -- ./scripts/ci.sh                # whole scripts work too
 offload run --get target/release/app -- cargo build --release   # bring a file/dir back
-offload run --on vps -- make -j                      # a specific runner
-offload run --no-sync -- nproc                       # no source needed
 ```
 
-- Exit code = the remote command's exit code. Out-of-memory exits 137 with
-  `job failed: out of memory (limit …)` — rerun with a larger `--mem`.
-- Long jobs: run the Bash call in the background, or `offload run -d -- …` and later
-  `offload attach <runner:id>`. Ctrl-C / killing `offload run` cancels the remote job;
-  Ctrl-C on `attach` only detaches.
-- `--fresh` = cold build (empty workspace); `--ephemeral` = don't keep the workspace.
-- Tools see the job's real core count (`nproc`, `CARGO_BUILD_JOBS`, `GOMAXPROCS`, `MAKEFLAGS`).
+You never choose where or how big. Offload picks the runner (warm workspace, free capacity,
+load), the profile (from the command: cargo, go, …), and the memory limit (learned from earlier
+runs of the same command). If that guess runs out of memory, the job is retried once with twice
+the memory. Override only when you know better: `--mem 16G`, `--cpu 8`, `--on NAME`.
+
+What the job sees on the runner:
+- The repository as it is here: tracked files plus untracked files that aren't ignored, including
+  uncommitted edits. Build output such as `target/` stays warm on the runner between runs.
+- A real `.git` at your HEAD and branch (log, describe, diff all work). Only missing commits are sent.
+- Your credentials, without copying keys: `SSH_AUTH_SOCK` and git's credential helper are answered
+  by this machine while you're attached (each use is announced on stderr), plus any credential
+  sets the user marked `auto` in `client.toml`. Detached jobs (`-d`) get no relay answers.
+- Real core counts (`nproc`, `CARGO_BUILD_JOBS`, `GOMAXPROCS`, `MAKEFLAGS`).
+
+What comes back:
+- stdout and stderr (kept separate) and the exit code. Out of memory after the retry exits 137.
+- Synced files the job edited (`cargo fmt`, `Cargo.lock`, codegen) are written back here, unless
+  they also changed locally during the job (then they're reported, not overwritten).
+- Anything else only with `--get PATH`.
+
+Long jobs: run the Bash call in the background, or `offload run -d -- …` and later
+`offload attach <runner:id>`. Killing `offload run` cancels the job; Ctrl-C on `attach` detaches.
+A script that calls `offload run` inside a job runs that command in place.
 
 ## Look around
 
@@ -52,5 +65,5 @@ A runner profile of kind `session` can be used as a stdio MCP server:
 - If a command truly has to run locally (it needs local hardware or files outside the repo),
   prefix it with `OFFLOAD_GUARD=off`.
 - Files outside the repository are not synced. Ignored files (`.gitignore`) are not synced
-  either; pass inputs explicitly or add them to the repo.
-- Results written on the runner stay there unless you pass `--get PATH`.
+  either; add inputs to the repo or generate them in the job.
+- Tools must exist on the runner (`offload hosts` lists runners and profiles).

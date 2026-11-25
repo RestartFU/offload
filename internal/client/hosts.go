@@ -30,7 +30,11 @@ type Config struct {
 	Port     int          `toml:"port"`
 	Local    *bool        `toml:"local"` // use a runner on this machine if one is running (default true)
 	Hosts    []HostConfig `toml:"host"`
+
+	Credentials CredentialsConfig `toml:"credentials"`
 }
+
+func decodeJSON(r io.Reader, v any) error { return json.NewDecoder(r).Decode(v) }
 
 // HostConfig pins a runner by URL, optionally with a token and a priority.
 type HostConfig struct {
@@ -105,27 +109,80 @@ func newHost(name, url, token string, prio int) *Host {
 	return h
 }
 
-// Discover returns every reachable runner with its status, best candidates first.
-func Discover(ctx context.Context, cfg *Config) []*Host {
-	var cands []*Host
-	seen := map[string]bool{}
-	add := func(h *Host) {
-		if !seen[h.URL+h.Name] {
-			seen[h.URL+h.Name] = true
-			cands = append(cands, h)
-		}
+// Runner discovery is cached so a command starts immediately: known runners are probed
+// directly, and the whole tailnet is scanned only when the cache is old or none of them answer.
+type hostCache struct {
+	At    time.Time    `json:"at"`
+	Hosts []cachedHost `json:"hosts"`
+}
+
+type cachedHost struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+const hostCacheTTL = 15 * time.Minute
+
+func hostCachePath() string {
+	dir, _ := os.UserCacheDir()
+	return filepath.Join(dir, "offload", "runners.json")
+}
+
+// forgetHosts drops the runner cache so the next command rescans the tailnet.
+func forgetHosts() { _ = os.Remove(hostCachePath()) }
+
+func loadHostCache() *hostCache {
+	b, err := os.ReadFile(hostCachePath())
+	if err != nil {
+		return nil
 	}
+	var c hostCache
+	if json.Unmarshal(b, &c) != nil || time.Since(c.At) > hostCacheTTL {
+		return nil
+	}
+	return &c
+}
+
+func saveHostCache(hosts []*Host) {
+	c := hostCache{At: time.Now()}
+	for _, h := range hosts {
+		c.Hosts = append(c.Hosts, cachedHost{Name: h.Name, URL: h.URL})
+	}
+	b, _ := json.Marshal(c)
+	_ = os.MkdirAll(filepath.Dir(hostCachePath()), 0o700)
+	_ = os.WriteFile(hostCachePath(), b, 0o600)
+}
+
+// Discover returns every reachable runner with its status, highest priority first.
+func Discover(ctx context.Context, cfg *Config) []*Host {
+	var fixed []*Host
 	for _, hc := range cfg.Hosts {
 		if !hc.Disabled {
-			add(newHost(hc.Name, hc.URL, hc.Token, hc.Priority))
+			fixed = append(fixed, newHost(hc.Name, hc.URL, hc.Token, hc.Priority))
 		}
 	}
 	if cfg.Local == nil || *cfg.Local {
 		if _, err := os.Stat(localSocket()); err == nil {
-			add(newHost("local", "unix://"+localSocket(), "", -10))
+			fixed = append(fixed, newHost("local", "unix://"+localSocket(), "", -10))
 		}
 	}
-	if cfg.Discover == nil || *cfg.Discover {
+	scan := cfg.Discover == nil || *cfg.Discover
+	if scan {
+		if c := loadHostCache(); c != nil {
+			var cached []*Host
+			for _, ch := range c.Hosts {
+				cached = append(cached, newHost(ch.Name, ch.URL, "", 0))
+			}
+			found := probe(ctx, append(append([]*Host(nil), fixed...), cached...))
+			for _, h := range found {
+				if h.Priority == 0 && !isFixed(h, fixed) {
+					return found // at least one cached tailnet runner answered
+				}
+			}
+		}
+	}
+	cands := append([]*Host(nil), fixed...)
+	if scan {
 		tctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		st, err := tsapi.GetStatus(tctx)
 		cancel()
@@ -138,10 +195,34 @@ func Discover(ctx context.Context, cfg *Config) []*Host {
 				if name == "" {
 					name = p.HostName
 				}
-				add(newHost(name, fmt.Sprintf("http://%s", net.JoinHostPort(p.TailscaleIPs[0], fmt.Sprint(cfg.Port))), "", 0))
+				cands = append(cands, newHost(name, fmt.Sprintf("http://%s", net.JoinHostPort(p.TailscaleIPs[0], fmt.Sprint(cfg.Port))), "", 0))
 			}
 		}
 	}
+	found := probe(ctx, cands)
+	if scan {
+		var tailnet []*Host
+		for _, h := range found {
+			if !isFixed(h, fixed) {
+				tailnet = append(tailnet, h)
+			}
+		}
+		saveHostCache(tailnet)
+	}
+	return found
+}
+
+func isFixed(h *Host, fixed []*Host) bool {
+	for _, f := range fixed {
+		if f == h {
+			return true
+		}
+	}
+	return false
+}
+
+// probe fetches every candidate's status in parallel and keeps the ones that answered.
+func probe(ctx context.Context, cands []*Host) []*Host {
 	var wg sync.WaitGroup
 	for _, h := range cands {
 		wg.Add(1)
@@ -160,12 +241,13 @@ func Discover(ctx context.Context, cfg *Config) []*Host {
 	}
 	wg.Wait()
 	var out []*Host
+	seen := map[string]bool{}
 	for _, h := range cands {
-		if h.Status != nil {
+		if h.Status != nil && !seen[h.URL] {
+			seen[h.URL] = true
 			out = append(out, h)
 		}
 	}
-	// A local runner and a tailnet runner can be the same machine; keep the first.
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Priority > out[j].Priority })
 	return out
 }
@@ -265,10 +347,11 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 			reasons = append(reasons, h.Name+": "+st.Reason)
 			continue
 		}
-		if r.Mem > st.Capacity.Mem {
+		if want.Mem > st.Capacity.Mem { // only an explicit request can rule a runner out
 			reasons = append(reasons, h.Name+": too little memory")
 			continue
 		}
+		r.Mem = min(r.Mem, st.Capacity.Mem)
 		f := h.free()
 		score := float64(h.Priority) * 1000
 		if f.CPU >= r.CPU && f.Mem >= r.Mem {
