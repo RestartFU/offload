@@ -130,7 +130,7 @@ func MCP(o MCPOptions) error {
 			}
 			select {
 			case <-ctx.Done():
-				return nil
+				return interrupted(o)
 			case <-time.After(3 * time.Second):
 			}
 			continue
@@ -162,7 +162,7 @@ func MCP(o MCPOptions) error {
 	}
 	select {
 	case <-ctx.Done():
-		return nil
+		return interrupted(o)
 	case err := <-done:
 		if err == nil && o.Prepare {
 			return prepareResult(ctx, h, se.ID)
@@ -190,6 +190,15 @@ func MCP(o MCPOptions) error {
 		}
 		return nil
 	}
+}
+
+// interrupted is what Ctrl-C returns: fine for a bridged MCP server, a failure for --prepare
+// (a script must not carry on as though provisioning finished).
+func interrupted(o MCPOptions) error {
+	if o.Prepare {
+		return errors.New("prepare interrupted before it finished")
+	}
+	return nil
 }
 
 // prepareResult turns a finished prepare session's exit into the command's result: anything but
@@ -280,7 +289,7 @@ func sendStdin(ctx context.Context, h *Host, id string, seq int64, line []byte) 
 			return nil
 		}
 		var ae *APIError
-		if errors.As(err, &ae) && (ae.Code == 404 || ae.Code == 410) {
+		if errors.As(err, &ae) && (ae.Code == 404 || ae.Code == 410 || ae.Code == 412) {
 			return fmt.Errorf("session ended: %s", ae.Msg)
 		}
 		if ctx.Err() != nil || attempt > 120 {
@@ -314,6 +323,9 @@ func pumpOut(ctx context.Context, h *Host, id, stream string, w io.Writer) error
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Code == 404 {
 			return fmt.Errorf("session %s is gone", id)
+		}
+		if errors.As(err, &ae) && ae.Code == 412 { // the runner was upgraded to another protocol
+			return fmt.Errorf("%s: %s", h.Name, ae.Msg)
 		}
 		select {
 		case <-ctx.Done():

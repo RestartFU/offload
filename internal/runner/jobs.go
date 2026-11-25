@@ -149,6 +149,13 @@ func (s *Server) restore() {
 			j.save()
 		case api.StateQueued:
 			j.queuedAt = j.CreatedAt
+			if j.StopRequested {
+				j.State, j.Reason = api.StateCancelled, "cancelled"
+				now := time.Now()
+				j.FinishedAt = &now
+				j.save()
+				break
+			}
 			if len(j.Spec.Relay) > 0 || j.Spec.Network == "client" {
 				j.relay = newRelay() // its sockets are created when it starts
 			}
@@ -499,6 +506,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if err == nil && g != nil {
 		if gerr := s.gitCheckout(gitCtx, sl, j.Spec.WorkspaceKey, g); gerr != nil {
 			s.note(j, "running without .git: "+gerr.Error())
+			// Never a previous job's .git describing another commit.
+			if root, err := os.OpenRoot(sl.Dir); err == nil {
+				_ = root.RemoveAll(".git")
+				root.Close()
+			}
+		} else {
+			s.pruneUntracked(gitCtx, sl, manifest)
 		}
 	} else if err == nil {
 		// No git for this job: don't leave a stale .git describing some other commit.
@@ -984,6 +998,15 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j.cancelled.Store(true)
+	if !api.Terminal(j.State) && !j.StopRequested {
+		// Recorded before it is acknowledged: a restart must never bring a cancelled job back.
+		j.StopRequested = true
+		if err := j.save(); err != nil {
+			j.StopRequested = false
+			out.err(500, "can't record the cancel: "+err.Error())
+			return
+		}
+	}
 	switch j.State {
 	case api.StateUploading, api.StateQueued:
 		if j.syncing {
@@ -995,11 +1018,7 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 			s.finishLocked(j, api.StateCancelled, nil, "cancelled")
 		}
 	case api.StateRunning:
-		j.cancel, j.StopRequested = true, true
-		if err := j.save(); err != nil { // recorded first: a restart must not forget the cancel
-			out.err(500, "can't record the cancel: "+err.Error())
-			return
-		}
+		j.cancel = true
 		stopUnit(j.Unit)
 	}
 	out.json(j.view())

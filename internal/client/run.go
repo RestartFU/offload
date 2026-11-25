@@ -150,7 +150,7 @@ func Run(o RunOptions) (int, error) {
 		defer os.Remove(pendingBaseline) // a no-op once renamed to the job's
 	}
 	for attempt := 0; ; attempt++ {
-		h, j, err := submit(ctx, cfg, o, spec, ws)
+		h, j, err := submit(ctx, cfg, o, spec, ws, pendingBaseline)
 		if err != nil {
 			if ctx.Err() != nil {
 				return 130, nil
@@ -159,12 +159,6 @@ func Run(o RunOptions) (int, error) {
 		}
 		ref := h.Name + ":" + j.ID
 		if o.Detach {
-			if pendingBaseline != "" {
-				if err := os.Rename(pendingBaseline, baselinePath(j.ID)); err != nil {
-					cancelJob(h, j.ID)
-					return 1, fmt.Errorf("can't keep the job's write-back baseline (cancelled it): %w", err)
-				}
-			}
 			fmt.Println(ref)
 			return 0, nil
 		}
@@ -193,10 +187,10 @@ func Run(o RunOptions) (int, error) {
 
 // submit picks a runner, creates the job and uploads the changed source. A runner whose
 // workspace slots are all busy is skipped for the next best one; if every runner is busy it waits.
-func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws *Workspace) (*Host, api.Job, error) {
+func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws *Workspace, pendingBaseline string) (*Host, api.Job, error) {
 	var j api.Job
 	busy := map[string]bool{}
-	waited := false
+	waited, allBusy := false, false
 	for {
 		hosts := Discover(ctx, cfg)
 		var h *Host
@@ -211,7 +205,7 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 				}
 			}
 			if len(avail) == 0 && len(hosts) > 0 {
-				avail, busy = hosts, map[string]bool{} // all busy: wait on the best one
+				avail, busy, allBusy = hosts, map[string]bool{}, true // all busy: wait on the best one
 			}
 			h, err = PickFor(avail, spec, "job")
 		}
@@ -224,7 +218,7 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 		err = h.do(ctx, "POST", "/v1/jobs", spec, &j)
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Code == 409 {
-			if o.On == "" && !busy[h.URL] && len(hosts) > 1 {
+			if o.On == "" && !allBusy && !busy[h.URL] && len(hosts) > 1 {
 				busy[h.URL] = true
 				continue
 			}
@@ -244,6 +238,14 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 			return nil, j, fmt.Errorf("%s: %w", h.Name, err)
 		}
 		rememberJob(j.ID, h)
+		if pendingBaseline != "" {
+			// Bound to the job before the source upload that makes it runnable: whatever happens
+			// to this connection afterwards, `offload attach` can still write its edits back.
+			if err := os.Rename(pendingBaseline, baselinePath(j.ID)); err != nil {
+				cancelJob(h, j.ID)
+				return nil, j, fmt.Errorf("can't keep the job's write-back baseline (cancelled it): %w", err)
+			}
+		}
 		if j.GitNeeded && ws != nil {
 			if err := uploadGit(ctx, h, j, ws, o.Quiet); err != nil {
 				if ctx.Err() != nil { // interrupted: give the reserved job back now
@@ -408,6 +410,9 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 		if errors.As(err, &ae) && ae.Code == 404 {
 			return fmt.Errorf("job %s is gone from %s", id, h.Name)
 		}
+		if errors.As(err, &ae) && ae.Code == 412 { // the runner was upgraded to another protocol
+			return fmt.Errorf("%s: %s", h.Name, ae.Msg)
+		}
 		if err == nil {
 			var j api.Job
 			if gerr := h.do(ctx, "GET", "/v1/jobs/"+id, nil, &j); gerr == nil && api.Terminal(j.State) {
@@ -477,6 +482,13 @@ func applyDetachedWriteBack(ctx context.Context, h *Host, j *api.Job) error {
 	if j.WriteBack == nil || !api.Terminal(j.State) {
 		return nil
 	}
+	// The baseline is consumed under the checkout's write-back lock, so two attaches of the
+	// same job apply it once.
+	unlock, err := lockFile(filepath.Join(stateDir(), "writeback", ".lock-job-"+j.ID))
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	b, err := os.ReadFile(baselinePath(j.ID))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil // not started from this machine with -d, or already applied
@@ -517,7 +529,24 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 
 // applyWriteBack writes files the job edited into the local tree, unless the local copy also
 // changed since upload (then it's left alone and reported).
+// applyWriteBack applies a finished job's edits to root. One write-back per checkout at a time:
+// two jobs that both started from the same file must not both find it unchanged and the
+// second silently replace the first one's result.
 func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, sent []api.FileEntry, quiet bool) error {
+	unlock, err := lockFile(writeBackLock(root))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return applyWriteBackLocked(ctx, h, j, root, sent, quiet)
+}
+
+func writeBackLock(root string) string {
+	sum := sha256.Sum256([]byte(root))
+	return filepath.Join(stateDir(), "writeback", ".lock-"+hex.EncodeToString(sum[:8]))
+}
+
+func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string, sent []api.FileEntry, quiet bool) error {
 	base := map[string]api.FileEntry{}
 	for _, e := range sent {
 		base[e.Path] = e
@@ -549,7 +578,9 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, sent 
 	defer tree.Close()
 	// A staging directory of this write-back's own (another job finishing in the same checkout
 	// has its own), removed when done; .offload-incoming itself goes once it is empty.
-	stage := path.Join(incomingDir, ".stage-"+j.ID)
+	sfx := make([]byte, 4)
+	_, _ = rand.Read(sfx)
+	stage := path.Join(incomingDir, ".stage-"+j.ID+"-"+hex.EncodeToString(sfx))
 	if err := mkdirReal(tree, stage); err != nil {
 		return err
 	}

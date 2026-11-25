@@ -280,13 +280,17 @@ func Pair(names []string, all bool, code string) error {
 // pairOne pairs with one runner; the caller holds its lock.
 func pairOne(ctx context.Context, h *Host, code string) error {
 	pending := runnerTokenPath(h.URL) + ".pending"
+	h.Token = storedToken(h.URL) // re-read under the lock: a concurrent pair may have rotated it
 	// A pending token is left by an attempt whose answer never arrived: the runner may have
-	// switched to it. Find out before minting another.
+	// switched to it. Ask with it, through the pair endpoint (it works across protocol versions
+	// and is a no-op for a token already paired).
 	if b, err := os.ReadFile(pending); err == nil {
 		probe := *h
 		probe.Token = strings.TrimSpace(string(b))
+		sum := sha256.Sum256([]byte(probe.Token))
 		var ae *APIError
-		switch err := probe.do(ctx, "GET", "/v1/sessions", nil, nil); {
+		var out map[string]string
+		switch err := probe.do(ctx, "POST", "/v1/admin/pair", map[string]any{"hash": hex.EncodeToString(sum[:])}, &out); {
 		case err == nil:
 			if err := os.Rename(pending, runnerTokenPath(h.URL)); err != nil {
 				return err

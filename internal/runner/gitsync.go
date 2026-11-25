@@ -170,3 +170,30 @@ func (s *Server) gitCheckout(ctx context.Context, sl *slot, key string, g *api.G
 	_, _ = gitCmdCtx(ctx, sl.Dir, "update-index", "-q", "--refresh")
 	return nil
 }
+
+// pruneUntracked removes files a previous job created in the slot that git doesn't ignore and
+// the client didn't send (generated sources, say): they would otherwise survive into builds of
+// other branches. Ignored files (target/, node_modules/ …) stay; that's what keeps slots warm.
+func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.FileEntry) {
+	out, err := gitCmdCtx(ctx, sl.Dir, "ls-files", "-z", "--others", "--exclude-standard")
+	if err != nil || out == "" {
+		return
+	}
+	sent := make(map[string]bool, len(manifest))
+	for _, e := range manifest {
+		sent[e.Path] = true
+	}
+	root, err := os.OpenRoot(sl.Dir)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+	for _, p := range strings.Split(out, "\x00") {
+		if p == "" || sent[p] || strings.HasPrefix(p, ".git/") {
+			continue
+		}
+		if _, err := cleanRel(p); err == nil && parentsState(root, p) == parentsReal {
+			_ = root.Remove(p)
+		}
+	}
+}

@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/RestartFU/offload/internal/api"
@@ -53,8 +54,9 @@ type Server struct {
 	readyChecked map[string]time.Time // when readyImages was last confirmed against podman
 	imageUse     map[string]time.Time
 
-	upgrading bool   // a new binary is being swapped in: start nothing
-	retireErr string // set while workloads of another version couldn't be confirmed stopped
+	tokensLock func() // releases the lifetime lock on the tokens file
+	upgrading  bool   // a new binary is being swapped in: start nothing
+	retireErr  string // set while workloads of another version couldn't be confirmed stopped
 
 	whoisMu sync.Mutex
 	whois   map[string]whoisEntry
@@ -89,6 +91,13 @@ func New(cfg *Config, version string) (*Server, error) {
 	}
 	s.loadHistory()
 	s.loadImageUse()
+	// Held for the daemon's lifetime: `runner reset-pairing` resets the file directly only when
+	// no runner holds it.
+	if release, err := tryLock(s.tokensPath() + ".lock"); err != nil {
+		log.Printf("tokens file %s is locked by another runner process", s.tokensPath())
+	} else {
+		s.tokensLock = release // kept: the open file holds the lock (and must not be collected)
+	}
 	s.restore()
 	if err := s.reconcile(); err != nil {
 		log.Printf("startup: %v (admitting nothing until this succeeds)", err)
@@ -148,7 +157,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/data/{name}", s.handleDataPlan)
 	mux.HandleFunc("PUT /v1/data/{name}", s.handleDataUpload)
 	mux.HandleFunc("PUT /v1/admin/binary", s.handleUpgrade)
-	mux.HandleFunc("POST /v1/admin/reset-pairing", s.handleResetPairing)
+	mux.HandleFunc("POST /v1/admin/reset-pairing-checked", s.handleResetPairing)
 	mux.HandleFunc("POST /v1/admin/pair", s.handlePair)
 
 	handler := s.auth(mux)
@@ -440,7 +449,7 @@ func NewPairCode(tokensFile string) (string, error) {
 func checkClientProto(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/status", "/v1/admin/pair", "/v1/admin/binary", "/v1/admin/reset-pairing":
+		case "/v1/status", "/v1/admin/pair", "/v1/admin/binary", "/v1/admin/reset-pairing-checked":
 		default:
 			if got := r.Header.Get(api.ProtoHeader); got != fmt.Sprint(api.Proto) {
 				if got == "" {
@@ -956,6 +965,13 @@ func ResetPairingLocal(tokensFile string) (string, error) {
 	// any other failure leaves everything as it was.
 	conn, err := net.DialTimeout("unix", unixSocketPath(), 2*time.Second)
 	if err != nil {
+		// Nothing on the socket. A runner serving this tokens file anyway (TCP only) holds its
+		// lock; only without one is the file ours to reset.
+		release, lerr := tryLock(tokensFile + ".lock")
+		if lerr != nil {
+			return "", fmt.Errorf("a runner is using %s but not answering on its local socket; stop it (systemctl --user stop offload-runner) and reset again", tokensFile)
+		}
+		defer release()
 		return ResetPairing(tokensFile)
 	}
 	c := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
@@ -969,7 +985,7 @@ func ResetPairingLocal(tokensFile string) (string, error) {
 			return d.Dial("unix", unixSocketPath())
 		}}}
 	body, _ := json.Marshal(map[string]string{"tokens": tokensFile})
-	resp, err := c.Post("http://local/v1/admin/reset-pairing", "application/json", bytes.NewReader(body))
+	resp, err := c.Post("http://local/v1/admin/reset-pairing-checked", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("the runner is running but didn't answer the reset (nothing changed?): %w", err)
 	}
@@ -979,4 +995,20 @@ func ResetPairingLocal(tokensFile string) (string, error) {
 		return "", fmt.Errorf("runner refused the reset: %s %s", resp.Status, out.Error)
 	}
 	return out.Code, nil
+}
+
+// tryLock takes an exclusive lock on path without waiting.
+func tryLock(path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }

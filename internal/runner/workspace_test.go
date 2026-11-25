@@ -5,11 +5,13 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -401,5 +403,30 @@ func TestFileBecomesDirectoryIsNotLeftDirty(t *testing.T) {
 	}
 	if d := sl.load().Dirty; len(d) != 0 {
 		t.Fatalf("left dirty: %v", d)
+	}
+}
+
+func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
+	dir := t.TempDir()
+	if out, err := exec.Command("git", "-C", dir, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	write := func(p, c string) {
+		os.MkdirAll(filepath.Dir(filepath.Join(dir, p)), 0o755)
+		os.WriteFile(filepath.Join(dir, p), []byte(c), 0o644)
+	}
+	write(".gitignore", "target/\n")
+	write("main.go", "package main")
+	write("gen.go", "package main // generated on the runner by an earlier job")
+	write("target/out", "build output")
+	s := &Server{cfg: &Config{}}
+	s.pruneUntracked(context.Background(), &slot{Dir: dir}, []api.FileEntry{{Path: ".gitignore"}, {Path: "main.go"}})
+	if _, err := os.Stat(filepath.Join(dir, "gen.go")); !os.IsNotExist(err) {
+		t.Fatal("runner-created source survived")
+	}
+	for _, p := range []string{"main.go", "target/out"} {
+		if _, err := os.Stat(filepath.Join(dir, p)); err != nil {
+			t.Fatalf("%s removed", p)
+		}
 	}
 }
