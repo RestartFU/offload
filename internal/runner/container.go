@@ -580,7 +580,7 @@ func (s *Server) cacheMounts() []string {
 // other repositories never do. CARGO_HOME itself is not shared, so a job's cargo config or
 // credentials never reach another. npm's cache holds runnable tool trees (npx), so it is scoped
 // too. scope "" (no workspace) gets no persistent caches at all.
-func (s *Server) workloadMounts(scope string) []string {
+func (s *Server) workloadMounts(scope, rustupLayer string) []string {
 
 	// Repository caches live in cache/scoped/<key> (aged out by GC), session caches in
 	// cache/sessions/<profile> (scope "session:<profile>"): distinct trees, no name games.
@@ -593,11 +593,11 @@ func (s *Server) workloadMounts(scope string) []string {
 	var out []string
 	for name, dst := range toolchainDirs {
 		_ = os.MkdirAll(s.cacheDir(name), 0o755)
-		if name == "rustup" && base != "" {
-			// Read-only shared toolchains under a writable layer of this repository's own, so a
-			// project's rust-toolchain.toml (a pinned nightly) can install what it needs
-			// without touching what other repositories run.
-			upper, work := filepath.Join(base, "rustup-upper"), filepath.Join(base, "rustup-work")
+		if name == "rustup" && rustupLayer != "" {
+			// Read-only shared toolchains under a writable layer of this workload's own (per
+			// workspace slot, or per session), so a project's rust-toolchain.toml (a pinned
+			// nightly) can install what it needs without touching what anyone else runs.
+			upper, work := filepath.Join(rustupLayer, "upper"), filepath.Join(rustupLayer, "work")
 			_ = os.MkdirAll(upper, 0o755)
 			_ = os.MkdirAll(work, 0o755)
 			out = append(out, s.cacheDir(name)+":"+dst+":O,upperdir="+upper+",workdir="+work)
@@ -724,6 +724,7 @@ type runSpec struct {
 	NestedSandbox                       bool   // flatpak/bubblewrap inside: unmask /proc, no seccomp filter
 	ClientNet                           bool   // network through the client (own netns + TUN + user-space stack)
 	CacheScope                          string // which scoped caches to mount (see workloadMounts)
+	RustupLayer                         string // this workload's own writable layer over rustup ("" = read-only)
 	DNSSearch                           []string
 	Argv                                []string
 }
@@ -904,7 +905,7 @@ func (s *Server) podmanRun(r runSpec) []string {
 		}
 	}
 	a = append(a, "-v", s.self+":"+s.self+":ro")
-	for _, m := range append(s.workloadMounts(r.CacheScope), r.Volumes...) {
+	for _, m := range append(s.workloadMounts(r.CacheScope, r.RustupLayer), r.Volumes...) {
 		a = append(a, "-v", m)
 	}
 	for _, d := range r.Devices {
@@ -951,6 +952,11 @@ func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets s
 	}
 	r.ClientNet, r.DNSSearch = j.Spec.Network == "client", j.Spec.DNSSearch
 	r.CacheScope = j.Spec.WorkspaceKey
+	if j.slot != nil && j.Spec.WorkspaceKey != "" {
+		// One overlay layer per workspace slot: an overlay's upper directory can't be shared by
+		// two mounts, and a slot runs one job at a time.
+		r.RustupLayer = s.cacheDir("scoped", j.Spec.WorkspaceKey, "rustup", hash12(j.slot.Dir))
+	}
 	return s.podmanRun(r)
 }
 

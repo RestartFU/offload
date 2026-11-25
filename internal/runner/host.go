@@ -287,11 +287,14 @@ type stopRecord struct {
 	Result string `json:"result"`
 	Code   string `json:"code,omitempty"`
 	Status string `json:"status,omitempty"`
+	// OOM: the unit's cgroup counted OOM kills (the hook runs in it, before it's removed). With
+	// OOMPolicy=continue systemd keeps the result "signal" for those, so this is what tells.
+	OOM bool `json:"oom,omitempty"`
 }
 
 // RunStopped is "offload runner stopped PATH", the ExecStopPost hook of job and session units.
 func RunStopped(path string) int {
-	_ = writeFileJSON(path, stopRecord{Result: os.Getenv("SERVICE_RESULT"), Code: os.Getenv("EXIT_CODE"), Status: os.Getenv("EXIT_STATUS")})
+	_ = writeFileJSON(path, stopRecord{Result: os.Getenv("SERVICE_RESULT"), Code: os.Getenv("EXIT_CODE"), Status: os.Getenv("EXIT_STATUS"), OOM: oomKilled()})
 	return 0
 }
 
@@ -299,7 +302,7 @@ func RunStopped(path string) int {
 func killedReason(dir string, mem int64) string {
 	var rec stopRecord
 	if b, err := os.ReadFile(filepath.Join(dir, "stop.json")); err == nil && json.Unmarshal(b, &rec) == nil {
-		if rec.Result == "oom-kill" {
+		if rec.Result == "oom-kill" || rec.OOM {
 			return fmt.Sprintf("out of memory (limit %s; the whole unit was killed, by its limit or host memory pressure)", units.FormatSize(mem))
 		}
 		if rec.Result != "" && rec.Result != "success" {

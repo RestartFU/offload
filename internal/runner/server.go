@@ -158,6 +158,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/data/{name}", s.handleDataPlan)
 	mux.HandleFunc("PUT /v1/data/{name}", s.handleDataUpload)
 	mux.HandleFunc("PUT /v1/admin/binary", s.handleUpgrade)
+	mux.HandleFunc("POST /v1/estimate", s.handleEstimate)
 	mux.HandleFunc("POST /v1/admin/reset-pairing-checked", s.handleResetPairing)
 	mux.HandleFunc("POST /v1/admin/pair", s.handlePair)
 

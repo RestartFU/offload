@@ -477,6 +477,32 @@ func pruneNonGit(sl *slot, manifest []api.FileEntry) {
 	}
 }
 
+// handleEstimate answers what a job would get here (profile defaults, --cpu-max, learned
+// memory), so the client compares runners as they will actually treat the job.
+func (s *Server) handleEstimate(w http.ResponseWriter, r *http.Request) {
+	var spec api.JobSpec
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&spec); err != nil {
+		writeErr(w, 400, "bad job spec: "+err.Error())
+		return
+	}
+	profiles := s.cfg.loadProfiles()
+	prof := profiles[spec.Profile]
+	if spec.Profile == "" {
+		if prof = matchProfile(profiles, spec.Argv); prof != nil {
+			spec.Profile = prof.Name
+		}
+	}
+	res := s.cfg.effective(spec.Resources, prof)
+	if spec.Resources.Mem == 0 {
+		s.mu.Lock()
+		if m := s.suggestMemLocked(spec); m > 0 {
+			res.Mem = m
+		}
+		s.mu.Unlock()
+	}
+	writeJSON(w, res)
+}
+
 // note appends an offload message to the job's stderr, so the caller sees it in order.
 func (s *Server) note(j *job, msg string) {
 	f, err := os.OpenFile(filepath.Join(j.dir, "stderr.log"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)

@@ -345,7 +345,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		command = s.podmanRun(runSpec{Name: "offload-" + se.ID, Image: image, Workdir: filepath.Join(se.dir, "tmp"), CPUs: allowed,
 			Secrets: secrets, Mem: res.Mem, Env: cenv, Interactive: true, Argv: prof.Command, ClientNet: prof.Network == "client", DNSSearch: dnsSearch,
 			Same: same, Volumes: volumes, Devices: devices, NestedSandbox: prof.NestedSandbox,
-			CacheScope: "session:" + prof.Name})
+			CacheScope: "session:" + prof.Name, RustupLayer: filepath.Join(se.dir, "rustup")})
 		unitEnv = map[string]string{}
 		s.touchImage(image)
 	} else if secrets != "" {

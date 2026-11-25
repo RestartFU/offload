@@ -1288,6 +1288,16 @@ func firstN(s []string, n int) []string {
 }
 
 // fetchArtifacts downloads and unpacks a job's artifacts into dest.
+// underRelocated reports whether rel lies in (or is) one of dirs.
+func underRelocated(rel string, dirs map[string]bool) bool {
+	for d := rel; d != "." && d != "/" && d != ""; d = path.Dir(d) {
+		if dirs[d] {
+			return true
+		}
+	}
+	return false
+}
+
 // deletedHere reports whether a directory above rel (or rel itself, for a directory entry) was
 // there when the snapshot was taken and is gone now.
 func deletedHere(tree *os.Root, rel string, isDir bool, snap map[string]fileSig) bool {
@@ -1358,6 +1368,7 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string, snap map[stri
 	defer tree.Close()
 	tr := tar.NewReader(gz)
 	n := 0
+	relocDirs := map[string]bool{} // directories whose entries go to .offload-incoming/<job>/
 	for {
 		hd, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -1373,8 +1384,19 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string, snap map[stri
 		// A directory deleted here while the job ran stays deleted: what the job put under it
 		// goes to .offload-incoming/<job>/ instead of recreating it.
 		relocated := false
-		if snap != nil && deletedHere(tree, name, hd.Typeflag == tar.TypeDir, snap) {
+		orig := name
+		switch {
+		case underRelocated(orig, relocDirs): // inside a directory already set aside
+			name, relocated = path.Join(incomingDir, id, orig), true
+		case snap != nil && deletedHere(tree, name, hd.Typeflag == tar.TypeDir, snap):
 			name, relocated = path.Join(incomingDir, id, name), true
+		case hd.Typeflag == tar.TypeDir:
+			// The directory exists here as something else (a symlink to an external disk): it
+			// stays, and this whole subtree goes aside.
+			if fi, err := tree.Lstat(name); err == nil && !fi.IsDir() {
+				relocDirs[orig] = true
+				name, relocated = path.Join(incomingDir, id, orig), true
+			}
 		}
 		// Every entry type goes through real directories only: an existing symlink in the
 		// destination (even one pointing inside it) must not alias another path. A parent that

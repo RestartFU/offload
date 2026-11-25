@@ -76,9 +76,10 @@ type Host struct {
 	Priority int
 	Status   *api.Status
 	http     *http.Client
-	sock     string // unix socket path for a local runner
-	derived  bool   // Token is the one stored for this URL by `host pair`, not configured
-	named    bool   // Name comes from client.toml
+	sock     string         // unix socket path for a local runner
+	derived  bool           // Token is the one stored for this URL by `host pair`, not configured
+	named    bool           // Name comes from client.toml
+	estimate *api.Resources // what this runner said the job at hand would get (see estimate)
 }
 
 // dialRaw opens a plain connection to the runner (for stream upgrades).
@@ -524,7 +525,32 @@ func PickFor(hosts []*Host, spec api.JobSpec, kind string) (*Host, error) {
 	if len(ok) == 0 && len(hosts) > 0 {
 		return nil, fmt.Errorf("no runner fits: %s", strings.Join(why, "; "))
 	}
+	if kind == "job" && len(ok) > 1 {
+		estimate(ok, spec)
+	}
 	return pick(ok, spec.Resources, spec.Profile, spec.WorkspaceKey, kind, spec.Argv)
+}
+
+// estimate asks each candidate what the job would get there (including memory it learned from
+// earlier runs of this command in this workspace), in parallel and briefly; pick then scores
+// with that instead of guessing from defaults.
+func estimate(hosts []*Host, spec api.JobSpec) {
+	q := spec
+	q.Manifest, q.Secrets, q.SecretFiles = nil, nil, nil
+	var wg sync.WaitGroup
+	for _, h := range hosts {
+		wg.Add(1)
+		go func(h *Host) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			var r api.Resources
+			if err := h.do(ctx, "POST", "/v1/estimate", q, &r); err == nil && r.Mem > 0 {
+				h.estimate = &r
+			}
+		}(h)
+	}
+	wg.Wait()
 }
 
 // eligible keeps the runners that can run spec at all (platform, container runtime), with the
@@ -574,6 +600,14 @@ func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []s
 		profile := profile
 		if profile == "" && len(argv) > 0 {
 			profile = api.MatchProfile(st.Profiles, argv)
+		}
+		if h.estimate != nil { // the runner's own answer beats any guess from its defaults
+			if r.CPU == 0 {
+				r.CPU = h.estimate.CPU
+			}
+			if r.Mem == 0 {
+				r.Mem = h.estimate.Mem
+			}
 		}
 		if p, ok := st.Profiles[profile]; profile != "" {
 			if !ok || (kind != "" && p.Kind != kind) {
