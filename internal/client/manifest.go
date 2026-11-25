@@ -32,6 +32,7 @@ type Workspace struct {
 	Manifest []api.FileEntry
 	Git      *api.GitRef // HEAD and branch, nil outside git or before the first commit
 	GitTree  bool        // the manifest is git's view (tracked + untracked, minus ignored)
+	Submods  bool        // has submodules (synced as files; their own .git isn't recreated)
 }
 
 // skipDirs are never synced when the tree is not a git repository.
@@ -69,6 +70,9 @@ func LoadWorkspace(cwd string) (*Workspace, error) {
 		files, err = gitFiles(ws.Root)
 		if err != nil {
 			return nil, err
+		}
+		if staged, err := git(ws.Root, "ls-files", "--stage"); err == nil {
+			ws.Submods = strings.Contains("\n"+staged, "\n160000 ")
 		}
 	} else {
 		err := filepath.WalkDir(cwd, func(p string, d fs.DirEntry, err error) error {

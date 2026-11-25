@@ -143,6 +143,9 @@ func Run(o RunOptions) (int, error) {
 		}
 		if !o.NoGit {
 			spec.Git = ws.Git
+			if ws.Submods && ws.Git != nil {
+				logf(o.Quiet, "note: submodules are synced as plain files; git commands inside them see the top-level repository")
+			}
 		}
 		if d := time.Since(start); d > 2*time.Second {
 			logf(o.Quiet, "scanned %d files in %s", len(ws.Manifest), d.Round(100*time.Millisecond))

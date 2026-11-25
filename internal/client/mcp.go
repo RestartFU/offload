@@ -123,10 +123,11 @@ pick:
 		} else {
 			h, err = Pick(hosts, res, profile, "", "session")
 		}
-		if err != nil && len(excluded) == 0 && !anyBusy(hosts) && lastRefusal != "" {
+		busy := anyBusy(candidates(hosts, on, profile, sc != nil))
+		if err != nil && len(excluded) == 0 && !busy && lastRefusal != "" {
 			return fmt.Errorf("%w (and %s)", err, lastRefusal)
 		}
-		if err != nil && (len(excluded) > 0 || anyBusy(hosts)) {
+		if err != nil && (len(excluded) > 0 || busy) {
 			// Every runner that can take it is full or under memory pressure right now: wait,
 			// then a fresh round.
 			fmt.Fprintf(os.Stderr, "offload: every runner that fits is full right now; waiting\n")
@@ -274,6 +275,27 @@ pick:
 	}
 }
 
+// candidates are the runners a launch could use at all: the pinned one, or those with the
+// profile (client-defined sessions: any).
+func candidates(hosts []*Host, on, profile string, defined bool) []*Host {
+	var out []*Host
+	for _, h := range hosts {
+		switch {
+		case on != "":
+			if h.Name == on {
+				out = append(out, h)
+			}
+		case defined:
+			out = append(out, h)
+		default:
+			if _, ok := h.Status.Profiles[profile]; ok {
+				out = append(out, h)
+			}
+		}
+	}
+	return out
+}
+
 // anyBusy reports whether a paired runner is temporarily refusing work (below its memory
 // reserve, upgrading, reconciling): worth waiting for rather than giving up.
 func anyBusy(hosts []*Host) bool {
@@ -382,7 +404,7 @@ func sendStdin(ctx context.Context, h *Host, id string, seq int64, line []byte) 
 			return nil
 		}
 		var ae *APIError
-		if errors.As(err, &ae) && (ae.Code == 404 || ae.Code == 410 || ae.Code == 412) {
+		if errors.As(err, &ae) && (ae.Code == 403 || ae.Code == 404 || ae.Code == 410 || ae.Code == 412) {
 			return fmt.Errorf("session ended: %s", ae.Msg)
 		}
 		if ctx.Err() != nil || attempt > 120 {
@@ -438,8 +460,8 @@ func pumpOut(ctx context.Context, h *Host, id, stream string, w io.Writer) error
 		if errors.As(err, &ae) && ae.Code == 404 {
 			return fmt.Errorf("session %s is gone", id)
 		}
-		if errors.As(err, &ae) && ae.Code == 412 { // the runner was upgraded to another protocol
-			return fmt.Errorf("%s: %s", h.Name, ae.Msg)
+		if errors.As(err, &ae) && (ae.Code == 412 || ae.Code == 403) { // upgraded, or pairing reset
+			return fmt.Errorf("%s: %s (start the MCP server again)", h.Name, ae.Msg)
 		}
 		select {
 		case <-ctx.Done():

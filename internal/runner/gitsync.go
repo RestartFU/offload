@@ -21,10 +21,18 @@ import (
 // only commits the store is missing, as a git bundle, so the runner never needs credentials.
 
 var shaRE = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
-var branchRE = regexp.MustCompile(`^[A-Za-z0-9._/@+-]{1,200}$`)
 
 func validGitRef(g *api.GitRef) bool {
-	return shaRE.MatchString(g.Head) && (g.Branch == "" || (branchRE.MatchString(g.Branch) && !strings.Contains(g.Branch, "..")))
+	return shaRE.MatchString(g.Head) && (g.Branch == "" || validBranch(g.Branch))
+}
+
+// validBranch applies git's own ref-name rules (feature/café is fine, "a..b" isn't).
+func validBranch(b string) bool {
+	if len(b) > 255 || strings.HasPrefix(b, "-") {
+		return false
+	}
+	_, err := gitCmd(".", "check-ref-format", "refs/heads/"+b)
+	return err == nil
 }
 
 func (s *Server) sharedGit(key string) string {

@@ -813,6 +813,10 @@ func (s *Server) sessionImageLocked(def *api.EnvDef) (string, bool, error) {
 // own), but parallelism, relays, git config, profile settings and the job's own variables.
 func (s *Server) containerEnv(prof *Profile, ncpu int, j *job) map[string]string {
 	env := parallelEnv(ncpu)
+	// The shared toolchain bin directories are read-only: `go install` and `cargo install` put
+	// what a job installs in the container's own /usr/local/bin (on PATH, gone with it).
+	env["GOBIN"] = "/usr/local/bin"
+	env["CARGO_INSTALL_ROOT"] = "/usr/local"
 	if prof != nil {
 		for k, v := range prof.Env {
 			if k != "PATH" && k != "HOME" {
@@ -926,8 +930,8 @@ func (s *Server) gcContainersLocked() {
 		if tag == baseTag() || time.Since(at) < s.cfg.imageRetain || live[tag] {
 			continue
 		}
-		if _, err := podman(context.Background(), "rmi", tag); err != nil && imageExists(tag) {
-			continue // still there (in use?): keep its record, try again next time
+		if _, err := podman(context.Background(), "rmi", "--ignore", tag); err != nil {
+			continue // not removed (in use, or podman trouble): keep its record, retry next time
 		}
 		log.Printf("gc: removed image %s (unused since %s)", tag, at.Format(time.DateTime))
 		delete(s.imageUse, tag)

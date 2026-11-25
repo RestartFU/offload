@@ -290,7 +290,7 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		dirty[p] = true
 	}
 	for p, e := range want {
-		if old, had := rec.Files[p]; !had || old.Link != e.Link || old.Mode != e.Mode {
+		if old, had := rec.Files[p]; !had || old.Link != e.Link || (e.Link == "" && old.Mode != e.Mode) { // a link's mode means nothing
 			dirty[p] = true
 		}
 	}
