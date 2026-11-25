@@ -18,11 +18,15 @@ import (
 // MCP starts a session from a runner profile and bridges this process's stdio to it, so an MCP
 // client can use `offload mcp <profile>` as a stdio server. Stdin lines are sent in order with
 // sequence numbers (safe to retry); stdout resumes from the last byte after reconnects.
-func MCP(profile, on string, res api.Resources) error {
+func MCP(profile, on string, res api.Resources, with, secretArgs []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 	cfg, err := LoadConfig()
 	if err != nil {
+		return err
+	}
+	spec := api.SessionSpec{Profile: profile, Resources: res, Client: clientLabel()}
+	if spec.Secrets, spec.SecretFiles, err = resolveSecrets(cfg, with, secretArgs, true, true); err != nil {
 		return err
 	}
 	hosts := Discover(ctx, cfg)
@@ -36,7 +40,7 @@ func MCP(profile, on string, res api.Resources) error {
 		return err
 	}
 	var se api.Session
-	if err := h.do(ctx, "POST", "/v1/sessions", api.SessionSpec{Profile: profile, Resources: res, Client: clientLabel()}, &se); err != nil {
+	if err := h.do(ctx, "POST", "/v1/sessions", spec, &se); err != nil {
 		return fmt.Errorf("%s: %w", h.Name, err)
 	}
 	fmt.Fprintf(os.Stderr, "offload: session %s:%s (%s)\n", h.Name, se.ID, profile)

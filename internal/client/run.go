@@ -91,11 +91,14 @@ func Run(o RunOptions) (int, error) {
 	}
 	spec := api.JobSpec{Argv: o.Argv, Env: o.Env, Profile: o.Profile, Resources: o.Resources,
 		Artifacts: o.Artifacts, Fresh: o.Fresh, Ephemeral: o.Ephemeral, Client: clientLabel(), Detached: o.Detach}
+	// --no-credentials drops the relays and auto sets; explicit --with/--secret still apply.
 	if !o.NoCreds {
 		spec.Relay = cfg.relays()
-		if spec.Secrets, spec.SecretFiles, err = resolveSecrets(cfg, o.With, o.Secrets, o.Quiet); err != nil {
-			return 1, err
-		}
+		cwd, _ := os.Getwd()
+		spec.GitConfig = mirroredGitConfig(cfg, cwd)
+	}
+	if spec.Secrets, spec.SecretFiles, err = resolveSecrets(cfg, o.With, o.Secrets, !o.NoCreds, o.Quiet); err != nil {
+		return 1, err
 	}
 	var ws *Workspace
 	if !o.NoSync {

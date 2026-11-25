@@ -24,6 +24,7 @@ import (
 //	[credentials]
 //	relay = ["ssh-agent", "git"]   # answered from this machine, only while a client is attached
 //	git_hosts = ["github.com"]     # hosts git may get credentials for (empty = any)
+//	git_config = ["url.*", "user.name", "user.email"]   # mirrored into jobs (default)
 //
 //	[credentials.sets.github]
 //	auto = true                    # attach to every job; no flags needed
@@ -34,9 +35,10 @@ import (
 //
 // Values: "cmd:<shell command>" (its stdout), "env:<NAME>", "file:<path>", or a literal.
 type CredentialsConfig struct {
-	Relay    *[]string                `toml:"relay"`
-	GitHosts []string                 `toml:"git_hosts"`
-	Sets     map[string]CredentialSet `toml:"sets"`
+	Relay     *[]string                `toml:"relay"`
+	GitHosts  []string                 `toml:"git_hosts"`
+	GitConfig *[]string                `toml:"git_config"` // client git config keys mirrored into jobs (globs)
+	Sets      map[string]CredentialSet `toml:"sets"`
 }
 
 // CredentialSet is a named group of temporary secrets. Auto sets go with every job; others only
@@ -52,6 +54,45 @@ func (c *Config) relays() []string {
 		return *c.Credentials.Relay
 	}
 	return []string{"ssh-agent", "git"}
+}
+
+// mirroredGitConfig reads the client's git config keys matching credentials.git_config, so that
+// URL rewrites (e.g. https -> ssh) and identity behave on the runner as they do here.
+func mirroredGitConfig(cfg *Config, dir string) [][2]string {
+	pats := []string{"url.*", "user.name", "user.email"}
+	if cfg.Credentials.GitConfig != nil {
+		pats = *cfg.Credentials.GitConfig
+	}
+	if len(pats) == 0 {
+		return nil
+	}
+	out, err := exec.Command("git", "-C", dir, "config", "--null", "--list").Output()
+	if err != nil {
+		return nil
+	}
+	var kv [][2]string
+	for _, entry := range strings.Split(string(out), "\x00") {
+		k, v, _ := strings.Cut(entry, "\n")
+		if k == "" {
+			continue
+		}
+		for _, p := range pats {
+			if configKeyMatch(strings.ToLower(p), k) {
+				kv = append(kv, [2]string{k, v})
+				break
+			}
+		}
+	}
+	return kv
+}
+
+// configKeyMatch matches a git config key against "exact.key" or "prefix.*" (where * spans
+// anything, including the dots and slashes inside URL subsections).
+func configKeyMatch(pattern, key string) bool {
+	if prefix, ok := strings.CutSuffix(pattern, "*"); ok {
+		return strings.HasPrefix(key, prefix)
+	}
+	return pattern == key
 }
 
 func expand(p string) string {
@@ -105,15 +146,21 @@ func resolveSet(name string, set CredentialSet, env map[string]string, files map
 	return nil
 }
 
-// resolveSecrets builds a job's secrets from the auto sets, --with sets and --secret names.
-// An auto set that can't be resolved (say, gh isn't logged in) is skipped with a warning; an
-// explicitly requested one is an error.
-func resolveSecrets(cfg *Config, sets, names []string, quiet bool) (map[string]string, map[string][]byte, error) {
+// resolveSecrets collects a job's or session's secrets. Every secret is NAME = source, where a
+// source is "cmd:<shell>", "env:<VAR>", "file:<path>" or a literal; file secrets arrive on the
+// runner as a file whose path is put in NAME. They come from, in order:
+//
+//   - credential sets marked auto = true in client.toml (skipped with a warning if they fail);
+//   - sets named by --with or OFFLOAD_WITH=a,b;
+//   - OFFLOAD_SECRET_<NAME>=<source> and OFFLOAD_SECRET_FILE_<NAME>=<path> in the environment,
+//     so an MCP server entry's "env" block (or any wrapper) can configure them;
+//   - --secret NAME (copies $NAME) or --secret NAME=<source>.
+func resolveSecrets(cfg *Config, sets, args []string, withAuto, quiet bool) (map[string]string, map[string][]byte, error) {
 	env := map[string]string{}
 	files := map[string][]byte{}
 	var auto []string
 	for name, set := range cfg.Credentials.Sets {
-		if set.Auto {
+		if set.Auto && withAuto {
 			auto = append(auto, name)
 		}
 	}
@@ -131,6 +178,13 @@ func resolveSecrets(cfg *Config, sets, names []string, quiet bool) (map[string]s
 			files[k] = v
 		}
 	}
+	if w := os.Getenv("OFFLOAD_WITH"); w != "" {
+		for _, n := range strings.Split(w, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				sets = append(sets, n)
+			}
+		}
+	}
 	for _, name := range sets {
 		set, ok := cfg.Credentials.Sets[name]
 		if !ok {
@@ -145,12 +199,35 @@ func resolveSecrets(cfg *Config, sets, names []string, quiet bool) (map[string]s
 			return nil, nil, err
 		}
 	}
-	for _, n := range names {
-		v, ok := os.LookupEnv(n)
-		if !ok {
-			return nil, nil, fmt.Errorf("--secret %s: not set in this environment", n)
+	for _, kv := range os.Environ() {
+		k, v, _ := strings.Cut(kv, "=")
+		switch {
+		case strings.HasPrefix(k, "OFFLOAD_SECRET_FILE_"):
+			name := strings.TrimPrefix(k, "OFFLOAD_SECRET_FILE_")
+			b, err := os.ReadFile(expand(strings.TrimPrefix(v, "file:")))
+			if err != nil {
+				return nil, nil, fmt.Errorf("%s: %w", k, err)
+			}
+			files[name] = b
+		case strings.HasPrefix(k, "OFFLOAD_SECRET_"):
+			name := strings.TrimPrefix(k, "OFFLOAD_SECRET_")
+			val, err := resolveValue(v)
+			if err != nil {
+				return nil, nil, fmt.Errorf("%s: %w", k, err)
+			}
+			env[name] = val
 		}
-		env[n] = v
+	}
+	for _, a := range args {
+		name, src, hasSrc := strings.Cut(a, "=")
+		if !hasSrc {
+			src = "env:" + name
+		}
+		val, err := resolveValue(src)
+		if err != nil {
+			return nil, nil, fmt.Errorf("--secret %s: %w", name, err)
+		}
+		env[name] = val
 	}
 	return env, files, nil
 }
@@ -279,10 +356,16 @@ func gitCredentialFill(req []byte) []byte {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "credential", "fill")
 	cmd.Stdin = bytes.NewReader(req)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "GIT_ASKPASS=true", "SSH_ASKPASS=true")
+	var env []string
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "GIT_ASKPASS=") && !strings.HasPrefix(e, "SSH_ASKPASS=") {
+			env = append(env, e)
+		}
+	}
+	cmd.Env = append(env, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
 	out, err := cmd.Output()
-	if err != nil {
-		return nil
+	if err != nil || credentialField(out, "password") == "" {
+		return nil // nothing usable; never lend an empty login
 	}
 	return out
 }

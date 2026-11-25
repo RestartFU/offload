@@ -204,7 +204,10 @@ func cgroupInt(name string) int64 {
 
 // RunPipe is "offload runner pipe": run argv with stdin fed from the unix socket sock and stdout
 // appended to <dir>/stdout. Any number of connections may write to the socket over time.
-func RunPipe(dir, sock string, argv []string) int {
+func RunPipe(dir, sock, secrets string, argv []string) int {
+	if secrets != "" {
+		loadSecrets(secrets)
+	}
 	fail := func(err error) int {
 		fmt.Fprintf(os.Stderr, "offload: %v\n", err)
 		_ = writeFileJSON(filepath.Join(dir, "exit.json"), exitRecord{Code: 1, Error: err.Error()})

@@ -130,9 +130,17 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		_ = os.WriteFile(filepath.Join(se.dir, "cpus"), []byte(allowed), 0o600)
 	}
 	home, _ := os.UserHomeDir()
+	pipe := []string{s.self, "runner", "pipe", "--dir", se.dir, "--sock", sessionSock(se.ID)}
+	if dir, err := writeSecrets(se.ID, spec.Secrets, spec.SecretFiles); err != nil {
+		s.releaseCPUsLocked(se.cpus)
+		writeErr(w, 500, "secrets: "+err.Error())
+		return
+	} else if dir != "" {
+		pipe = append(pipe, "--secrets", dir)
+	}
 	u := unitSpec{
 		Name: se.Unit, Slice: s.cfg.Slice, Dir: home, Env: env,
-		Argv:      append([]string{s.self, "runner", "pipe", "--dir", se.dir, "--sock", sessionSock(se.ID), "--"}, prof.Command...),
+		Argv:      append(append(pipe, "--"), prof.Command...),
 		CPUWeight: cpuWeight(res.CPU), CPUQuotaPct: int(math.Ceil(res.CPUMax * 100)),
 		AllowedCPUs: allowed, MemoryMax: res.Mem, OOMScoreAdj: s.cfg.Policy.OOMScoreAdj,
 		Stdout: filepath.Join(se.dir, "stderr.log"),
@@ -142,6 +150,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := startUnit(contextBG(), u); err != nil {
 		s.releaseCPUsLocked(se.cpus)
+		_ = os.RemoveAll(secretsDir(se.ID))
 		_ = os.RemoveAll(se.dir)
 		writeErr(w, 500, err.Error())
 		return
@@ -335,6 +344,7 @@ func (s *Server) checkSessions() {
 func (s *Server) finishSessionLocked(se *session, code *int, reason string) {
 	now := time.Now()
 	se.State, se.ExitCode, se.Reason, se.FinishedAt = api.StateExited, code, reason, &now
+	_ = os.RemoveAll(secretsDir(se.ID))
 	s.releaseCPUsLocked(se.cpus)
 	se.cpus = nil
 	go func() {

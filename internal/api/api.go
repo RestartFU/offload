@@ -59,6 +59,9 @@ type JobSpec struct {
 	// file's path) exist only while the job runs, in tmpfs. The runner never stores them.
 	Secrets     map[string]string `json:"secrets,omitempty"`
 	SecretFiles map[string][]byte `json:"secret_files,omitempty"`
+	// GitConfig is git configuration mirrored from the client (URL rewrites, identity), applied
+	// to the job through GIT_CONFIG_* so git on the runner behaves like git on the client.
+	GitConfig [][2]string `json:"git_config,omitempty"`
 	// Detached means no client will stay attached, so relay requests fail at once.
 	Detached bool `json:"detached,omitempty"`
 	// SecretNames records which secrets a job got (names only); set by the runner.
@@ -130,9 +133,11 @@ type ChangedFile struct {
 
 // SessionSpec is the body of POST /v1/sessions.
 type SessionSpec struct {
-	Profile   string    `json:"profile"`
-	Resources Resources `json:"resources"`
-	Client    string    `json:"client,omitempty"`
+	Profile     string            `json:"profile"`
+	Resources   Resources         `json:"resources"`
+	Client      string            `json:"client,omitempty"`
+	Secrets     map[string]string `json:"secrets,omitempty"` // as in JobSpec
+	SecretFiles map[string][]byte `json:"secret_files,omitempty"`
 }
 
 // Session is a long-lived process (usually an MCP server) whose stdio is bridged over HTTP.

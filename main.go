@@ -54,8 +54,8 @@ Client:
       --mem SIZE       memory limit (8G)        --env K=V        extra environment (repeatable)
       --get PATH       bring PATH back after the job (repeatable)
       --with SET       add a credential set from client.toml (auto sets are always added)
-      --secret NAME    pass this local env var to the job as a secret
-      --no-credentials no ssh-agent/git relays and no secrets
+      --secret NAME[=SRC]  secret from $NAME, or SRC = cmd:…, env:…, file:…, literal
+      --no-credentials no ssh-agent/git relays and no auto credential sets
       --no-sync        don't upload the current directory
       --no-git         don't give the runner the repository's git history
       --no-write-back  don't copy files the job edited (cargo fmt, lockfiles…) back here
@@ -68,7 +68,11 @@ Client:
   offload get ID [DIR]               download a job's --get artifacts
   offload ps [--all]                 jobs and sessions on every runner
   offload hosts                      runners, capacity and load
-  offload mcp PROFILE [--on NAME]    stdio MCP server backed by a runner session
+  offload mcp PROFILE [--on NAME] [--with SET] [--secret NAME[=SRC]]
+                                     stdio MCP server backed by a runner session
+
+Secrets can also come from the environment (e.g. an MCP entry's "env"):
+  OFFLOAD_SECRET_<NAME>=<source>   OFFLOAD_SECRET_FILE_<NAME>=<path>   OFFLOAD_WITH=set1,set2
   offload host upgrade NAME|--all    push this binary to runners
 
 Runner (on the server):
@@ -233,12 +237,15 @@ func cmdMCP(args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	on := fs.String("on", "", "runner name")
 	res := resourceFlags(fs)
+	var with, secrets multi
+	fs.Var(&with, "with", "credential set")
+	fs.Var(&secrets, "secret", "NAME or NAME=SOURCE")
 	_ = fs.Parse(args[1:])
 	r, err := res()
 	if err != nil {
 		return err
 	}
-	return client.MCP(profile, *on, r)
+	return client.MCP(profile, *on, r, with, secrets)
 }
 
 func cmdHost(args []string) error {
@@ -312,12 +319,13 @@ func cmdRunner(args []string) (int, error) {
 		fs := flag.NewFlagSet("pipe", flag.ExitOnError)
 		dir := fs.String("dir", "", "")
 		sock := fs.String("sock", "", "")
+		secrets := fs.String("secrets", "", "")
 		fl, rest := splitArgs(args[1:])
 		_ = fs.Parse(fl)
 		if *dir == "" || *sock == "" || len(rest) == 0 {
 			die("internal: runner pipe --dir DIR --sock PATH -- CMD")
 		}
-		return runner.RunPipe(*dir, *sock, rest), nil
+		return runner.RunPipe(*dir, *sock, *secrets, rest), nil
 	}
 	die("usage: offload runner serve|install|install-system")
 	return 2, nil

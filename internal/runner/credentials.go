@@ -167,42 +167,59 @@ func (s *Server) setupCredentials(j *job, env map[string]string) string {
 					s.note(j, "git credential relay needs the runner's unix socket (listen = [..., \"unix\"])")
 					continue
 				}
-				env["GIT_CONFIG_COUNT"] = "2"
-				env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"] = "credential.helper", "" // drop the runner's own helpers
-				env["GIT_CONFIG_KEY_1"], env["GIT_CONFIG_VALUE_1"] = "credential.helper", "!'"+s.self+"' runner credential"
+				addGitConfig(env, "credential.helper", "") // drop the runner's own helpers
+				addGitConfig(env, "credential.helper", "!'"+s.self+"' runner credential")
 				env["OFFLOAD_RUNNER_SOCK"] = unixSocketPath()
 			}
 		}
 	}
-	if len(j.secrets) == 0 && len(j.secretFiles) == 0 {
-		return ""
+	for _, kv := range j.Spec.GitConfig {
+		addGitConfig(env, kv[0], kv[1])
 	}
-	dir := secretsDir(j.ID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	dir, err := writeSecrets(j.ID, j.secrets, j.secretFiles)
+	if err != nil {
 		s.note(j, "secrets unavailable: "+err.Error())
-		return ""
-	}
-	vars := map[string]string{}
-	for k, v := range j.secrets {
-		vars[k] = v
-	}
-	i := 0
-	for k, content := range j.secretFiles {
-		p := filepath.Join(dir, fmt.Sprintf("file-%d", i))
-		i++
-		if err := os.WriteFile(p, content, 0o600); err != nil {
-			s.note(j, "secret file "+k+": "+err.Error())
-			continue
-		}
-		vars[k] = p
-	}
-	b, _ := json.Marshal(vars)
-	if err := os.WriteFile(filepath.Join(dir, "env.json"), b, 0o600); err != nil {
-		s.note(j, "secrets unavailable: "+err.Error())
-		return ""
 	}
 	j.secrets, j.secretFiles = nil, nil // from here on they only exist in the tmpfs directory
 	return dir
+}
+
+// writeSecrets puts secrets in a tmpfs directory for the unit wrapper to load ("" if none).
+func writeSecrets(id string, vars map[string]string, files map[string][]byte) (string, error) {
+	if len(vars) == 0 && len(files) == 0 {
+		return "", nil
+	}
+	dir := secretsDir(id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	all := map[string]string{}
+	for k, v := range vars {
+		all[k] = v
+	}
+	i := 0
+	for k, content := range files {
+		p := filepath.Join(dir, fmt.Sprintf("file-%d", i))
+		i++
+		if err := os.WriteFile(p, content, 0o600); err != nil {
+			return "", fmt.Errorf("secret file %s: %w", k, err)
+		}
+		all[k] = p
+	}
+	b, _ := json.Marshal(all)
+	if err := os.WriteFile(filepath.Join(dir, "env.json"), b, 0o600); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// addGitConfig appends one GIT_CONFIG_KEY_n/VALUE_n pair (git's env-based config).
+func addGitConfig(env map[string]string, key, value string) {
+	n := 0
+	fmt.Sscan(env["GIT_CONFIG_COUNT"], &n)
+	env[fmt.Sprintf("GIT_CONFIG_KEY_%d", n)] = key
+	env[fmt.Sprintf("GIT_CONFIG_VALUE_%d", n)] = value
+	env["GIT_CONFIG_COUNT"] = fmt.Sprint(n + 1)
 }
 
 // cleanupCredentials closes relays and deletes the job's secrets.

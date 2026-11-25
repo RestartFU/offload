@@ -74,6 +74,7 @@ local = true      # use a runner on this machine too, at low priority (default)
 [credentials]
 relay = ["ssh-agent", "git"]   # default; answered from this machine while attached
 git_hosts = []                 # restrict git credential lending, e.g. ["github.com"]
+git_config = ["url.*", "user.name", "user.email"]   # default; this machine's git settings in jobs
 
 [credentials.sets.github]
 auto = true                    # every job gets it, no flags
@@ -81,6 +82,11 @@ env = { GH_TOKEN = "cmd:gh auth token" }
 
 [credentials.sets.npm]         # only with: offload run --with npm -- …
 files = { NPM_CONFIG_USERCONFIG = "~/.npmrc" }
+
+# Secrets are NAME = source: "cmd:<shell>", "env:<VAR>", "file:<path>" or a literal. Besides
+# sets, they can come from flags (--with SET, --secret NAME[=SOURCE]) or from the environment of
+# offload itself, which is how an MCP server entry configures them:
+#   "env": { "OFFLOAD_SECRET_API_KEY": "cmd:pass show api", "OFFLOAD_SECRET_FILE_KUBECONFIG": "~/.kube/config", "OFFLOAD_WITH": "github" }
 
 [[host]]          # pin a runner explicitly, e.g. outside the tailnet
 name = "box"
