@@ -41,10 +41,12 @@ type metricsState struct {
 	cpuSecs map[string]float64 // workload id -> CPU seconds last seen, for the ledger
 
 	// Owned by the sampler goroutine alone.
-	prevCPU   map[int]cpuTimes
-	prevUnit  map[string]unitSample // unit -> last usage reading
-	prevSlice unitSample            // the slice's, for offload's total
-	cgPaths   map[string]string     // unit -> cgroup directory
+	prevCPU    map[int]cpuTimes
+	prevUnit   map[string]unitSample // unit -> last usage reading
+	prevSlice  unitSample            // the slice's, for offload's total
+	sliceDir   string                // the slice's cgroup, once found
+	sliceTried time.Time             // last lookup
+	cgPaths    map[string]string     // unit -> cgroup directory
 }
 
 type cpuTimes struct{ busy, total uint64 }
@@ -211,8 +213,8 @@ func (s *Server) sample(ctx context.Context) (save bool) {
 	sort.Slice(work, func(a, b int) bool { return work[a].ID < work[b].ID })
 	// Offload's total comes from the slice's own counter when it can be read: it includes work
 	// too short to be seen by two samples (a queue of one-second jobs).
-	if base := userManagerCgroup(); base != "" {
-		if usec, ok := cgroupCPUUsec(filepath.Join(base, sliceCgroupPath(s.cfg.Slice))); ok {
+	if dir := s.sliceCgroupDir(ctx); dir != "" {
+		if usec, ok := cgroupCPUUsec(dir); ok {
 			if m.prevSlice.at.IsZero() {
 				pt.CPUUsed = 0 // no baseline yet; the next sample has one
 			} else {
@@ -474,6 +476,27 @@ func (s *Server) unitCgroupDir(ctx context.Context, unit string) string {
 		m.cgPaths[unit] = dir
 	}
 	return dir
+}
+
+// sliceCgroupDir is offload's slice cgroup: under our own user manager's cgroup, or (a runner
+// started from a shell, outside it) wherever systemd says.
+func (s *Server) sliceCgroupDir(ctx context.Context) string {
+	m := &s.metrics
+	if m.sliceDir != "" || time.Since(m.sliceTried) < time.Minute { // it may not exist yet
+		return m.sliceDir
+	}
+	m.sliceTried = time.Now()
+	if base := userManagerCgroup(); base != "" {
+		if d := filepath.Join(base, sliceCgroupPath(s.cfg.Slice)); dirExists(d) {
+			m.sliceDir = d
+		}
+	}
+	if m.sliceDir == "" {
+		if out, err := systemctl(ctx, "show", "-p", "ControlGroup", "--value", s.cfg.Slice); err == nil && out != "" {
+			m.sliceDir = filepath.Join("/sys/fs/cgroup", out)
+		}
+	}
+	return m.sliceDir
 }
 
 func dirExists(p string) bool {

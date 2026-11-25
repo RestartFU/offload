@@ -117,8 +117,9 @@ func (f *fleet) discover(ctx context.Context) {
 
 // addLocked adds a runner found by discovery, or points a known one at its fresh client. A
 // runner reachable at two addresses (pinned in client.toml and found on the tailnet) is one row.
-// Discovery lists pinned hosts first, so that address is used, and while it isn't answering, a
-// paired one that discovery just reached stands in.
+// Discovery lists pinned hosts first, so that address is used. While it isn't working (not
+// answering, or answering status but refusing the rest), a usable one discovery just reached
+// stands in: paired (it has a token), or the local socket.
 func (f *fleet) addLocked(h *client.Host) {
 	key := h.URL
 	if h.Status != nil && h.Status.ID != "" {
@@ -128,7 +129,8 @@ func (f *fleet) addLocked(h *client.Host) {
 		}
 	}
 	if r := f.runners[key]; r != nil {
-		if r.URL == h.URL || (!r.Online && h.Token != "") {
+		usable := h.Token != "" || h.URL == "http://local"
+		if r.URL == h.URL || ((!r.Online || r.Error != "") && usable) {
 			r.host, r.URL = h, h.URL
 		}
 		return
@@ -193,15 +195,17 @@ func (f *fleet) pollOne(ctx context.Context, r *runnerState) {
 	)
 	if err := h.Do(ctx, "GET", "/v1/status", nil, &st); err != nil {
 		f.mu.Lock()
-		r.Online, r.Error = false, err.Error()
+		if r.host == h { // discovery may have moved it to another address meanwhile
+			r.Online, r.Error = false, err.Error()
+		}
 		f.mu.Unlock()
 		return
 	}
-	if st.ID != "" && st.ID != r.key && r.key != r.URL {
+	if st.ID != "" && st.ID != r.key && r.key != h.URL {
 		// This address now answers as another runner (its state was moved or reset): drop the
 		// row, and the next discovery lists it under its new ID.
 		f.mu.Lock()
-		if f.runners[r.key] == r {
+		if f.runners[r.key] == r && r.host == h {
 			delete(f.runners, r.key)
 		}
 		f.found = time.Time{} // rediscover on the next round
@@ -232,6 +236,9 @@ func (f *fleet) pollOne(ctx context.Context, r *runnerState) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if r.host != h {
+		return // moved to another address while this poll ran: its next poll publishes
+	}
 	r.Online, r.LastSeen, r.Status, r.Metrics = true, time.Now(), &st, met
 	if werr != nil {
 		r.Error, r.Jobs, r.Sessions = werr.Error(), []api.Job{}, []api.Session{}
@@ -289,15 +296,22 @@ func (r *runnerState) currentLocked() bool {
 	return r.Online && r.Status != nil && r.Status.Metrics && r.Status.Proto == api.Proto
 }
 
-// ledgerHosts lists online runners that keep a ledger.
-func (f *fleet) ledgerHosts() map[string]*client.Host {
+// ledgerHosts lists the runners whose ledger can be read now, and why each other one's can't.
+func (f *fleet) ledgerHosts() (map[string]*client.Host, map[string]string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := map[string]*client.Host{}
+	out, missing := map[string]*client.Host{}, map[string]string{}
 	for _, r := range f.runners {
-		if r.currentLocked() {
+		switch {
+		case r.currentLocked():
 			out[r.Name] = r.host
+		case !r.Online:
+			missing[r.Name] = "not answering, so its history is left out"
+		case r.Status != nil && !r.Status.Metrics:
+			// predates the ledger: nothing is missing
+		default:
+			missing[r.Name] = "its history can't be read: " + r.Error
 		}
 	}
-	return out
+	return out, missing
 }

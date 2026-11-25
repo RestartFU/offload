@@ -525,7 +525,9 @@ function renderCharts() {
   const capCPU = sum(st, (x) => x.capacity.cpu), hostCPUs = sum(st, (x) => x.host_cpus);
   const capMem = sum(st, (x) => x.capacity.mem), memTotal = sum(runners, (r) => r.metrics?.mem_total);
   const sub = $("#ov-charts-sub");
-  if (sub) sub.textContent = state.runner ? state.runner : runners.length > 1 ? `All ${runners.length} runners, added together` : "";
+  const left = (state.fleet?.runners || []).filter((r) => !r.current && r.status?.metrics !== false && (!state.runner || r.name === state.runner)).map((r) => r.name);
+  if (sub) sub.textContent = (state.runner ? state.runner : runners.length > 1 ? `All ${runners.length} runners, added together` : "") +
+    (left.length ? `${state.runner || runners.length > 1 ? " · " : ""}left out (not answering): ${left.join(", ")}` : "");
   const cards = [
     chartCard("CPU", "Cores", data, SERIES.cpu, { ref: capCPU, refLabel: `capacity ${fmtCores(capCPU)}`, max: Math.max(hostCPUs, capCPU), fmt: fmtCores, unit: " cores" }, loading),
     chartCard("Memory", "Bytes", data, SERIES.mem, { ref: capMem, refLabel: `capacity ${fmtBytes(capMem)}`, max: Math.max(memTotal, capMem), fmt: fmtBytes, unit: "" }, loading),
@@ -666,6 +668,10 @@ function renderActivity() {
   const label = { "1h": "last hour", "6h": "last 6 hours", "24h": "last 24 hours", "7d": "last 7 days" }[state.range];
   const head = h("div", { class: "section-head" }, h("h2", {}, "Activity"), h("span", { class: "muted" }, "Finished work, " + label + (state.runner ? " on " + state.runner : "")));
   if (!state.ledger || state.ledgerFor !== state.range) { el.replaceChildren(head, h("div", { class: "card empty-state" }, "Loading…")); return; }
+  if (state.runner && state.ledgerErrors?.[state.runner]) {
+    el.replaceChildren(head, h("div", { class: "card empty-state" }, `History unavailable: ${state.runner} is ${state.ledgerErrors[state.runner].replace(/, so its history is left out$/, "")}.`));
+    return;
+  }
   const rows = state.ledger.filter((e) => !state.runner || e.runner === state.runner);
   const jobs = rows.filter((e) => e.kind === "job");
   const errs = state.ledgerErrors ? Object.entries(state.ledgerErrors).map(([k, v]) => h("div", { class: "note" }, `${k}: ${v}`)) : [];

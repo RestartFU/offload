@@ -188,4 +188,11 @@ func TestFleetOneRowPerRunnerID(t *testing.T) {
 	if r := f.runners["r1"]; r.URL != "http://100.64.0.1:7420" || r.host.URL != r.URL {
 		t.Fatalf("didn't fall back: %s", r.URL)
 	}
+	// An address that answers status but refuses the rest (unpaired) also gives way.
+	r := f.runners["r1"]
+	r.Online, r.Error = true, "this client isn't paired with the runner"
+	f.addLocked(&client.Host{Name: "local", URL: "http://local", Status: &api.Status{ID: "r1"}})
+	if r.URL != "http://local" {
+		t.Fatalf("stayed on a status-only address: %s", r.URL)
+	}
 }

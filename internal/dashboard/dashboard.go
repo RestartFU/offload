@@ -261,7 +261,7 @@ func (s *server) handleLedger(w http.ResponseWriter, r *http.Request) {
 		truncated bool
 		err       error
 	}
-	hosts := s.fleet.ledgerHosts()
+	hosts, missing := s.fleet.ledgerHosts()
 	ch := make(chan result, len(hosts))
 	for name, h := range hosts {
 		go func() {
@@ -281,6 +281,9 @@ func (s *server) handleLedger(w http.ResponseWriter, r *http.Request) {
 		Errors    map[string]string `json:"errors,omitempty"`
 		Truncated []string          `json:"truncated,omitempty"` // runners that sent only their newest entries
 	}{Rows: []ledgerRow{}}
+	if len(missing) > 0 {
+		out.Errors = missing
+	}
 	for range hosts {
 		res := <-ch
 		if res.err != nil {
@@ -363,7 +366,7 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	// Give up, saying why, on an answer retrying can't change or after about five minutes.
 	follow, failures, opened := true, 0, time.Now()
 	for {
-		n, readErr, writeErr := copyFlush(w, flusher, resp.Body)
+		n, readErr, writeErr := copyFlush(w, resp.Body)
 		resp.Body.Close()
 		done()
 		off += n
@@ -444,19 +447,23 @@ func openStream(ctx context.Context, h *client.Host, path string) (*http.Respons
 	return resp, func() { timer.Stop(); cancel() }, nil
 }
 
-// copyFlush copies src to w, flushing after every read so output shows as it arrives. readErr
-// is nil at the end of src.
-func copyFlush(w io.Writer, flusher http.Flusher, src io.Reader) (n int64, readErr, writeErr error) {
+// copyFlush copies src to w, flushing after every read so output shows as it arrives. Each
+// write must finish within a minute: a viewer that stops reading doesn't hold the proxy.
+// readErr is nil at the end of src.
+func copyFlush(w http.ResponseWriter, src io.Reader) (n int64, readErr, writeErr error) {
+	rc := http.NewResponseController(w)
+	defer rc.SetWriteDeadline(time.Time{}) // the connection may serve other requests after this
 	buf := make([]byte, 32<<10)
 	for {
 		k, err := src.Read(buf)
 		if k > 0 {
+			_ = rc.SetWriteDeadline(time.Now().Add(time.Minute))
 			if _, werr := w.Write(buf[:k]); werr != nil {
 				return n, nil, werr
 			}
 			n += int64(k)
-			if flusher != nil {
-				flusher.Flush()
+			if werr := rc.Flush(); werr != nil {
+				return n, nil, werr
 			}
 		}
 		if errors.Is(err, io.EOF) {
