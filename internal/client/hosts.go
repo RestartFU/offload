@@ -672,14 +672,29 @@ func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []s
 				score += 100 // without overbooking: its guarantee really is free there
 			}
 		}
+		// A warm workspace saves the upload and a cold build: worth one bonus, however many
+		// image variants have a slot there (it used to count per slot and pinned every repo
+		// to the runner that ran it first).
 		if key != "" {
 			for _, k := range st.WarmKeys {
 				if k == key || strings.HasPrefix(k, key+"--") {
-					score += 200
+					score += 150
+					break
 				}
 			}
 		}
-		score += min(f.CPU, max(unbooked, 0)+f.CPU/4) - st.Load1/4
+		// Then how much CPU the job would really get: builds use every core they're allowed,
+		// so idle cores up to its ceiling are worth more than capacity on paper.
+		idle := st.CPUIdle
+		if st.CPUOvercommit == 0 { // an older runner: estimate from load
+			idle = st.Capacity.CPU - st.Load1
+		}
+		idle -= st.Pending.CPU
+		ceiling := r.CPUMax
+		if ceiling <= 0 {
+			ceiling = max(st.Capacity.CPUMax, st.Capacity.CPU)
+		}
+		score += 8*min(max(idle, 0), ceiling) + min(f.CPU, max(unbooked, 0)+f.CPU/4)/4
 		if st.OS == goruntime.GOOS && st.Arch == goruntime.GOARCH {
 			score += 50
 		}

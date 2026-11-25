@@ -57,3 +57,22 @@ func TestPickPrefersUnbookedRoom(t *testing.T) {
 		t.Fatalf("picked %s; want zeno, which has 10 unbooked cores", h.Name)
 	}
 }
+
+// Warm on both (vps with more image variants), vps busy, zeno idle: the job goes where its cores
+// are. Slots per variant used to stack the warm bonus and pin work to the busy runner.
+func TestPickSpreadsToIdleRunner(t *testing.T) {
+	want := api.Resources{CPU: 4, Mem: 1 << 30}
+	vps := testHost("vps", 30, api.Resources{CPU: 20}, api.Resources{}, "repo", "repo--a", "repo--b", "repo--c", "repo--d")
+	vps.Status.CPUOvercommit, vps.Status.CPUIdle = 2, 6
+	zeno := testHost("zeno", 22, api.Resources{}, api.Resources{}, "repo--a")
+	zeno.Status.CPUOvercommit, zeno.Status.CPUIdle = 2, 22
+	if h, _ := pick([]*Host{vps, zeno}, want, "", "repo", "job", nil); h.Name != "zeno" {
+		t.Fatalf("picked %s; want the idle zeno", h.Name)
+	}
+	// Equally idle: the warm runner still wins over a cold one.
+	vps.Status.Allocated, vps.Status.CPUIdle = api.Resources{}, 22
+	zeno.Status.WarmKeys = nil
+	if h, _ := pick([]*Host{vps, zeno}, want, "", "repo", "job", nil); h.Name != "vps" {
+		t.Fatalf("picked %s; want the warm vps", h.Name)
+	}
+}
