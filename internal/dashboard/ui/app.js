@@ -1035,15 +1035,16 @@ const THEMES = [
   ["dark", "Dark", () => glyphSVG(s("path", { d: "M13.5 9.6A5.75 5.75 0 0 1 6.4 2.5a5.75 5.75 0 1 0 7.1 7.1Z" }))],
 ];
 const narrow = matchMedia("(max-width: 760px)");
-function currentTheme() { const t = store("theme"); return t === "light" || t === "dark" ? t : "system"; }
-function setTheme(t) { store("theme", t); applyTheme(); }
-function applyTheme() {
-  const t = currentTheme();
+let theme = "system"; // in memory too: storage may be blocked
+function currentTheme() { const t = store("theme"); return t === "light" || t === "dark" || t === "system" ? t : theme; }
+function setTheme(t) { theme = t; store("theme", t); applyTheme(t); }
+function applyTheme(t = currentTheme()) {
+  theme = t;
   if (t === "system") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
   renderTheme();
 }
 function renderTheme() {
-  const cur = currentTheme();
+  const cur = theme;
   $("#theme").replaceChildren(h("div", { class: "seg theme-switch", role: "group", "aria-label": "Theme" },
     THEMES.map(([v, label, glyph], i) => h("button", { type: "button", "aria-pressed": String(v === cur), "aria-label": label, title: label, onclick: () => {
       // On a phone only the current choice shows (see app.css): tapping it moves to the next.
@@ -1055,6 +1056,6 @@ addEventListener("storage", (e) => { if (e.key === "theme") applyTheme(); });
 
 // ---------- start ----------
 window.addEventListener("resize", () => { if (state.view === "overview") renderCharts(); });
-renderTheme();
+applyTheme();
 route();
 pollFleet();
