@@ -1025,7 +1025,36 @@ async function startLogs() {
   }
 }
 
+// ---------- theme ----------
+// System, light or dark. Colours are CSS variables, so switching only flips data-theme on the
+// root; theme.js applies the saved choice before the first paint.
+const glyphSVG = (...kids) => s("svg", { viewBox: "0 0 16 16", fill: "none", stroke: "currentColor", "stroke-width": "1.5", "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true" }, kids);
+const THEMES = [
+  ["system", "Match system", () => glyphSVG(s("rect", { x: "1.75", y: "2.75", width: "12.5", height: "8.5", rx: "1.5" }), s("path", { d: "M5.5 14h5M8 11.25V14" }))],
+  ["light", "Light", () => glyphSVG(s("circle", { cx: "8", cy: "8", r: "2.75" }), s("path", { d: "M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.06 1.06M11.54 11.54l1.06 1.06M3.4 12.6l1.06-1.06M11.54 4.46l1.06-1.06" }))],
+  ["dark", "Dark", () => glyphSVG(s("path", { d: "M13.5 9.6A5.75 5.75 0 0 1 6.4 2.5a5.75 5.75 0 1 0 7.1 7.1Z" }))],
+];
+const narrow = matchMedia("(max-width: 760px)");
+function currentTheme() { const t = store("theme"); return t === "light" || t === "dark" ? t : "system"; }
+function setTheme(t) { store("theme", t); applyTheme(); }
+function applyTheme() {
+  const t = currentTheme();
+  if (t === "system") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  renderTheme();
+}
+function renderTheme() {
+  const cur = currentTheme();
+  $("#theme").replaceChildren(h("div", { class: "seg theme-switch", role: "group", "aria-label": "Theme" },
+    THEMES.map(([v, label, glyph], i) => h("button", { type: "button", "aria-pressed": String(v === cur), "aria-label": label, title: label, onclick: () => {
+      // On a phone only the current choice shows (see app.css): tapping it moves to the next.
+      setTheme(v === cur && narrow.matches ? THEMES[(i + 1) % THEMES.length][0] : v);
+    } }, glyph()))));
+}
+// Another dashboard tab changed it.
+addEventListener("storage", (e) => { if (e.key === "theme") applyTheme(); });
+
 // ---------- start ----------
 window.addEventListener("resize", () => { if (state.view === "overview") renderCharts(); });
+renderTheme();
 route();
 pollFleet();
