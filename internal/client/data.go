@@ -128,7 +128,12 @@ func versionLess(a, b string) bool {
 
 // dataFiles lists a data set's files after include/exclude/newest rules.
 func dataFiles(cfg DataSetConfig) (string, []string, error) {
-	root := expand(cfg.Path)
+	// Resolve the root once and use the real directory for everything: a root that is a symlink
+	// (data moved to another disk) is walked where it points, never seen as an empty tree.
+	root, err := filepath.EvalSymlinks(expand(cfg.Path))
+	if err != nil {
+		return "", nil, fmt.Errorf("%s is not a readable directory: %v", expand(cfg.Path), err)
+	}
 	// newest: for each pattern, every matching entry except the highest version is excluded.
 	var drop []string
 	for _, pat := range cfg.Newest {
@@ -164,7 +169,7 @@ func dataFiles(cfg DataSetConfig) (string, []string, error) {
 	if fi, err := os.Stat(root); err != nil || !fi.IsDir() {
 		return "", nil, fmt.Errorf("%s is not a readable directory: %v", root, err)
 	}
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) && p != root {
 				return nil // deleted while we walked: gone on the runner too

@@ -229,6 +229,10 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 		rememberJob(j.ID, h)
 		if j.GitNeeded && ws != nil {
 			if err := uploadGit(ctx, h, j, ws, o.Quiet); err != nil {
+				if ctx.Err() != nil { // interrupted: give the reserved job back now
+					cancelJob(h, j.ID)
+					return nil, j, ctx.Err()
+				}
 				logf(false, "git history not sent (%v); the job runs without .git", err)
 			}
 		}
@@ -264,7 +268,7 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 // uploadGit sends the commits the runner is missing. The first job of a repository on a runner
 // sends the whole history once; later ones send only new commits.
 func uploadGit(ctx context.Context, h *Host, j api.Job, ws *Workspace, quiet bool) error {
-	path, err := gitBundle(ws.Root, j.GitHave)
+	path, err := gitBundle(ctx, ws.Root, j.GitHave)
 	if err != nil {
 		return err
 	}
@@ -480,8 +484,18 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, sent 
 		if err := checkRel(c.Path); err != nil {
 			return err
 		}
-		if !realParents(tree, c.Path) { // a symlinked parent could alias another file in the tree
-			skipped = append(skipped, c.Path)
+		if !realParents(tree, c.Path) {
+			// The directory moved or became a symlink (which could alias another file): keep the
+			// job's version in a fresh directory of its own instead of dropping it.
+			saved := path.Join(".offload-incoming", j.ID, c.Path)
+			err := mkdirReal(tree, path.Dir(saved))
+			if err == nil {
+				err = writeInIf(tree, saved, tr, os.FileMode(c.Mode).Perm(), c.Hash, nil)
+			}
+			if err != nil {
+				return fmt.Errorf("%s: its directory changed, and saving the job's version failed: %w", c.Path, err)
+			}
+			skipped = append(skipped, c.Path+" (job's version: "+saved+")")
 			continue
 		}
 		// Replace only if the local file is still exactly what this job was sent (content and

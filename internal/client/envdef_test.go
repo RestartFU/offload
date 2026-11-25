@@ -150,3 +150,34 @@ func TestReadLineMax(t *testing.T) {
 		t.Fatalf("line across buffer refills: %d %v", len(l), err)
 	}
 }
+
+func TestLocalOrigin(t *testing.T) {
+	for u, want := range map[string]bool{
+		"../upstream.git":                      true,
+		"/srv/git/repo.git":                    true,
+		"file:///srv/git/repo.git":             true,
+		"git@github.com:RestartFU/offload.git": false,
+		"https://github.com/RestartFU/offload": false,
+		"ssh://git@host/x.git":                 false,
+		"./a:b":                                true,
+	} {
+		if got := localOrigin(u); got != want {
+			t.Errorf("localOrigin(%q) = %v, want %v", u, got, want)
+		}
+	}
+}
+
+func TestDataRootSymlinkIsFollowed(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	os.MkdirAll(filepath.Join(real, "sub"), 0o755)
+	os.WriteFile(filepath.Join(real, "sub", "f"), []byte("x"), 0o644)
+	os.Symlink(real, filepath.Join(dir, "link"))
+	_, files, err := dataFiles(DataSetConfig{Path: filepath.Join(dir, "link")})
+	if err != nil || len(files) != 1 || files[0] != "sub/f" {
+		t.Fatalf("files = %v, %v", files, err)
+	}
+	if _, _, err := dataFiles(DataSetConfig{Path: filepath.Join(dir, "missing")}); err == nil {
+		t.Fatal("missing root accepted")
+	}
+}

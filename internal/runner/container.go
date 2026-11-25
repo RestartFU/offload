@@ -449,6 +449,14 @@ func (s *Server) resetCachesIfOld() error {
 	if b, err := os.ReadFile(marker); err == nil && strings.TrimSpace(string(b)) == cacheLayout {
 		return nil
 	}
+	// Running workloads have the old layout mounted: wiping it under them would pull their
+	// compiler or dependencies away mid-build. Wait for them (admission stays closed meanwhile).
+	s.mu.Lock()
+	busy := s.allocatedBusyLocked()
+	s.mu.Unlock()
+	if busy > 0 {
+		return fmt.Errorf("cache layout changed: waiting for %d running job(s)/session(s) to finish before resetting caches", busy)
+	}
 	log.Printf("cache layout changed: wiping shared toolchains and caches (the bootstrap reinstalls them)")
 	if err := removeAll(s.cacheDir()); err != nil {
 		return fmt.Errorf("wiping old caches: %w", err)
@@ -475,11 +483,16 @@ func (s *Server) stopOrphanBuilds() error {
 			continue
 		}
 		unit := f[0]
-		if slice, _ := systemctl(context.Background(), "show", "-p", "Slice", "--value", unit); slice != s.cfg.Slice {
-			continue // another runner's (a dev runner uses its own slice)
-		}
 		if active, known := unitActive(unit); known && !active {
+			continue // already finished
+		}
+		slice, err := systemctl(context.Background(), "show", "-p", "Slice", "--value", unit)
+		if err != nil || slice == "" {
+			problems = append(problems, fmt.Sprintf("%s: can't tell whose it is: %v", unit, err))
 			continue
+		}
+		if slice != s.cfg.Slice {
+			continue // another runner's (a dev runner uses its own slice)
 		}
 		log.Printf("stopping %s: left over from a previous runner process", unit)
 		if err := stopUnitConfirmed(unit); err != nil {
@@ -634,10 +647,14 @@ type runSpec struct {
 	Argv                                []string
 }
 
+// ownerLabel marks this runner's containers, so cleanup never touches another runner's (two
+// runners of one user share podman's container namespace).
+func (s *Server) ownerLabel() string { return "dev.offload.runner=" + hash12(s.cfg.StateDir) }
+
 // podmanRun builds the podman command line. Paths are mounted where they are on the host; the
 // mounted static offload binary is the entrypoint and loads secrets inside.
 func (s *Server) podmanRun(r runSpec) []string {
-	a := []string{"podman", "run", "--rm", "--name", r.Name,
+	a := []string{"podman", "run", "--rm", "--name", r.Name, "--label", s.ownerLabel(),
 		"--cgroups=split", "--security-opt", "label=disable",
 		"--pids-limit=-1", "--init", "--pull=never",
 		fmt.Sprintf("--memory=%d", r.Mem), "--memory-swap=" + fmt.Sprint(r.Mem),
@@ -866,7 +883,7 @@ func (s *Server) gcContainersLocked() {
 		delete(s.readyImages, tag)
 	}
 	_ = writeFileJSON(s.imagesPath(), s.imageUse)
-	out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-j-", "--format", "{{.Names}}")
+	out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-j-", "--filter", "label="+s.ownerLabel(), "--format", "{{.Names}}")
 	if err == nil && out != "" {
 		for _, name := range strings.Split(out, "\n") {
 			if j := s.jobs[strings.TrimPrefix(name, "offload-")]; j == nil || j.State != api.StateRunning {

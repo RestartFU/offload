@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"regexp"
@@ -307,16 +308,29 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		}
 		written[p] = true
 	}
-	// Only now, with the upload known complete, remove what left the manifest.
+	// Only now, with the upload known complete, remove what left the manifest: recorded files,
+	// and paths an interrupted apply may have created before recording them. A path whose
+	// removal fails stays journaled, so the next apply tries again.
+	gone := map[string]bool{}
 	for p := range rec.Files {
-		if _, ok := want[p]; !ok {
-			// Only through real directories: a parent the runner turned into a symlink (even one
-			// pointing inside the tree) must not redirect this delete onto another tracked file.
-			if _, err := cleanRel(p); err == nil && realParents(root, p) {
-				_ = root.Remove(p)
-			}
-			delete(rec.Files, p)
+		gone[p] = true
+	}
+	for p := range dirtyBefore {
+		gone[p] = true
+	}
+	var stillDirty []string
+	for p := range gone {
+		if _, ok := want[p]; ok {
+			continue
 		}
+		// Only through real directories: a parent the runner turned into a symlink (even one
+		// pointing inside the tree) must not redirect this delete onto another tracked file.
+		if _, err := cleanRel(p); err == nil && realParents(root, p) {
+			if err := root.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				stillDirty = append(stillDirty, p)
+			}
+		}
+		delete(rec.Files, p)
 	}
 	for _, e := range manifest {
 		old, had := rec.Files[e.Path]
@@ -361,7 +375,8 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		rec.Files[e.Path] = ent
 	}
 	s.LastUsed = time.Now()
-	rec.Dirty, rec.Stages = nil, nil
+	sort.Strings(stillDirty)
+	rec.Dirty, rec.Stages = stillDirty, nil
 	return s.save(rec)
 }
 

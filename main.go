@@ -96,6 +96,7 @@ Runner (on the server):
   sudo offload runner install-system --user U    linger, cgroup delegation, keep-alive, firewall
   offload runner serve [--config PATH]           the daemon (run by systemd)
   offload runner pair-code                       print a one-time code for "offload host pair"
+  offload runner reset-pairing                   unpair every client (revoke), then print a code
 
 Other:
   offload hook claude                Claude Code PreToolUse guard
@@ -335,7 +336,7 @@ func cmdEnv(args []string) (int, error) {
 
 func cmdRunner(args []string) (int, error) {
 	if len(args) < 1 {
-		die("usage: offload runner serve|install|install-system|pair-code")
+		die("usage: offload runner serve|install|install-system|pair-code|reset-pairing")
 	}
 	switch args[0] {
 	case "serve":
@@ -354,12 +355,17 @@ func cmdRunner(args []string) (int, error) {
 		defer stop()
 		log.Printf("offload runner %s (%s) starting", cfg.Name, versionString())
 		return 0, s.Serve(ctx)
-	case "pair-code":
+	case "pair-code", "reset-pairing":
 		cfg, err := runner.LoadConfig(runner.DefaultConfigPath())
 		if err != nil {
 			return 1, err
 		}
-		code, err := runner.NewPairCode(cfg.TokensFile)
+		newCode := runner.NewPairCode
+		if args[0] == "reset-pairing" {
+			newCode = runner.ResetPairing
+			fmt.Println("forgot every paired client")
+		}
+		code, err := newCode(cfg.TokensFile)
 		if err != nil {
 			return 1, err
 		}
@@ -424,6 +430,6 @@ func cmdRunner(args []string) (int, error) {
 		}
 		return runner.RunPipe(*dir, *sock, *secrets, rest), nil
 	}
-	die("usage: offload runner serve|install|install-system|pair-code")
+	die("usage: offload runner serve|install|install-system|pair-code|reset-pairing")
 	return 2, nil
 }

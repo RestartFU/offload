@@ -96,16 +96,16 @@ func New(cfg *Config, version string) (*Server, error) {
 }
 
 // reconcile settles what a previous runner process left behind before any new work starts:
-// orphaned build/bootstrap units first, then the cache layout (which those may be writing), then
-// workloads of another protocol version.
+// workloads of another protocol version, orphaned build/bootstrap units, then the cache layout
+// (which both may be using).
 func (s *Server) reconcile() error {
+	if err := s.retireOtherVersions(); err != nil {
+		return err
+	}
 	if err := s.stopOrphanBuilds(); err != nil {
 		return err
 	}
-	if err := s.resetCachesIfOld(); err != nil {
-		return err
-	}
-	return s.retireOtherVersions()
+	return s.resetCachesIfOld()
 }
 
 func (s *Server) kick() {
@@ -350,6 +350,18 @@ func (s *Server) consumePairCode(code string) error {
 		return errors.New("wrong pairing code (it is now used up); " + help)
 	}
 	return os.Remove(s.pairCodePath())
+}
+
+// ResetPairing forgets every paired client (run on the runner itself, e.g. to revoke a token
+// that may have leaked) and returns a fresh pairing code.
+func ResetPairing(tokensFile string) (string, error) {
+	if tokensFile == "" {
+		tokensFile = filepath.Join(filepath.Dir(DefaultConfigPath()), "tokens")
+	}
+	if err := os.WriteFile(tokensFile, nil, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	return NewPairCode(tokensFile)
 }
 
 // NewPairCode makes a fresh one-time pairing code for the runner whose tokens file is

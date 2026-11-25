@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/gob"
 	"encoding/hex"
@@ -124,9 +125,22 @@ func gitFiles(root string) ([]string, error) {
 // workspaceKey names the runner-side workspace: repo name plus a hash of its origin (or path),
 // so every clone and worktree of a repository shares warm build directories.
 func workspaceKey(root string) string {
-	id := root
+	host, _ := os.Hostname()
+	id := "path:" + host + ":" + root // no origin: this checkout on this machine
 	if url, err := git(root, "config", "--get", "remote.origin.url"); err == nil && strings.TrimSpace(url) != "" {
 		id = strings.TrimSpace(url)
+		if localOrigin(id) {
+			// A path means nothing beyond this machine, and a relative one ("../upstream.git")
+			// means something different in every checkout: resolve it, and keep it per client.
+			p := strings.TrimPrefix(id, "file://")
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(root, p)
+			}
+			if real, err := filepath.EvalSymlinks(p); err == nil {
+				p = real
+			}
+			id = "path:" + host + ":" + filepath.Clean(p)
+		}
 	}
 	sum := sha256.Sum256([]byte(id))
 	name := filepath.Base(root)
@@ -149,12 +163,26 @@ func workspaceKey(root string) string {
 	return n + "-" + hex.EncodeToString(sum[:])[:10]
 }
 
+// localOrigin reports whether a remote URL is a filesystem path rather than a network remote
+// (scheme://… or scp-like host:path).
+func localOrigin(u string) bool {
+	if strings.HasPrefix(u, "file://") {
+		return true
+	}
+	if strings.Contains(u, "://") {
+		return false
+	}
+	colon, slash := strings.Index(u, ":"), strings.Index(u, "/")
+	return colon < 0 || (slash >= 0 && slash < colon)
+}
+
 // hashCache avoids rehashing files whose size and mtime haven't changed since the last run.
 type hashCache map[string]cachedHash
 
 type cachedHash struct {
 	Size  int64
 	MTime int64
+	CTime int64 // inode change time: mtime alone can be set back by a timestamp-preserving edit
 	Ino   uint64
 	Hash  string
 }
@@ -205,7 +233,8 @@ func hashFiles(root string, files []string) ([]api.FileEntry, error) {
 				case fi.Mode().IsRegular():
 					ino := inode(fi)
 					c, ok := cache[p]
-					if ok && c.Size == fi.Size() && c.MTime == fi.ModTime().UnixNano() && c.Ino == ino {
+					ct, ctOK := changeTime(fi)
+					if ok && ctOK && c.Size == fi.Size() && c.MTime == fi.ModTime().UnixNano() && c.Ino == ino && c.CTime == ct {
 						e.Hash = c.Hash
 					} else {
 						var now os.FileInfo
@@ -215,7 +244,7 @@ func hashFiles(root string, files []string) ([]api.FileEntry, error) {
 					}
 					if err == nil {
 						mu.Lock()
-						next[p] = cachedHash{Size: fi.Size(), MTime: fi.ModTime().UnixNano(), Ino: ino, Hash: e.Hash}
+						next[p] = cachedHash{Size: fi.Size(), MTime: fi.ModTime().UnixNano(), CTime: ct, Ino: ino, Hash: e.Hash}
 						mu.Unlock()
 					}
 				default:
@@ -326,7 +355,7 @@ func writeTar(w io.Writer, root string, manifest []api.FileEntry, needed []strin
 
 // gitBundle writes a bundle of HEAD minus the commits the runner already has (those we also
 // have locally) to a temp file and returns its path.
-func gitBundle(root string, have []string) (string, error) {
+func gitBundle(ctx context.Context, root string, have []string) (string, error) {
 	f, err := os.CreateTemp("", "offload-*.bundle")
 	if err != nil {
 		return "", err
@@ -334,19 +363,20 @@ func gitBundle(root string, have []string) (string, error) {
 	f.Close()
 	args := []string{"bundle", "create", "-q", f.Name(), "HEAD"}
 	if len(have) > 0 {
-		cmd := exec.Command("git", "-C", root, "cat-file", "--batch-check=%(objectname) %(objecttype)")
+		cmd := groupCommand(ctx, "git", "-C", root, "cat-file", "--batch-check=%(objectname) %(objecttype)")
 		cmd.Stdin = strings.NewReader(strings.Join(have, "\n") + "\n")
-		out, _ := cmd.Output()
+		out, _ := groupOutput(cmd)
 		for _, line := range strings.Split(string(out), "\n") {
 			if sha, typ, ok := strings.Cut(line, " "); ok && typ == "commit" {
 				args = append(args, "^"+sha)
 			}
 		}
 	}
-	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+	// Ctrl-C stops git and its pack helpers; the caller then cancels the reserved job.
+	cmd := groupCommand(ctx, "git", append([]string{"-C", root}, args...)...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if _, err := groupOutput(cmd); err != nil {
 		os.Remove(f.Name())
 		return "", fmt.Errorf("git bundle: %v: %s", err, strings.TrimSpace(stderr.String()))
 	}

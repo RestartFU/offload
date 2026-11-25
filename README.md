@@ -78,7 +78,9 @@ systemctl --user daemon-reexec && systemctl --user restart offload-runner
 ```
 
 `runner install` ends by printing a one-time pairing code (valid a day; `offload runner
-pair-code` prints a new one). On the laptop: `offload host pair <name> --code <code>`. After that, upgrades come from the laptop with
+pair-code` prints a new one). On the laptop: `offload host pair <name> --code <code>`. To revoke every
+paired client (a lost laptop, a leaked token), run `offload runner reset-pairing` on the runner
+and pair again. After that, upgrades come from the laptop with
 `offload host upgrade <name>`.
 
 The config lives in `~/.config/offload/runner.toml` and holds capacity, reserve, storage and

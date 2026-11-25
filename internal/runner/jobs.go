@@ -608,7 +608,7 @@ func (s *Server) retireOtherVersions() error {
 		s.mu.Unlock()
 	}
 	if s.containersAvailable() {
-		out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-[js]-", "--format", "{{.Names}}")
+		out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-[js]-", "--filter", "label="+s.ownerLabel(), "--format", "{{.Names}}")
 		if err != nil {
 			problems = append(problems, "listing containers: "+err.Error())
 		} else {

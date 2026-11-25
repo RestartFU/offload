@@ -352,3 +352,31 @@ func TestInterruptedDataApplyRepairsSymlink(t *testing.T) {
 		t.Fatal("still dirty")
 	}
 }
+
+func TestInterruptedApplyLeftoverIsRemoved(t *testing.T) {
+	dir := t.TempDir()
+	sl := &slot{Key: "k", Index: 0, Dir: filepath.Join(dir, "0")}
+	os.MkdirAll(sl.Dir, 0o755)
+	a, ab := entry("a.txt", "one")
+	m := []api.FileEntry{a}
+	need, _ := sl.plan(m)
+	if err := sl.apply(m, need, tarOf(t, map[string][]byte{"a.txt": ab}, need)); err != nil {
+		t.Fatal(err)
+	}
+	// An interrupted apply had installed new.txt (journaled, never recorded); the client then
+	// dropped it. The next apply must remove it.
+	rec := sl.load()
+	rec.Dirty = []string{"new.txt"}
+	sl.save(rec)
+	os.WriteFile(filepath.Join(sl.Dir, "new.txt"), []byte("half-synced"), 0o644)
+	need, _ = sl.plan(m)
+	if err := sl.apply(m, need, tarOf(t, map[string][]byte{"a.txt": ab}, need)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(sl.Dir, "new.txt")); !os.IsNotExist(err) {
+		t.Fatal("leftover from the interrupted apply survived")
+	}
+	if len(sl.load().Dirty) != 0 {
+		t.Fatal("still dirty")
+	}
+}

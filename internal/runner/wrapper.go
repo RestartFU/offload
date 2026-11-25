@@ -142,7 +142,7 @@ func collectWriteBack(dir, recordPath, dest string) (*api.WriteBack, error) {
 		if err != nil {
 			continue
 		}
-		if h != ent.Hash {
+		if h != ent.Hash || os.FileMode(ent.Mode).Perm() != fi.Mode().Perm() { // content, or just chmod
 			if total += fi.Size(); total > writeBackLimit {
 				return nil, fmt.Errorf("edited files exceed %d MiB; not sending them back", writeBackLimit>>20)
 			}

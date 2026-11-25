@@ -150,10 +150,27 @@ func clientToken() string {
 	}
 	tok := hex.EncodeToString(buf)
 	_ = os.MkdirAll(configDir(), 0o700)
-	if err := os.WriteFile(clientTokenPath(), []byte(tok+"\n"), 0o600); err != nil {
+	// Publish without replacing: two first runs racing must end up with one secret, not each
+	// pairing with its own and one of them overwritten.
+	tmp, err := os.CreateTemp(configDir(), ".client.token-*")
+	if err != nil {
 		return ""
 	}
-	return tok
+	defer os.Remove(tmp.Name())
+	_, err = tmp.WriteString(tok + "\n")
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return ""
+	}
+	if err := os.Link(tmp.Name(), clientTokenPath()); err != nil && !errors.Is(err, os.ErrExist) {
+		return ""
+	}
+	if b, err := os.ReadFile(clientTokenPath()); err == nil && len(strings.TrimSpace(string(b))) >= 32 {
+		return strings.TrimSpace(string(b)) // ours, or the one that won
+	}
+	return ""
 }
 
 // runnerToken is this client's token for one runner: derived from the client secret and the
