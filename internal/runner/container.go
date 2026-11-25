@@ -337,6 +337,7 @@ type runSpec struct {
 	Devices                             []string
 	Env                                 map[string]string
 	Interactive                         bool // keep stdin (sessions)
+	NestedSandbox                       bool // flatpak/bubblewrap inside: unmask /proc, no seccomp filter
 	Argv                                []string
 }
 
@@ -354,6 +355,12 @@ func (s *Server) podmanRun(r runSpec) []string {
 	}
 	if r.CPUs != "" {
 		a = append(a, "--cpuset-cpus="+r.CPUs)
+	}
+	if r.NestedSandbox {
+		// bubblewrap needs to mount /proc, create namespaces and bring up loopback in its own
+		// network namespace. Still rootless: these capabilities only cover namespaces the
+		// container owns, not the host's.
+		a = append(a, "--security-opt", "unmask=ALL", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN", "--cap-add", "NET_ADMIN")
 	}
 	same := append(r.Same, runtimeDir()) // relay sockets, runner socket, secrets
 	for _, p := range same {

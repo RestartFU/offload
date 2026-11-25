@@ -160,6 +160,27 @@ type SessionSpec struct {
 	SecretFiles map[string][]byte `json:"secret_files,omitempty"`
 	Environment *EnvDef           `json:"environment,omitempty"` // overrides the profile's
 	Runtime     string            `json:"runtime,omitempty"`     // "host" or "container"
+	// Def is a session defined on the client (~/.config/offload/sessions/NAME.toml); when set,
+	// the runner needs no profile of that name.
+	Def *SessionDef `json:"def,omitempty"`
+}
+
+// SessionDef is a client-side session definition. Data maps synced data sets (by name) to
+// container paths; Volumes maps runner-side persistent volumes (by name) to container paths.
+type SessionDef struct {
+	Command       []string          `json:"command"`
+	Env           map[string]string `json:"env,omitempty"`
+	Data          map[string]string `json:"data,omitempty"`
+	Volumes       map[string]string `json:"volumes,omitempty"`
+	Devices       []string          `json:"devices,omitempty"`
+	NestedSandbox bool              `json:"nested_sandbox,omitempty"` // allow bubblewrap/flatpak inside
+}
+
+// DataPlan is the body of POST /v1/data/{name}: a data set's manifest. The runner answers with
+// the paths to upload (PUT /v1/data/{name}). Files the runner changed itself (a refreshed token,
+// game settings) are kept unless the client's copy changed since the last sync.
+type DataPlan struct {
+	Manifest []FileEntry `json:"manifest"`
 }
 
 // Session is a long-lived process (usually an MCP server) whose stdio is bridged over HTTP.

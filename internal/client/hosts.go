@@ -32,7 +32,21 @@ type Config struct {
 	Local    *bool        `toml:"local"` // use a runner on this machine if one is running (default true)
 	Hosts    []HostConfig `toml:"host"`
 
-	Credentials CredentialsConfig `toml:"credentials"`
+	Credentials CredentialsConfig        `toml:"credentials"`
+	Data        map[string]DataSetConfig `toml:"data"`
+}
+
+func encodeJSON(w io.Writer, v any) error { return json.NewEncoder(w).Encode(v) }
+
+func newRequest(ctx context.Context, h *Host, method, path string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, h.URL+path, body)
+	if err != nil {
+		return nil, err
+	}
+	if h.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+h.Token)
+	}
+	return req, nil
 }
 
 func decodeJSON(r io.Reader, v any) error { return json.NewDecoder(r).Decode(v) }

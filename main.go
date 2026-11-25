@@ -72,7 +72,9 @@ Client:
   offload ps [--all]                 jobs and sessions on every runner
   offload hosts                      runners, capacity and load
   offload mcp PROFILE [--on NAME] [--with SET] [--secret NAME[=SRC]]
-                                     stdio MCP server backed by a runner session
+                                     stdio MCP server backed by a runner session; PROFILE is a
+                                     runner profile or ~/.config/offload/sessions/PROFILE.toml
+                                     (its data sets are synced first; --prepare runs its setup)
 
 Secrets can also come from the environment (e.g. an MCP entry's "env"):
   OFFLOAD_SECRET_<NAME>=<source>   OFFLOAD_SECRET_FILE_<NAME>=<path>   OFFLOAD_WITH=set1,set2
@@ -258,12 +260,13 @@ func cmdMCP(args []string) error {
 	fs.Var(&secrets, "secret", "NAME or NAME=SOURCE")
 	environment := fs.String("environment", "", "named environment")
 	host := fs.Bool("host", false, "run on the runner host")
+	prepare := fs.Bool("prepare", false, "run the session's prepare step and exit")
 	_ = fs.Parse(args[1:])
 	r, err := res()
 	if err != nil {
 		return err
 	}
-	return client.MCP(client.MCPOptions{Profile: profile, On: *on, Resources: r, With: with, Secrets: secrets, Environment: *environment, Host: *host})
+	return client.MCP(client.MCPOptions{Profile: profile, On: *on, Resources: r, With: with, Secrets: secrets, Environment: *environment, Host: *host, Prepare: *prepare})
 }
 
 func cmdHost(args []string) error {

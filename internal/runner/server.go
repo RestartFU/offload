@@ -112,6 +112,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/sessions/{id}/stdout", s.handleSessionStdout)
 	mux.HandleFunc("GET /v1/sessions/{id}/stderr", s.handleSessionStderr)
 	mux.HandleFunc("DELETE /v1/sessions/{id}", s.handleStopSession)
+	mux.HandleFunc("POST /v1/data/{name}", s.handleDataPlan)
+	mux.HandleFunc("PUT /v1/data/{name}", s.handleDataUpload)
 	mux.HandleFunc("PUT /v1/admin/binary", s.handleUpgrade)
 
 	handler := s.auth(mux)

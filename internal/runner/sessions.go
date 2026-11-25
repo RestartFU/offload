@@ -81,6 +81,33 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prof := s.cfg.loadProfiles()[spec.Profile]
+	if spec.Def != nil {
+		// Defined by the client: build a profile from it. Data sets must have been synced.
+		if len(spec.Def.Command) == 0 {
+			writeErr(w, 400, "session definition has no command")
+			return
+		}
+		prof = &Profile{Name: spec.Profile, Kind: "session", Command: spec.Def.Command, Env: spec.Def.Env,
+			Devices: spec.Def.Devices, Runtime: "container", NestedSandbox: spec.Def.NestedSandbox}
+		for name, ctr := range spec.Def.Data {
+			if !validKey(name) {
+				writeErr(w, 400, "invalid data set name "+strconv.Quote(name))
+				return
+			}
+			if _, err := os.Stat(s.dataPath(name)); err != nil {
+				writeErr(w, 400, "data set "+name+" was never synced to this runner")
+				return
+			}
+			prof.Volumes = append(prof.Volumes, s.dataPath(name)+":"+ctr)
+		}
+		for name, ctr := range spec.Def.Volumes {
+			if !validKey(name) {
+				writeErr(w, 400, "invalid volume name "+strconv.Quote(name))
+				return
+			}
+			prof.Volumes = append(prof.Volumes, s.volumePath(name)+":"+ctr)
+		}
+	}
 	if prof == nil || prof.Kind != "session" || len(prof.Command) == 0 {
 		writeErr(w, 400, "no session profile named "+strconv.Quote(spec.Profile))
 		return
@@ -208,7 +235,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		}
 		command = s.podmanRun(runSpec{Name: "offload-" + se.ID, Image: image, Workdir: se.dir, CPUs: allowed,
 			Secrets: secrets, Mem: res.Mem, Env: cenv, Interactive: true, Argv: prof.Command,
-			Same: []string{se.dir}, Volumes: volumes, Devices: devices})
+			Same: []string{se.dir}, Volumes: volumes, Devices: devices, NestedSandbox: prof.NestedSandbox})
 		unitEnv = map[string]string{}
 		s.touchImage(image)
 	} else if secrets != "" {

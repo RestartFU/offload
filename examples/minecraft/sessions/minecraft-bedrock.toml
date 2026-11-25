@@ -1,0 +1,27 @@
+# Use from an MCP client:  {"command": "offload", "args": ["mcp", "minecraft-bedrock"]}
+# First time (optional, avoids MCP startup timeouts):  offload mcp minecraft-bedrock --prepare
+description = "Minecraft Bedrock client (mcpelauncher fork) driven over MCP, headless"
+environment = "minecraft"           # ~/.config/offload/envs/minecraft/Containerfile
+command = ["minecraft-mcp"]
+prepare = ["minecraft-prepare", "--update"]
+nested_sandbox = true                # flatpak's bubblewrap runs inside the container
+
+[data]                               # data sets from client.toml, synced before every start
+minecraft = "/root/.var/app/io.mrarm.mcpelauncher/data/mcpelauncher"
+minecraft-config = "/root/.var/app/io.mrarm.mcpelauncher/config/Minecraft Linux Launcher"
+mcpelauncher-agent = "/opt/mcpelauncher-agent"
+mcpelauncher-fork-repo = "/opt/flatpak-fork-repo"
+
+[volumes]                            # kept on the runner between sessions
+minecraft-flatpak = "/root/.local/share/flatpak"
+
+[env]
+MCPELAUNCHER_CLIENT = "/usr/local/bin/mcpelauncher-headless"
+MCPELAUNCHER_DATA = "/root/.var/app/io.mrarm.mcpelauncher/data/mcpelauncher"
+MCPELAUNCHER_SOCKET_DIR = "/root/.var/app/io.mrarm.mcpelauncher/data"
+MCPELAUNCHER_ABI = "x86_64"
+
+[resources]
+cpu = 2
+cpu_max = 8                          # llvmpipe rendering is CPU-bound
+mem = "6G"

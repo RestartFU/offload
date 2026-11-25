@@ -42,3 +42,22 @@ func TestEnvAddKeepsOneSortedPackageLayer(t *testing.T) {
 		t.Fatalf("layout wrong:\n%s", s)
 	}
 }
+
+func TestDataFiles(t *testing.T) {
+	root := t.TempDir()
+	for _, f := range []string{"versions/1.26.9.1/a", "versions/1.26.60.4/b", "versions/versions.ini", "versions/1.26.44.3/c", "apks/x.apk", "mods/m.so", "dobby.log", "minecraftpe/packcache/p", "minecraftpe/options.txt", "xal/1"} {
+		os.MkdirAll(filepath.Join(root, filepath.Dir(f)), 0o755)
+		os.WriteFile(filepath.Join(root, f), []byte(f), 0o644)
+	}
+	_, files, err := dataFiles(DataSetConfig{Path: root, Exclude: []string{"apks/**", "*.log", "minecraftpe/packcache/**"}, Newest: []string{"versions/*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(files, ",")
+	if got != "minecraftpe/options.txt,mods/m.so,versions/1.26.60.4/b,versions/versions.ini,xal/1" {
+		t.Fatalf("files = %s", got)
+	}
+	if !versionLess("1.26.9.1", "1.26.60.4") || versionLess("1.26.60.4", "1.26.44.3") {
+		t.Fatal("versionLess")
+	}
+}

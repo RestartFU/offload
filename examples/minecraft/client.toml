@@ -1,0 +1,21 @@
+# Add to ~/.config/offload/client.toml. Synced incrementally; files the game changes on the
+# runner (settings, refreshed tokens) are kept unless they also change here.
+
+[data.minecraft]
+path = "~/.var/app/io.mrarm.mcpelauncher/data/mcpelauncher"
+newest = ["versions/*"]              # only the newest game version
+exclude = [
+  "apks/**", "downloads/**", "disabled-mods/**", "background_art/**", "PackManifestFactoryCache/**",
+  "minecraftpe/packcache/**", "minecraftpe/CatalogCache/**", "minecraftpe/ContentCache/**",
+  "minecraftpe/MessagingService/**", "*.log", "*.jsonl", "*.sock",
+]
+
+[data.minecraft-config]            # launcher settings incl. the Google Play login the updates mod uses
+path = "~/.var/app/io.mrarm.mcpelauncher/config/Minecraft Linux Launcher"
+
+[data.mcpelauncher-agent]
+path = "~/.local/share/mcpelauncher-agent"
+exclude = [".git/**"]
+
+[data.mcpelauncher-fork-repo]
+path = "~/.local/share/mcpelauncher-flatpak-fork/repo"

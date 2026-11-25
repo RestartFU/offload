@@ -46,6 +46,11 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
   (`containerfile`, `devices` such as `/dev/dri`, persistent `volumes`), or the client's
   `--environment NAME`, or on the host with `runtime = "host"`. The environment is built on first
   use while the client waits.
+- **Client-defined sessions and data sets.** `~/.config/offload/sessions/NAME.toml` describes a
+  whole MCP server: environment, command, data sets, persistent volumes, resources. Data sets
+  (`[data.NAME]` in `client.toml`, with include/exclude/newest rules) are synced incrementally
+  before each start. Files the runner changed are kept unless they also changed locally. Nothing
+  is set up on the runner by hand. See `examples/minecraft/`.
 - **Any Linux runner.** The environment is the same on every distro. Runners report OS/arch,
   and the client prefers one matching the laptop (`--platform linux/arm64` forces one).
   Windows hosts can be runners through WSL2; macOS hosts through a Linux VM.

@@ -9,11 +9,14 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/RestartFU/offload/internal/api"
+	"github.com/RestartFU/offload/internal/units"
 )
 
 // MCP starts a session from a runner profile and bridges this process's stdio to it, so an MCP
@@ -25,6 +28,7 @@ type MCPOptions struct {
 	Resources                api.Resources
 	With, Secrets            []string
 	Host                     bool
+	Prepare                  bool // run the session definition's prepare command and exit
 }
 
 func MCP(o MCPOptions) error {
@@ -39,6 +43,36 @@ func MCP(o MCPOptions) error {
 	if spec.Secrets, spec.SecretFiles, err = resolveSecrets(cfg, o.With, o.Secrets, true, true); err != nil {
 		return err
 	}
+	sc, err := LoadSessionConfig(profile)
+	if err != nil {
+		return err
+	}
+	if sc != nil {
+		cmd := sc.Command
+		if o.Prepare {
+			if len(sc.Prepare) == 0 {
+				return fmt.Errorf("session %s has no prepare command", profile)
+			}
+			cmd = sc.Prepare
+		}
+		spec.Def = &api.SessionDef{Command: cmd, Env: sc.Env, Data: sc.Data, Volumes: sc.Volumes,
+			Devices: sc.Devices, NestedSandbox: sc.NestedSandbox}
+		if o.Environment == "" {
+			o.Environment = sc.Environment
+		}
+		if spec.Resources.CPU == 0 {
+			spec.Resources.CPU = sc.Resources.CPU
+		}
+		if spec.Resources.CPUMax == 0 {
+			spec.Resources.CPUMax = sc.Resources.CPUMax
+		}
+		if spec.Resources.Mem == 0 {
+			spec.Resources.Mem, _ = units.ParseSize(sc.Resources.Mem)
+		}
+		res = spec.Resources
+	} else if o.Prepare {
+		return fmt.Errorf("--prepare needs a session definition in %s", filepath.Join(configDir(), "sessions", profile+".toml"))
+	}
 	if o.Environment != "" {
 		if spec.Environment, err = LoadEnvDef("", o.Environment); err != nil {
 			return err
@@ -51,11 +85,29 @@ func MCP(o MCPOptions) error {
 	var h *Host
 	if on != "" {
 		h, err = FindHost(hosts, on)
+	} else if sc != nil {
+		h, err = PickFor(hosts, api.JobSpec{Resources: res, Environment: spec.Environment}, "")
 	} else {
 		h, err = Pick(hosts, res, profile, "", "session")
 	}
 	if err != nil {
 		return err
+	}
+	if sc != nil {
+		names := make([]string, 0, len(sc.Data))
+		for name := range sc.Data {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			dc, ok := cfg.Data[name]
+			if !ok {
+				return fmt.Errorf("session %s uses data set %q, which client.toml doesn't define ([data.%s])", profile, name, name)
+			}
+			if err := SyncData(ctx, h, name, dc, false); err != nil {
+				return err
+			}
+		}
 	}
 	var se api.Session
 	for announced := false; ; {
@@ -90,7 +142,11 @@ func MCP(o MCPOptions) error {
 	inDone := make(chan error, 1)
 	go func() { done <- pumpOut(ctx, h, se.ID, "stdout", out) }()
 	go func() { _ = pumpOut(ctx, h, se.ID, "stderr", os.Stderr) }()
-	go func() { inDone <- pumpIn(ctx, h, se.ID, os.Stdin) }()
+	if o.Prepare {
+		_ = os.Stdin.Close() // nothing to send; wait for the prepare command to finish
+	} else {
+		go func() { inDone <- pumpIn(ctx, h, se.ID, os.Stdin) }()
+	}
 	select {
 	case <-ctx.Done():
 		return nil

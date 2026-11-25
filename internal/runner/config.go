@@ -94,6 +94,7 @@ type Profile struct {
 	Containerfile string            `toml:"containerfile"`
 	Devices       []string          `toml:"devices"`
 	Volumes       []string          `toml:"volumes"`
+	NestedSandbox bool              `toml:"nested_sandbox"` // allow bubblewrap/flatpak inside the container
 	Env           map[string]string `toml:"env"`
 	Resources     struct {
 		CPU    float64 `toml:"cpu"`

@@ -113,7 +113,13 @@ with no attached client for `session_grace` is stopped.
 
 ## Not built yet
 
-- The Minecraft session profile still runs on the host (the launcher fork is a flatpak).
+- Minecraft (examples/minecraft): the fork's flatpak runs inside the container
+  (`nested_sandbox`: unmask /proc, no seccomp filter, SYS_ADMIN and NET_ADMIN in the container's
+  own namespaces; a system D-Bus is started for `flatpak run`). The client starts. It currently
+  blocks in the updates mod's Google credentials helper (`mcpelauncher-ui-qt
+  --request-google-credentials`), which needs something the laptop has and the container
+  doesn't.
+- A client network mode (connections dialed by the attached client) and socket/port forwarding.
 - Sharing built images between runners (a tailnet registry) once there is a second runner.
 - devcontainer "features".
 - Kubernetes backend: a runner deployed in-cluster that creates Pods and Jobs with its own
