@@ -16,6 +16,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/RestartFU/offload/internal/api"
@@ -34,9 +35,10 @@ type job struct {
 	secrets     map[string]string // in memory until the job starts, then only in tmpfs
 	secretFiles map[string][]byte
 	queuedAt    time.Time
-	inactive    int       // consecutive checks the unit was gone without an exit record
-	checked     time.Time // last time systemd was asked whether the unit is active
-	mounts      []string  // runtime paths (sockets, secrets) this job's container may see
+	inactive    int         // consecutive checks the unit was gone without an exit record
+	checked     time.Time   // last time systemd was asked whether the unit is active
+	cancelled   atomic.Bool // set by DELETE; read by uploads without taking s.mu
+	mounts      []string    // runtime paths (sockets, secrets) this job's container may see
 
 }
 
@@ -51,10 +53,22 @@ type exitRecord struct {
 	WriteBack *api.WriteBack `json:"write_back,omitempty"`
 }
 
-// manifestDigest identifies a synced tree's content (paths, hashes, modes, links).
-func manifestDigest(m []api.FileEntry) string {
+// contextRel normalizes an environment's build context directory ("" means the workspace root).
+func contextRel(dir string) string {
+	if dir == "" || dir == "." {
+		return "."
+	}
+	return dir
+}
+
+// contextDigest identifies exactly the files a COPY/ADD build can see: those under ctx.
+func contextDigest(m []api.FileEntry, ctx string) string {
 	h := sha256.New()
+	fmt.Fprintf(h, "%s\n", ctx)
 	for _, e := range m {
+		if ctx != "." && !strings.HasPrefix(e.Path, ctx+"/") {
+			continue
+		}
 		fmt.Fprintf(h, "%s\x00%s\x00%o\x00%s\n", e.Path, e.Hash, e.Mode, e.Link)
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16]
@@ -67,10 +81,12 @@ func (j *job) view() api.Job {
 	return v
 }
 
-func (j *job) save() {
-	if err := writeFileJSON(filepath.Join(j.dir, "job.json"), j.Job); err != nil {
+func (j *job) save() error {
+	err := writeFileJSON(filepath.Join(j.dir, "job.json"), j.Job)
+	if err != nil {
 		log.Printf("job %s: save: %v", j.ID, err)
 	}
+	return err
 }
 
 func (s *Server) jobDir(id string) string { return filepath.Join(s.cfg.StateDir, "jobs", id) }
@@ -125,7 +141,9 @@ func (s *Server) restore() {
 					_, _ = j.relay.startAgent(j.ID)
 				}
 				if j.Runtime == "container" && (j.Spec.Network == "client" || slices.Contains(j.Spec.Relay, "git")) {
-					_, _ = s.startControl(j.relay, "jobs", j.ID)
+					if _, err := s.startControl(j.relay, "jobs", j.ID, j.Spec.Network == "client", slices.Contains(j.Spec.Relay, "git")); err != nil {
+						log.Printf("job %s: control socket after restart: %v", j.ID, err)
+					}
 				}
 			}
 			if j.AllowedCPUs != "" {
@@ -230,6 +248,12 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	case spec.Runtime != "" && spec.Runtime != "host":
 		out.err(400, "runtime must be host or container")
 		return
+	}
+	if e := spec.Environment; e != nil && contextRel(e.ContextDir) != "." {
+		if _, err := cleanRel(e.ContextDir); err != nil {
+			writeErr(w, 400, "environment context: "+err.Error())
+			return
+		}
 	}
 	if rt == "host" && spec.Environment != nil {
 		out.err(400, "this job has a container environment but runs on the host; drop --host or install podman")
@@ -384,7 +408,7 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 	}()
 	tmp, err := os.CreateTemp(j.dir, "bundle-*")
 	if err == nil {
-		_, err = tmp.ReadFrom(http.MaxBytesReader(w, r.Body, 16<<30))
+		_, err = tmp.ReadFrom(uploadBody(w, r, 16<<30, j.cancelled.Load))
 		if cerr := tmp.Close(); err == nil {
 			err = cerr
 		}
@@ -425,7 +449,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	needed, err := sl.plan(manifest)
 	if err == nil {
-		err = sl.apply(manifest, needed, http.MaxBytesReader(w, r.Body, 8<<30))
+		err = sl.apply(manifest, needed, uploadBody(w, r, 8<<30, j.cancelled.Load))
 	}
 	s.mu.Lock()
 	g := j.Spec.Git
@@ -436,7 +460,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if err == nil {
 		// No git for this job: don't leave a stale .git describing some other commit.
-		_ = os.RemoveAll(filepath.Join(sl.Dir, ".git"))
+		if root, err := os.OpenRoot(sl.Dir); err == nil {
+			_ = root.RemoveAll(".git")
+			root.Close()
+		}
 	}
 
 	s.mu.Lock()
@@ -453,7 +480,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j.State, j.queuedAt = api.StateQueued, time.Now()
-	j.ContextDigest = manifestDigest(manifest)
+	if e := j.Spec.Environment; e != nil {
+		j.ContextDigest = contextDigest(manifest, contextRel(e.ContextDir))
+	}
 	j.Spec.Manifest = nil // synced; no need to keep it on disk
 	j.save()
 	out.json(j.view())
@@ -570,7 +599,13 @@ func (s *Server) startJobLocked(j *job) error {
 		j.AllowedCPUs = units.FormatCPUList(j.cpus)
 	}
 	argv := append([]string{s.self, "runner", "exec", "--job-dir", j.dir}, artifactArgs(j.Spec.Artifacts)...)
-	secrets := s.setupCredentials(j, env)
+	secrets, err := s.setupCredentials(j, env)
+	if err != nil {
+		s.releaseCPUsLocked(j.cpus)
+		s.cleanupCredentials(j)
+		j.cpus, j.AllowedCPUs, j.Unit = nil, "", ""
+		return err
+	}
 	if secrets != "" && !container {
 		argv = append(argv, "--secrets", secrets)
 	}
@@ -602,8 +637,18 @@ func (s *Server) startJobLocked(j *job) error {
 	// the start, restore sees a running job and watches its unit instead of starting it again.
 	now := time.Now()
 	j.State, j.StartedAt = api.StateRunning, &now
-	j.save()
+	if err := j.save(); err != nil {
+		s.releaseCPUsLocked(j.cpus)
+		s.cleanupCredentials(j)
+		j.cpus, j.AllowedCPUs, j.Unit = nil, "", ""
+		j.State, j.StartedAt = api.StateQueued, nil
+		return fmt.Errorf("can't record the job before starting it: %w", err)
+	}
 	if err := startUnit(contextBG(), u); err != nil {
+		if active, known := unitActive(u.Name); known && active {
+			log.Printf("job %s: systemd-run reported %v, but the unit is running; keeping it", j.ID, err)
+			return nil
+		}
 		s.releaseCPUsLocked(j.cpus)
 		s.cleanupCredentials(j)
 		j.cpus, j.AllowedCPUs, j.Unit = nil, "", ""
@@ -637,14 +682,12 @@ func (s *Server) checkRunning() {
 			continue // asking systemd is slower; once a second is plenty for crashed units
 		}
 		j.checked = time.Now()
-		active, known := true, true
-		if err != nil {
-			active, known = unitActive(j.Unit)
-		}
+		// An exit record only counts once systemd confirms the unit is gone too.
+		active, known := unitActive(j.Unit)
 		s.mu.Lock()
 		switch {
-		case err != nil && !known:
-			// systemd didn't answer: no conclusion, keep the job's resources.
+		case !known || (err == nil && active):
+			// systemd didn't answer, or the wrapper is still exiting: no conclusion yet.
 		case err == nil:
 			state, reason := api.StateExited, rec.Error
 			if rec.OOM {
@@ -694,7 +737,9 @@ func (s *Server) finishLocked(j *job, state string, code *int, reason string) {
 	j.cpus = nil
 	if j.slot != nil {
 		if j.slot.leases > 0 {
-			j.slot.releaseAfterBuild = true // a build still reads it; the build releases it
+			// A build is still snapshotting it; the build releases it afterwards.
+			j.slot.releaseAfterBuild = true
+			j.slot.dropAfterBuild = !s.cfg.persistent || j.Spec.Ephemeral
 		} else {
 			s.releaseSlotLocked(j.slot, !s.cfg.persistent || j.Spec.Ephemeral)
 		}
@@ -737,6 +782,7 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		out.err(404, "no such job")
 		return
 	}
+	j.cancelled.Store(true)
 	switch j.State {
 	case api.StateUploading, api.StateQueued:
 		if j.syncing {

@@ -39,7 +39,7 @@ func MCP(o MCPOptions) error {
 	if err != nil {
 		return err
 	}
-	spec := api.SessionSpec{Profile: profile, Resources: res, Client: clientLabel()}
+	spec := api.SessionSpec{Profile: profile, Resources: res, Client: clientLabel(), DNSSearch: dnsSearch()}
 	if spec.Secrets, spec.SecretFiles, err = resolveSecrets(cfg, o.With, o.Secrets, true, true); err != nil {
 		return err
 	}
@@ -135,7 +135,7 @@ func MCP(o MCPOptions) error {
 	}
 	fmt.Fprintf(os.Stderr, "offload: session %s:%s (%s)\n", h.Name, se.ID, profile)
 	if se.Network == "client" { // the runner says so, whether the profile is ours or the runner's
-		go serveCallbacks(ctx, h, "/v1/sessions/"+se.ID, cfg, true)
+		go serveCallbacks(ctx, h, "/v1/sessions/"+se.ID, cfg, true, map[string]bool{"dial": true})
 	}
 	defer func() {
 		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)

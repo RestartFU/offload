@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -138,11 +139,15 @@ func (s *Server) Serve(ctx context.Context) error {
 
 // unixSocketPath is the local runner socket (used by a runner on the same machine).
 func unixSocketPath() string {
-	dir := os.Getenv("XDG_RUNTIME_DIR")
-	if dir == "" {
-		dir = filepath.Join(os.TempDir(), fmt.Sprintf("offload-%d", os.Getuid()))
+	return filepath.Join(userRuntimeDir(), "offload-admin", "runner.sock")
+}
+
+// userRuntimeDir is $XDG_RUNTIME_DIR (tmpfs), or a per-user fallback.
+func userRuntimeDir() string {
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		return dir
 	}
-	return filepath.Join(dir, "offload", "runner.sock")
+	return filepath.Join(os.TempDir(), fmt.Sprintf("offload-%d", os.Getuid()))
 }
 
 type unixMarker struct{}
@@ -485,6 +490,29 @@ func newID(prefix string) string {
 	b := make([]byte, 5)
 	_, _ = rand.Read(b)
 	return prefix + hex.EncodeToString(b)
+}
+
+// uploadIdle is how long an upload may stall before it is abandoned.
+const uploadIdle = 2 * time.Minute
+
+// idleBody reads a request body with a deadline that is pushed forward while data flows, and
+// stops early when stop reports true (the job was cancelled).
+type idleBody struct {
+	r    io.Reader
+	rc   *http.ResponseController
+	stop func() bool
+}
+
+func (b idleBody) Read(p []byte) (int, error) {
+	if b.stop != nil && b.stop() {
+		return 0, errors.New("cancelled")
+	}
+	_ = b.rc.SetReadDeadline(time.Now().Add(uploadIdle))
+	return b.r.Read(p)
+}
+
+func uploadBody(w http.ResponseWriter, r *http.Request, limit int64, stop func() bool) io.Reader {
+	return idleBody{r: http.MaxBytesReader(w, r.Body, limit), rc: http.NewResponseController(w), stop: stop}
 }
 
 // reply holds a handler's response until s.mu is released, so a client that stops reading can

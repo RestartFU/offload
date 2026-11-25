@@ -1,10 +1,8 @@
 package client
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -92,7 +90,7 @@ func serveDial(ctx context.Context, h *Host, data []byte) string {
 		return err.Error()
 	}
 	if req.Proto == "udp" {
-		go relayDatagrams(stream, conn)
+		go streamio.RelayDatagrams(conn.(*net.UDPConn), stream, 2*time.Minute)
 	} else {
 		go streamio.Splice(stream, conn)
 	}
@@ -111,43 +109,4 @@ func openStream(ctx context.Context, h *Host, id string) (net.Conn, error) {
 		hdr.Set("Authorization", "Bearer "+h.Token)
 	}
 	return streamio.Upgrade(c, h.hostHeader(), "/v1/streams/"+id, hdr)
-}
-
-// relayDatagrams carries a UDP flow: frames from the stream (2-byte length + payload) become
-// datagrams to the destination and back, until either side closes or two idle minutes pass.
-func relayDatagrams(stream io.ReadWriteCloser, conn net.Conn) {
-	defer stream.Close()
-	defer conn.Close()
-	go func() {
-		buf := make([]byte, 65535)
-		frame := make([]byte, 2+65535)
-		for {
-			conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
-			n, err := conn.Read(buf)
-			if err != nil {
-				stream.Close()
-				return
-			}
-			frame[0], frame[1] = byte(n>>8), byte(n)
-			copy(frame[2:], buf[:n])
-			if _, err := stream.Write(frame[:2+n]); err != nil {
-				return
-			}
-		}
-	}()
-	r := bufio.NewReader(stream)
-	var hdr [2]byte
-	buf := make([]byte, 65535)
-	for {
-		if _, err := io.ReadFull(r, hdr[:]); err != nil {
-			return
-		}
-		n := int(hdr[0])<<8 | int(hdr[1])
-		if _, err := io.ReadFull(r, buf[:n]); err != nil {
-			return
-		}
-		if _, err := conn.Write(buf[:n]); err != nil {
-			return
-		}
-	}
 }

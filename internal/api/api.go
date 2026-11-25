@@ -168,6 +168,7 @@ type SessionSpec struct {
 	SecretFiles map[string][]byte `json:"secret_files,omitempty"`
 	Environment *EnvDef           `json:"environment,omitempty"` // overrides the profile's
 	Runtime     string            `json:"runtime,omitempty"`     // "host" or "container"
+	DNSSearch   []string          `json:"dns_search,omitempty"`  // the client's search list, for network = "client"
 	// Def is a session defined on the client (~/.config/offload/sessions/NAME.toml); when set,
 	// the runner needs no profile of that name.
 	Def *SessionDef `json:"def,omitempty"`

@@ -20,54 +20,58 @@ import (
 // connects back (POST /v1/streams/{sid}); the runner then splices the two connections. Both legs
 // are HTTP/1.1 upgrades to a raw byte stream.
 
+// pendingStream is one dial waiting for the client's leg. The leg is delivered at most once; the
+// dial claims it, or whoever ends the pairing closes it.
+type pendingStream struct {
+	conn  net.Conn
+	ready chan struct{}
+}
+
 type streamHub struct {
 	mu      sync.Mutex
-	pending map[string]chan net.Conn
+	pending map[string]*pendingStream
 }
 
-var hub = &streamHub{pending: map[string]chan net.Conn{}}
+var hub = &streamHub{pending: map[string]*pendingStream{}}
 
-func (h *streamHub) expect(id string) chan net.Conn {
-	ch := make(chan net.Conn, 1)
+func (h *streamHub) expect(id string) *pendingStream {
+	p := &pendingStream{ready: make(chan struct{})}
 	h.mu.Lock()
-	h.pending[id] = ch
+	h.pending[id] = p
 	h.mu.Unlock()
-	return ch
+	return p
 }
 
-// forget ends a pairing. A client leg that was delivered but never taken (the dial gave up) is
-// closed here, so no upgraded connection is left behind.
-func (h *streamHub) forget(id string) {
+// claim ends a pairing and returns the delivered leg, if any. Called exactly once per dial.
+func (h *streamHub) claim(id string) net.Conn {
 	h.mu.Lock()
-	ch := h.pending[id]
+	defer h.mu.Unlock()
+	p := h.pending[id]
 	delete(h.pending, id)
-	h.mu.Unlock()
-	if ch == nil {
-		return
+	if p == nil {
+		return nil
 	}
-	select {
-	case c := <-ch:
-		c.Close()
-	default:
-	}
+	c := p.conn
+	p.conn = nil
+	return c
 }
 
+// deliver hands the client's leg to a waiting dial; false (and the caller closes c) if there is
+// no such dial or it already has a leg.
 func (h *streamHub) deliver(id string, c net.Conn) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	ch := h.pending[id]
-	if ch == nil {
+	p := h.pending[id]
+	if p == nil || p.conn != nil {
 		return false
 	}
-	select {
-	case ch <- c: // stays registered until the dial takes it or forget closes it
-		return true
-	default:
-		return false
-	}
+	p.conn = c
+	close(p.ready)
+	return true
 }
 
-// upgrade hijacks the request's connection and answers 101, leaving a raw stream.
+// upgrade hijacks the request's connection and answers 101, leaving a raw stream. The handshake
+// has a deadline, and the connection is closed on any error.
 func upgrade(w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -77,12 +81,16 @@ func upgrade(w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	_ = c.SetDeadline(time.Time{})
-	if _, err := rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: offload-stream\r\nConnection: Upgrade\r\n\r\n"); err != nil {
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: offload-stream\r\nConnection: Upgrade\r\n\r\n"); err == nil {
+		err = rw.Flush()
+	}
+	if err != nil {
 		c.Close()
 		return nil, nil, err
 	}
-	return c, rw, rw.Flush()
+	_ = c.SetDeadline(time.Time{})
+	return c, rw, nil
 }
 
 // dialRequest is what the client receives (callback kind "dial").
@@ -102,6 +110,10 @@ func (s *Server) handleDial(w http.ResponseWriter, r *http.Request) {
 	if o == nil {
 		return
 	}
+	if !o.allowDial {
+		writeErr(w, 403, "this workload does not use client networking")
+		return
+	}
 	req := dialRequest{Stream: newID("st-"), Proto: r.URL.Query().Get("proto"), Addr: r.URL.Query().Get("addr")}
 	if req.Proto != "tcp" && req.Proto != "udp" {
 		writeErr(w, 400, "proto must be tcp or udp")
@@ -111,8 +123,13 @@ func (s *Server) handleDial(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad addr")
 		return
 	}
-	ch := hub.expect(req.Stream)
-	defer hub.forget(req.Stream)
+	pending := hub.expect(req.Stream)
+	var remote net.Conn
+	defer func() {
+		if c := hub.claim(req.Stream); c != nil {
+			c.Close() // delivered but never used (the dial gave up)
+		}
+	}()
 	body, _ := json.Marshal(req)
 	answer, err := o.rl.ask("dial", body, 30*time.Second)
 	if err != nil {
@@ -123,14 +140,15 @@ func (s *Server) handleDial(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, a)
 		return
 	}
-	var remote net.Conn
 	select {
-	case remote = <-ch:
-		hub.mu.Lock()
-		delete(hub.pending, req.Stream) // taken: forget has nothing left to close
-		hub.mu.Unlock()
+	case <-pending.ready:
+		remote = hub.claim(req.Stream)
 	case <-time.After(15 * time.Second):
 		writeErr(w, http.StatusGatewayTimeout, "client did not connect the stream")
+		return
+	}
+	if remote == nil {
+		writeErr(w, http.StatusBadGateway, "stream vanished")
 		return
 	}
 	local, rw, err := upgrade(w)
@@ -138,14 +156,23 @@ func (s *Server) handleDial(w http.ResponseWriter, r *http.Request) {
 		remote.Close()
 		return
 	}
-	streamio.Splice(streamio.Buffered{Conn: local, R: rw.Reader}, remote)
+	leg := streamio.Buffered{Conn: local, R: rw.Reader}
+	// Tracked on the workload's relay: when the job or session ends, its streams are closed.
+	if !o.rl.track(leg, remote) {
+		leg.Close()
+		remote.Close()
+		return
+	}
+	defer o.rl.untrack(leg, remote)
+	streamio.Splice(leg, remote)
 }
 
 // handleStream is the client's leg of a dial: it is paired with the waiting container leg.
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sid")
 	hub.mu.Lock()
-	_, ok := hub.pending[id]
+	p, ok := hub.pending[id]
+	ok = ok && p.conn == nil
 	hub.mu.Unlock()
 	if !ok {
 		writeErr(w, 404, "no such stream")

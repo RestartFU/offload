@@ -108,44 +108,14 @@ func Start(dial Dialer) error {
 }
 
 // relayUDP carries one UDP flow (one source, one destination) over a framed stream, until it has
-// been idle for two minutes.
+// been idle in both directions for two minutes.
 func relayUDP(c *gonet.UDPConn, addr string, dial Dialer) {
-	defer c.Close()
 	up, err := dial("udp", addr)
 	if err != nil {
+		c.Close()
 		return
 	}
-	defer up.Close()
-	go func() {
-		var hdr [2]byte
-		buf := make([]byte, 65535)
-		for {
-			if _, err := io.ReadFull(up, hdr[:]); err != nil {
-				c.Close()
-				return
-			}
-			n := int(hdr[0])<<8 | int(hdr[1])
-			if _, err := io.ReadFull(up, buf[:n]); err != nil {
-				c.Close()
-				return
-			}
-			c.Write(buf[:n])
-		}
-	}()
-	buf := make([]byte, 65535)
-	frame := make([]byte, 2+65535)
-	for {
-		c.SetReadDeadline(time.Now().Add(2 * time.Minute))
-		n, err := c.Read(buf)
-		if err != nil {
-			return
-		}
-		frame[0], frame[1] = byte(n>>8), byte(n)
-		copy(frame[2:], buf[:n])
-		if _, err := up.Write(frame[:2+n]); err != nil {
-			return
-		}
-	}
+	streamio.RelayDatagrams(c, up, 2*time.Minute)
 }
 
 func openTUN(name string) (int, error) {

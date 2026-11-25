@@ -34,10 +34,11 @@ import (
 var errNoClient = errors.New("no offload client attached to answer (was the job detached?)")
 
 type callback struct {
-	ID   string `json:"id"`
-	Kind string `json:"kind"` // "ssh-agent" or "git-credential"
-	Data []byte `json:"data"`
-	resp chan []byte
+	ID      string `json:"id"`
+	Kind    string `json:"kind"` // "ssh-agent" or "git-credential"
+	Data    []byte `json:"data"`
+	resp    chan []byte
+	expires time.Time
 }
 
 // relay queues a job's credential requests for its client to answer.
@@ -50,6 +51,33 @@ type relay struct {
 	lastPoll time.Time
 	agent    net.Listener
 	ctl      net.Listener // the workload's own control socket (see startControl)
+	srv      *http.Server // serves ctl; closing it also closes its open connections
+	conns    map[net.Conn]struct{}
+	closed   bool
+}
+
+// track registers a workload's live stream legs so close can end them; false once closed.
+func (r *relay) track(cs ...net.Conn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return false
+	}
+	if r.conns == nil {
+		r.conns = map[net.Conn]struct{}{}
+	}
+	for _, c := range cs {
+		r.conns[c] = struct{}{}
+	}
+	return true
+}
+
+func (r *relay) untrack(cs ...net.Conn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range cs {
+		delete(r.conns, c)
+	}
 }
 
 func newRelay() *relay {
@@ -67,7 +95,7 @@ func (r *relay) ask(kind string, data []byte, timeout time.Duration) ([]byte, er
 		r.mu.Unlock()
 		return nil, errNoClient
 	}
-	cb := &callback{ID: newID("c-"), Kind: kind, Data: data, resp: make(chan []byte, 1)}
+	cb := &callback{ID: newID("c-"), Kind: kind, Data: data, resp: make(chan []byte, 1), expires: time.Now().Add(timeout)}
 	r.queue = append(r.queue, cb)
 	r.pending[cb.ID] = cb
 	r.mu.Unlock()
@@ -75,7 +103,18 @@ func (r *relay) ask(kind string, data []byte, timeout time.Duration) ([]byte, er
 	case r.notify <- struct{}{}:
 	default:
 	}
-	defer func() { r.mu.Lock(); delete(r.pending, cb.ID); r.mu.Unlock() }()
+	defer func() {
+		// Whatever happened, this request is over: never hand it to a client later.
+		r.mu.Lock()
+		delete(r.pending, cb.ID)
+		for i, q := range r.queue {
+			if q == cb {
+				r.queue = append(r.queue[:i], r.queue[i+1:]...)
+				break
+			}
+		}
+		r.mu.Unlock()
+	}()
 	select {
 	case b := <-cb.resp:
 		return b, nil
@@ -87,6 +126,11 @@ func (r *relay) ask(kind string, data []byte, timeout time.Duration) ([]byte, er
 func (r *relay) close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.closed = true
+	if r.srv != nil {
+		r.srv.Close() // the listener and every open connection on it
+		r.srv = nil
+	}
 	for _, ln := range []*net.Listener{&r.agent, &r.ctl} {
 		if *ln != nil {
 			(*ln).Close()
@@ -94,12 +138,16 @@ func (r *relay) close() {
 			*ln = nil
 		}
 	}
+	for c := range r.conns {
+		c.Close()
+	}
+	r.conns = nil
 }
 
 // startControl gives one job or session its own unix socket that serves only its own credential
 // and dial requests. Containers get this socket mounted, never the runner's main socket (whose
 // callers are fully trusted) or the shared runtime directory (other workloads' sockets and secrets).
-func (s *Server) startControl(rl *relay, kind, id string) (string, error) {
+func (s *Server) startControl(rl *relay, kind, id string, dial, credential bool) (string, error) {
 	path := filepath.Join(workloadDir(id), "ctl")
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)
 	_ = os.Remove(path)
@@ -117,19 +165,26 @@ func (s *Server) startControl(rl *relay, kind, id string) (string, error) {
 			h(w, r)
 		}
 	}
+	// Only the features this workload enabled are reachable from inside it.
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/"+kind+"/{id}/credential", own(s.handleCredential))
-	mux.HandleFunc("POST /v1/"+kind+"/{id}/dial", own(s.handleDial))
+	if credential {
+		mux.HandleFunc("POST /v1/"+kind+"/{id}/credential", own(s.handleCredential))
+	}
+	if dial {
+		mux.HandleFunc("POST /v1/"+kind+"/{id}/dial", own(s.handleDial))
+	}
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 30 * time.Second,
 		ConnContext: func(c context.Context, _ net.Conn) context.Context { return context.WithValue(c, unixMarker{}, true) }}
 	go srv.Serve(ln)
 	rl.mu.Lock()
-	rl.ctl = ln
+	rl.ctl, rl.srv = ln, srv
 	rl.mu.Unlock()
 	return path, nil
 }
 
-func runtimeDir() string { return filepath.Dir(unixSocketPath()) }
+// runtimeDir holds per-workload sockets and secrets. The runner's own (fully trusted) socket lives
+// in a separate directory (unixSocketPath), so no container mount of this tree can reach it.
+func runtimeDir() string { return filepath.Join(userRuntimeDir(), "offload") }
 
 func secretsDir(id string) string { return filepath.Join(runtimeDir(), "secrets", id) }
 
@@ -193,11 +248,11 @@ func (r *relay) serveAgent(c net.Conn) {
 // setupCredentials prepares relays and secrets for a job about to start and adds their env.
 // It returns the secrets directory to hand to the wrapper ("" if none).
 // For a containerized job it also records in j.mounts the only runtime paths the container may see.
-func (s *Server) setupCredentials(j *job, env map[string]string) string {
+func (s *Server) setupCredentials(j *job, env map[string]string) (string, error) {
 	container := j.Runtime == "container"
 	sock := unixSocketPath()
 	if j.relay != nil && container && (j.Spec.Network == "client" || slices.Contains(j.Spec.Relay, "git")) {
-		ctl, err := s.startControl(j.relay, "jobs", j.ID)
+		ctl, err := s.startControl(j.relay, "jobs", j.ID, j.Spec.Network == "client", slices.Contains(j.Spec.Relay, "git"))
 		if err != nil {
 			s.note(j, "control socket unavailable: "+err.Error())
 		} else {
@@ -235,8 +290,9 @@ func (s *Server) setupCredentials(j *job, env map[string]string) string {
 		addGitConfig(env, kv[0], kv[1])
 	}
 	dir, err := writeSecrets(j.ID, j.secrets, j.secretFiles)
+	j.secrets, j.secretFiles = nil, nil // from here on they only exist in the tmpfs directory
 	if err != nil {
-		s.note(j, "secrets unavailable: "+err.Error())
+		return "", fmt.Errorf("secrets: %w", err) // never run a job without the secrets it asked for
 	}
 	if dir != "" {
 		j.mounts = append(j.mounts, dir)
@@ -246,8 +302,7 @@ func (s *Server) setupCredentials(j *job, env map[string]string) string {
 			j.mounts = append(j.mounts, workloadDir(j.ID))
 		}
 	}
-	j.secrets, j.secretFiles = nil, nil // from here on they only exist in the tmpfs directory
-	return dir
+	return dir, nil
 }
 
 // writeSecrets puts secrets in a tmpfs directory for the unit wrapper to load ("" if none).
@@ -329,30 +384,35 @@ func (s *Server) listensUnix() bool {
 
 // relayOwner is the job or session a relay request is about.
 type relayOwner struct {
-	id   string
-	rl   *relay
-	done func() bool
-	note func(string)
+	id        string
+	rl        *relay
+	done      func() bool
+	note      func(string)
+	allowDial bool // the workload uses network = "client"
+	allowCred bool // the workload enabled the git credential relay
 }
 
 // relayOf finds the relay of /v1/jobs/{id}/… or /v1/sessions/{id}/….
 func (s *Server) relayOf(w http.ResponseWriter, r *http.Request) *relayOwner {
 	id := r.PathValue("id")
+	var o *relayOwner
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if strings.HasPrefix(r.URL.Path, "/v1/sessions/") {
 		if se := s.sessions[id]; se != nil && se.relay != nil {
-			return &relayOwner{id: id, rl: se.relay,
+			o = &relayOwner{id: id, rl: se.relay, allowDial: se.Network == "client",
 				done: func() bool { s.mu.Lock(); defer s.mu.Unlock(); return api.Terminal(se.State) },
 				note: func(msg string) { appendNote(filepath.Join(se.dir, "stderr.log"), msg) }}
 		}
 	} else if j := s.jobs[id]; j != nil && j.relay != nil {
-		return &relayOwner{id: id, rl: j.relay,
+		o = &relayOwner{id: id, rl: j.relay, allowDial: j.Spec.Network == "client", allowCred: slices.Contains(j.Spec.Relay, "git"),
 			done: func() bool { s.mu.Lock(); defer s.mu.Unlock(); return api.Terminal(j.State) },
 			note: func(msg string) { s.note(j, msg) }}
 	}
-	writeErr(w, 404, "no such job or session, or it has no relay")
-	return nil
+	s.mu.Unlock() // never write a response while holding the scheduler lock
+	if o == nil {
+		writeErr(w, 404, "no such job or session, or it has no relay")
+	}
+	return o
 }
 
 func appendNote(path, msg string) {
@@ -383,9 +443,12 @@ func (s *Server) handleCallbacks(w http.ResponseWriter, r *http.Request) {
 	deadline := time.After(25 * time.Second)
 	for {
 		rl.mu.Lock()
-		if len(rl.queue) > 0 {
+		for len(rl.queue) > 0 {
 			cb := rl.queue[0]
 			rl.queue = rl.queue[1:]
+			if time.Now().After(cb.expires) {
+				continue // its asker gave up; a late answer would act on a stale request
+			}
 			rl.mu.Unlock()
 			writeJSON(w, cb)
 			return
@@ -420,12 +483,16 @@ func (s *Server) handleCallbackReply(w http.ResponseWriter, r *http.Request) {
 	}
 	rl.mu.Lock()
 	cb := rl.pending[r.PathValue("cid")]
+	delete(rl.pending, r.PathValue("cid")) // one answer per request
 	rl.mu.Unlock()
 	if cb == nil {
 		writeErr(w, 404, "no such request")
 		return
 	}
-	cb.resp <- b
+	select {
+	case cb.resp <- b:
+	default:
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -438,6 +505,10 @@ func (s *Server) handleCredential(w http.ResponseWriter, r *http.Request) {
 	}
 	o := s.relayOf(w, r)
 	if o == nil {
+		return
+	}
+	if !o.allowCred {
+		writeErr(w, 403, "this workload did not enable the git credential relay")
 		return
 	}
 	rl := o.rl

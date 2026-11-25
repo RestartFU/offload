@@ -101,6 +101,10 @@ func (s *Server) handleDataUpload(w http.ResponseWriter, r *http.Request) {
 	mu := dataLock(name)
 	mu.Lock()
 	defer mu.Unlock()
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{uploadBody(w, r, 64<<30, nil), r.Body}
 	mr, err := r.MultipartReader()
 	if err != nil {
 		writeErr(w, 400, err.Error())
@@ -129,7 +133,7 @@ func (s *Server) handleDataUpload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case "files":
-			if err := sl.apply(plan.Manifest, needed, part); err != nil {
+			if err := sl.applyMode(plan.Manifest, needed, part, true); err != nil {
 				writeErr(w, 400, "data sync: "+err.Error())
 				return
 			}

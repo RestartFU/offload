@@ -33,15 +33,18 @@ type session struct {
 
 	relay *relay // client networking requests, when the session uses network = "client"
 
-	inMu  sync.Mutex // serializes stdin writes
-	conn  net.Conn
-	connR *bufio.Reader
+	inMu   sync.Mutex // serializes stdin writes
+	conn   net.Conn
+	connR  *bufio.Reader
+	legacy bool // the wrapper predates the framed protocol (started by an older runner)
 }
 
-func (se *session) save() {
-	if err := writeFileJSON(filepath.Join(se.dir, "session.json"), se.Session); err != nil {
+func (se *session) save() error {
+	err := writeFileJSON(filepath.Join(se.dir, "session.json"), se.Session)
+	if err != nil {
 		log.Printf("session %s: save: %v", se.ID, err)
 	}
+	return err
 }
 
 func (s *Server) restoreSessions() {
@@ -60,7 +63,9 @@ func (s *Server) restoreSessions() {
 			se.LastSeen = time.Now()
 			if se.Network == "client" {
 				se.relay = newRelay()
-				_, _ = s.startControl(se.relay, "sessions", se.ID)
+				if _, err := s.startControl(se.relay, "sessions", se.ID, true, false); err != nil {
+					log.Printf("session %s: control socket after restart: %v", se.ID, err)
+				}
 			}
 			if c, ok := s.unitCPUs(se.dir); ok {
 				se.cpus = c
@@ -225,6 +230,9 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if spec.Def != nil {
 		dnsSearch = spec.Def.DNSSearch
 	}
+	if len(dnsSearch) == 0 {
+		dnsSearch = spec.DNSSearch // runner-defined profiles get it too
+	}
 	unitEnv := env
 	if rt == "container" {
 		cenv := parallelEnv(ncpu)
@@ -242,12 +250,12 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			cenv["TZ"] = s.tz
 		}
 		cenv["TMPDIR"], cenv["OFFLOAD_SESSION"] = env["TMPDIR"], se.ID
-		same := []string{se.dir}
+		same := []string{filepath.Join(se.dir, "tmp")} // not se.dir: it holds exit.json and the session record
 		if secrets != "" {
 			same = append(same, secrets)
 		}
 		if se.relay != nil {
-			ctl, err := s.startControl(se.relay, "sessions", se.ID)
+			ctl, err := s.startControl(se.relay, "sessions", se.ID, true, false)
 			if err != nil {
 				s.releaseCPUsLocked(se.cpus)
 				_ = os.RemoveAll(secretsDir(se.ID))
@@ -271,7 +279,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			_ = os.MkdirAll(host, 0o755)
 			volumes = append(volumes, host+":"+ctr)
 		}
-		command = s.podmanRun(runSpec{Name: "offload-" + se.ID, Image: image, Workdir: se.dir, CPUs: allowed,
+		command = s.podmanRun(runSpec{Name: "offload-" + se.ID, Image: image, Workdir: filepath.Join(se.dir, "tmp"), CPUs: allowed,
 			Secrets: secrets, Mem: res.Mem, Env: cenv, Interactive: true, Argv: prof.Command, ClientNet: prof.Network == "client", DNSSearch: dnsSearch,
 			Same: same, Volumes: volumes, Devices: devices, NestedSandbox: prof.NestedSandbox})
 		unitEnv = map[string]string{}
@@ -292,8 +300,15 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	// Recorded before systemd starts the unit, so a runner that dies right after the start still
 	// finds the session on restore (and keeps accounting for and reaping it).
 	s.sessions[se.ID] = se
-	se.save()
-	if err := startUnit(contextBG(), u); err != nil {
+	err = se.save()
+	if err == nil {
+		if err = startUnit(contextBG(), u); err != nil {
+			if active, known := unitActive(u.Name); known && active {
+				err = nil // systemd-run timed out but the unit did start
+			}
+		}
+	}
+	if err != nil {
 		delete(s.sessions, se.ID)
 		s.releaseCPUsLocked(se.cpus)
 		if se.relay != nil {
@@ -359,6 +374,10 @@ func (s *Server) handleSessionStdin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	seq, _ := strconv.ParseInt(r.URL.Query().Get("seq"), 10, 64)
+	if seq <= 0 {
+		writeErr(w, 400, "seq must be a positive sequence number")
+		return
+	}
 	se.inMu.Lock()
 	defer se.inMu.Unlock()
 	// The wrapper (which outlives runner restarts) deduplicates by seq and acknowledges each
@@ -372,13 +391,25 @@ func (s *Server) handleSessionStdin(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			se.connR = bufio.NewReader(se.conn)
+			se.legacy = !readGreeting(se.conn, se.connR)
 		}
-		err = sendFrame(se.conn, se.connR, seq, body)
+		if se.legacy {
+			// A wrapper from before the framed protocol (started by an older runner): raw bytes.
+			_ = se.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			_, err = se.conn.Write(body)
+			_ = se.conn.SetWriteDeadline(time.Time{})
+		} else {
+			err = sendFrame(se.conn, se.connR, seq, body)
+		}
 		if err == nil {
 			break
 		}
 		se.conn.Close()
 		se.conn, se.connR = nil, nil
+		if errors.Is(err, errBusy) {
+			writeErr(w, http.StatusServiceUnavailable, "session is not reading its input; retry")
+			return
+		}
 		if attempt > 0 || errors.Is(err, os.ErrDeadlineExceeded) {
 			writeErr(w, http.StatusGatewayTimeout, "session stdin: "+err.Error())
 			return
@@ -402,16 +433,29 @@ func sendFrame(c net.Conn, r *bufio.Reader, seq int64, body []byte) error {
 	if err != nil {
 		return err
 	}
-	if ack != "ok\n" {
-		return fmt.Errorf("wrapper: %s", strings.TrimSpace(ack))
+	switch ack {
+	case "ok\n":
+		return nil
+	case "busy\n":
+		return errBusy
 	}
-	return nil
+	return fmt.Errorf("wrapper: %s", strings.TrimSpace(ack))
+}
+
+var errBusy = errors.New("busy")
+
+// readGreeting reports whether the wrapper on c speaks the framed protocol.
+func readGreeting(c net.Conn, r *bufio.Reader) bool {
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	defer c.SetReadDeadline(time.Time{})
+	line, err := r.ReadString('\n')
+	return err == nil && line == pipeGreeting
 }
 
 // sessionSock is where a session's wrapper accepts stdin. It lives in the runtime directory
 // because unix socket paths are limited to ~108 bytes.
 func sessionSock(id string) string {
-	return filepath.Join(filepath.Dir(unixSocketPath()), id+".sock")
+	return filepath.Join(runtimeDir(), id+".sock")
 }
 
 func dialRetry(path string, wait time.Duration) (net.Conn, error) {
@@ -486,17 +530,14 @@ func (s *Server) checkSessions() {
 	s.mu.Unlock()
 	for _, se := range live {
 		rec, err := readExit(filepath.Join(se.dir, "exit.json"))
-		active, known := true, true
-		if err != nil {
-			active, known = unitActive(se.Unit)
-		}
+		active, known := unitActive(se.Unit) // an exit record only counts once the unit is gone
 		s.mu.Lock()
 		if active {
 			se.inactive = 0
 		}
 		switch {
-		case err != nil && !known:
-			// systemd didn't answer: no conclusion.
+		case !known || (err == nil && active):
+			// systemd didn't answer, or the wrapper is still exiting: no conclusion yet.
 		case err == nil:
 			code := rec.Code
 			reason := se.Reason

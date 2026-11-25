@@ -122,21 +122,25 @@ func localSocket() string {
 	if dir == "" {
 		dir = filepath.Join(os.TempDir(), fmt.Sprintf("offload-%d", os.Getuid()))
 	}
-	return filepath.Join(dir, "offload", "runner.sock")
+	return filepath.Join(dir, "offload-admin", "runner.sock")
 }
+
+// noRedirects keeps requests (whose bodies can carry source and secrets) on the runner that was
+// vetted: a redirect is returned as an error, never followed.
+func noRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 func newHost(name, url, token string, prio int) *Host {
 	h := &Host{Name: name, URL: strings.TrimRight(url, "/"), Token: token, Priority: prio}
 	if sock, ok := strings.CutPrefix(url, "unix://"); ok {
 		h.URL, h.sock = "http://local", sock
-		h.http = &http.Client{Transport: &http.Transport{
+		h.http = &http.Client{CheckRedirect: noRedirects, Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
 				return d.DialContext(ctx, "unix", sock)
 			},
 		}}
 	} else {
-		h.http = &http.Client{Transport: &http.Transport{
+		h.http = &http.Client{CheckRedirect: noRedirects, Transport: &http.Transport{
 			DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}).DialContext,
 			ResponseHeaderTimeout: 0,
 			IdleConnTimeout:       60 * time.Second,

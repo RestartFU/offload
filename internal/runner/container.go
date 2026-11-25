@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -44,8 +45,9 @@ type envBuild struct {
 	err     error
 	waiters map[string]*job
 	logPath string
-	read    int64 // bytes of the log already copied to the waiters
-	slot    *slot // the workspace slot a COPY/ADD build reads (leased until the build ends)
+	read    int64  // bytes of the log already copied to the waiters
+	slot    *slot  // the workspace a COPY/ADD build snapshots its context from
+	ctxRel  string // that context's directory in the workspace ("" = no context)
 }
 
 func hash12(parts ...string) string {
@@ -106,11 +108,11 @@ func imageExists(tag string) bool {
 // build in the background and the job stays queued; a failed build fails the job.
 func (s *Server) ensureImageLocked(j *job) bool {
 	tag, cf, _ := envPlan(j.Spec.Environment)
-	ctxDir := ""
+	ctxRel := ""
 	if j.Spec.Environment != nil && usesContext(cf) && j.slot != nil {
-		ctxDir = filepath.Join(j.slot.Dir, filepath.FromSlash(j.Spec.Environment.ContextDir))
-		// The image depends on the workspace content too: only identical contexts share it.
-		tag = imageRepo + "/env:" + hash12(tag, j.ContextDigest)
+		ctxRel = contextRel(j.Spec.Environment.ContextDir)
+		// Keyed by the exact context (directory and content): only identical inputs share an image.
+		tag = imageRepo + "/env:" + hash12(tag, ctxRel, j.ContextDigest)
 	}
 	j.Image = tag
 	if b := s.builds[tag]; b != nil {
@@ -125,10 +127,10 @@ func (s *Server) ensureImageLocked(j *job) bool {
 		s.touchImage(tag)
 		return true
 	}
-	b := &envBuild{tag: tag, waiters: map[string]*job{j.ID: j}}
-	if ctxDir != "" {
+	b := &envBuild{tag: tag, waiters: map[string]*job{j.ID: j}, ctxRel: ctxRel}
+	if ctxRel != "" {
 		b.slot = j.slot
-		b.slot.leases++
+		b.slot.leases++ // held only while the context snapshot is copied
 	}
 	s.builds[tag] = b
 	name := "base"
@@ -136,13 +138,13 @@ func (s *Server) ensureImageLocked(j *job) bool {
 		name = j.Spec.Environment.Name
 	}
 	s.note(j, fmt.Sprintf("building environment %s on %s (cached layers make later builds fast)", name, s.cfg.Name))
-	go s.build(b, cf, ctxDir)
+	go s.build(b, cf)
 	return false
 }
 
 // build builds an image (and the base first, when needed) in its own unit with its own limits,
 // so a job's small learned memory limit can't starve its environment build.
-func (s *Server) build(b *envBuild, cf, ctxDir string) {
+func (s *Server) build(b *envBuild, cf string) {
 	dir := filepath.Join(s.cfg.StateDir, "envs", strings.ReplaceAll(strings.TrimPrefix(b.tag, imageRepo+"/"), ":", "-"))
 	_ = os.MkdirAll(dir, 0o755)
 	b.logPath = filepath.Join(dir, "build.log")
@@ -150,7 +152,20 @@ func (s *Server) build(b *envBuild, cf, ctxDir string) {
 	stop, pumped := make(chan struct{}), make(chan struct{})
 	go func() { s.pumpBuildLog(b, stop); close(pumped) }()
 	var err error
-	if strings.Contains(cf, baseTag()) && b.tag != baseTag() && !imageExists(baseTag()) {
+	ctxDir := ""
+	if b.slot != nil {
+		// Podman reads a private, immutable copy of exactly the synced context files, never the
+		// live workspace (which may hold ignored files, .git, or symlinks out of the tree).
+		ctxDir = filepath.Join(dir, "context")
+		err = snapshotContext(b.slot, b.ctxRel, ctxDir)
+		s.mu.Lock()
+		if b.slot.leases--; b.slot.leases == 0 && b.slot.releaseAfterBuild {
+			s.releaseSlotLocked(b.slot, b.slot.dropAfterBuild)
+		}
+		s.mu.Unlock()
+		defer os.RemoveAll(ctxDir)
+	}
+	if err == nil && strings.Contains(cf, baseTag()) && b.tag != baseTag() && !imageExists(baseTag()) {
 		err = s.runBuild(baseTag(), baseContainerfile, "", dir, b.logPath)
 	}
 	if err == nil && !imageExists(b.tag) {
@@ -160,16 +175,12 @@ func (s *Server) build(b *envBuild, cf, ctxDir string) {
 		err = s.runBootstrap(b.tag, b.logPath)
 	}
 	close(stop)
-	<-pumped // the pump owns b.read until it has stopped
-	s.copyBuildLog(b)
+	<-pumped                    // the pump owns b.read until it has stopped
+	for s.copyBuildLog(b) > 0 { // drain everything, in bounded chunks
+	}
 	s.mu.Lock()
 	b.done, b.err = true, err
 	delete(s.builds, b.tag) // a failed build is retried by the next job that needs it
-	if b.slot != nil {
-		if b.slot.leases--; b.slot.leases == 0 && b.slot.releaseAfterBuild {
-			s.releaseSlotLocked(b.slot, !s.cfg.persistent)
-		}
-	}
 	if err == nil {
 		s.readyImages[b.tag] = true
 		s.touchImage(b.tag)
@@ -218,6 +229,57 @@ func (s *Server) runBuild(tag, cf, ctxDir, dir, logPath string) error {
 			tail = strings.TrimSpace(string(out))
 		}
 		return fmt.Errorf("podman build %s: %v: %s", tag, err, tail)
+	}
+	return nil
+}
+
+// snapshotContext copies the synced files under ctxRel from the slot into dst, verifying each
+// file's hash against the slot record. Both sides go through os.Root.
+func snapshotContext(sl *slot, ctxRel, dst string) error {
+	_ = os.RemoveAll(dst)
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	src, err := os.OpenRoot(sl.Dir)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	out, err := os.OpenRoot(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	for p, ent := range sl.load().Files {
+		rel := p
+		if ctxRel != "." {
+			var ok bool
+			if rel, ok = strings.CutPrefix(p, ctxRel+"/"); !ok {
+				continue
+			}
+		}
+		if err := out.MkdirAll(path.Dir(rel), 0o755); err != nil {
+			return err
+		}
+		if ent.Link != "" {
+			if err := out.Symlink(ent.Link, rel); err != nil {
+				return err
+			}
+			continue
+		}
+		fi, err := src.Lstat(p)
+		if err != nil || !fi.Mode().IsRegular() {
+			return fmt.Errorf("context file %s changed on the runner", p)
+		}
+		f, err := src.Open(p)
+		if err != nil {
+			return err
+		}
+		err = writeConfined(out, rel, f, os.FileMode(ent.Mode).Perm(), ent.Hash)
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("context file %s: %w", p, err)
+		}
 	}
 	return nil
 }
@@ -302,16 +364,16 @@ func (s *Server) pumpBuildLog(b *envBuild, stop chan struct{}) {
 
 // copyBuildLog appends new build output (at most 1 MiB per call, read outside s.mu) to the
 // stderr of every job waiting on the build. Jobs that join mid-build see output from then on.
-func (s *Server) copyBuildLog(b *envBuild) {
+func (s *Server) copyBuildLog(b *envBuild) int {
 	f, err := os.Open(b.logPath)
 	if err != nil {
-		return
+		return 0
 	}
 	chunk := make([]byte, 1<<20)
 	n, _ := f.ReadAt(chunk, b.read)
 	f.Close()
 	if n == 0 {
-		return
+		return 0
 	}
 	b.read += int64(n)
 	s.mu.Lock()
@@ -326,6 +388,7 @@ func (s *Server) copyBuildLog(b *envBuild) {
 			f.Close()
 		}
 	}
+	return n
 }
 
 // prebuildBase builds the base image in the background at startup so the first job doesn't wait.
@@ -345,7 +408,7 @@ func (s *Server) prebuildBase() {
 	s.builds[baseTag()] = b
 	s.mu.Unlock()
 	log.Printf("building base environment %s", baseTag())
-	s.build(b, baseContainerfile, "")
+	s.build(b, baseContainerfile)
 }
 
 // --- running a job in a container ---
@@ -355,6 +418,7 @@ type runSpec struct {
 	Name, Image, Workdir, CPUs, Secrets string
 	Mem                                 int64
 	Same                                []string // host paths mounted at the same path
+	ReadOnly                            []string // host paths mounted read-only at the same path
 	Volumes                             []string // "host:container"
 	Devices                             []string
 	Env                                 map[string]string
@@ -404,6 +468,11 @@ func (s *Server) podmanRun(r runSpec) []string {
 			a = append(a, "-v", p+":"+p)
 		}
 	}
+	for _, p := range r.ReadOnly {
+		if _, err := os.Stat(p); err == nil {
+			a = append(a, "-v", p+":"+p+":ro")
+		}
+	}
 	a = append(a, "-v", s.self+":"+s.self+":ro")
 	for _, m := range append(s.cacheMounts(), r.Volumes...) {
 		a = append(a, "-v", m)
@@ -439,9 +508,13 @@ func (s *Server) podmanRun(r runSpec) []string {
 // containerArgv wraps a job command in podman run.
 func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets string) []string {
 	r := runSpec{Name: "offload-" + j.ID, Image: j.Image, Workdir: workdir, CPUs: j.AllowedCPUs,
-		Secrets: secrets, Mem: j.Resources.Mem, Env: env, Argv: j.Spec.Argv, Same: append([]string{j.dir}, j.mounts...)}
+		Secrets: secrets, Mem: j.Resources.Mem, Env: env, Argv: j.Spec.Argv,
+		// Never the job directory itself: it holds exit.json and the job record, which the
+		// container must not be able to forge.
+		Same: append([]string{filepath.Join(j.dir, "tmp"), filepath.Join(j.dir, "work")}, j.mounts...)}
 	if j.slot != nil {
-		r.Same = append(r.Same, j.slot.Dir, s.sharedGit(j.Spec.WorkspaceKey))
+		r.Same = append(r.Same, j.slot.Dir)
+		r.ReadOnly = append(r.ReadOnly, s.sharedGit(j.Spec.WorkspaceKey)) // shared by every slot of the repo
 	}
 	if j.Spec.Environment != nil {
 		r.Devices = j.Spec.Environment.Devices
@@ -470,7 +543,7 @@ func (s *Server) sessionImageLocked(def *api.EnvDef) (string, bool, error) {
 	}
 	b := &envBuild{tag: tag, waiters: map[string]*job{}}
 	s.builds[tag] = b
-	go s.build(b, cf, "")
+	go s.build(b, cf)
 	return tag, false, nil
 }
 

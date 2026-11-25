@@ -32,6 +32,7 @@ type slot struct {
 	// meanwhile; the slot is only released once no build reads it (releaseAfterBuild).
 	leases            int
 	releaseAfterBuild bool
+	dropAfterBuild    bool // the job that finished was ephemeral (or storage isn't persistent)
 }
 
 func (s *slot) id() string { return fmt.Sprintf("%s/%d", s.Key, s.Index) }
@@ -181,6 +182,12 @@ func (s *slot) plan(manifest []api.FileEntry) ([]string, error) {
 // extracts the uploaded files (verifying their hashes), recreates symlinks and fixes modes.
 // Untracked build output (target/, node_modules/…) is left alone; that's the point of a slot.
 func (s *slot) apply(manifest []api.FileEntry, needed []string, upload io.Reader) error {
+	return s.applyMode(manifest, needed, upload, false)
+}
+
+// applyMode syncs the slot. With keepRunner (data sets), only what changed on the client is
+// touched: files the runner changed itself (a refreshed token, a symlink a session made) stay.
+func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Reader, keepRunner bool) error {
 	rec := s.load()
 	root, err := s.openTree()
 	if err != nil {
@@ -197,8 +204,10 @@ func (s *slot) apply(manifest []api.FileEntry, needed []string, upload io.Reader
 	}
 	for p := range rec.Files {
 		if _, ok := want[p]; !ok {
-			if _, err := cleanRel(p); err == nil {
-				_ = root.Remove(p) // confined: a symlinked parent can't redirect this outside
+			// Only through real directories: a parent the runner turned into a symlink (even one
+			// pointing inside the tree) must not redirect this delete onto another tracked file.
+			if _, err := cleanRel(p); err == nil && realParents(root, p) {
+				_ = root.Remove(p)
 			}
 			delete(rec.Files, p)
 		}
@@ -207,13 +216,18 @@ func (s *slot) apply(manifest []api.FileEntry, needed []string, upload io.Reader
 	for _, p := range needed {
 		pending[p] = true
 	}
-	if err := extract(root, upload, want, pending, rec); err != nil {
+	written := map[string]bool{}
+	if err := extract(root, upload, want, pending, written); err != nil {
 		return err
 	}
 	for p := range pending {
 		return fmt.Errorf("upload is missing %q (and %d more)", p, len(pending)-1)
 	}
 	for _, e := range manifest {
+		old, had := rec.Files[e.Path]
+		if keepRunner && had && !written[e.Path] && old.Link == e.Link && (e.Link != "" || (old.Hash == e.Hash && old.Mode == e.Mode)) {
+			continue // unchanged on the client: leave the runner's copy alone
+		}
 		if err := prepareParents(root, e.Path); err != nil {
 			return fmt.Errorf("%s: %w", e.Path, err)
 		}
@@ -232,6 +246,9 @@ func (s *slot) apply(manifest []api.FileEntry, needed []string, upload io.Reader
 			return fmt.Errorf("%s: %w", e.Path, err)
 		}
 		if !fi.Mode().IsRegular() {
+			if keepRunner {
+				continue // the runner replaced it; the client didn't send new content
+			}
 			return fmt.Errorf("%s: not a regular file on the runner; sync again with --fresh", e.Path)
 		}
 		if fi.Mode().Perm() != os.FileMode(e.Mode).Perm() {
@@ -241,7 +258,10 @@ func (s *slot) apply(manifest []api.FileEntry, needed []string, upload io.Reader
 			fi, _ = root.Lstat(e.Path)
 		}
 		ent := rec.Files[e.Path]
-		ent.Hash, ent.Mode, ent.Link = e.Hash, e.Mode, ""
+		if written[e.Path] || !keepRunner || !had {
+			ent.Hash = e.Hash
+		}
+		ent.Mode, ent.Link = e.Mode, ""
 		ent.Size, ent.MTime = fi.Size(), fi.ModTime().UnixNano()
 		rec.Files[e.Path] = ent
 	}
@@ -249,10 +269,24 @@ func (s *slot) apply(manifest []api.FileEntry, needed []string, upload io.Reader
 	return s.save(rec)
 }
 
+// realParents reports whether every parent directory of rel is a real directory (no symlinks).
+func realParents(root *os.Root, rel string) bool {
+	parts := strings.Split(rel, "/")
+	for i := 1; i < len(parts); i++ {
+		fi, err := root.Lstat(strings.Join(parts[:i], "/"))
+		if err != nil || !fi.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
 // extract writes the uploaded files (verifying each hash) through the confined root, each via an
 // exclusively created temporary file and an atomic rename.
-func extract(root *os.Root, upload io.Reader, want map[string]api.FileEntry, pending map[string]bool, rec slotRecord) error {
-	if upload == nil || len(pending) == 0 {
+// Entries outside pending are accepted too when they match the manifest (another client may have
+// synced some of them between this client's plan and its upload).
+func extract(root *os.Root, upload io.Reader, want map[string]api.FileEntry, pending, written map[string]bool) error {
+	if upload == nil {
 		return nil
 	}
 	gz, err := gzip.NewReader(upload)
@@ -276,7 +310,7 @@ func extract(root *os.Root, upload io.Reader, want map[string]api.FileEntry, pen
 			return err
 		}
 		e, ok := want[p]
-		if !ok || !pending[p] || h.Typeflag != tar.TypeReg {
+		if !ok || e.Link != "" || h.Typeflag != tar.TypeReg {
 			return fmt.Errorf("upload: unexpected entry %q", h.Name)
 		}
 		if err := prepareParents(root, p); err != nil {
@@ -291,7 +325,7 @@ func extract(root *os.Root, upload io.Reader, want map[string]api.FileEntry, pen
 			return err
 		}
 		delete(pending, p)
-		rec.Files[p] = slotEntry{Hash: e.Hash, Mode: e.Mode}
+		written[p] = true
 	}
 }
 

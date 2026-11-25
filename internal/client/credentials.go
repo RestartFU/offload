@@ -235,7 +235,9 @@ func resolveSecrets(cfg *Config, sets, args []string, withAuto, quiet bool) (map
 // serveCallbacks answers the job's credential requests from this machine until ctx ends or the
 // job finishes. Each kind of use is announced once on stderr, so the caller knows it happened.
 // base is "/v1/jobs/<id>" or "/v1/sessions/<id>".
-func serveCallbacks(ctx context.Context, h *Host, base string, cfg *Config, quiet bool) {
+// allow lists the callback kinds this workload enabled ("dial", "ssh-agent", "git-credential");
+// anything else is refused here too, whatever the runner forwards.
+func serveCallbacks(ctx context.Context, h *Host, base string, cfg *Config, quiet bool, allow map[string]bool) {
 	var once sync.Map
 	announce := func(key, msg string) {
 		if _, loaded := once.LoadOrStore(key, true); !loaded {
@@ -276,6 +278,11 @@ func serveCallbacks(ctx context.Context, h *Host, base string, cfg *Config, quie
 		}
 		go func() {
 			var answer []byte
+			if !allow[cb.Kind] {
+				announce("deny:"+cb.Kind, "refused a "+cb.Kind+" request the job did not enable")
+				_ = h.do(ctx, "POST", base+"/callbacks/"+cb.ID, bytes.NewReader(nil), nil)
+				return
+			}
 			switch cb.Kind {
 			case "dial":
 				answer = []byte(serveDial(ctx, h, cb.Data))

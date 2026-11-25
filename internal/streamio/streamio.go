@@ -5,12 +5,14 @@ package streamio
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -81,8 +83,9 @@ func Splice(a, b io.ReadWriteCloser) {
 		defer wg.Done()
 		_, err := io.Copy(dst, src)
 		if cw, ok := dst.(closeWriter); ok && err == nil {
-			_ = cw.CloseWrite()
-			return
+			if cw.CloseWrite() == nil {
+				return
+			}
 		}
 		// No half-close available, or the copy failed: tear both down.
 		dst.Close()
@@ -93,4 +96,59 @@ func Splice(a, b io.ReadWriteCloser) {
 	wg.Wait()
 	a.Close()
 	b.Close()
+}
+
+// PacketConn is the datagram side of a UDP relay.
+type PacketConn interface {
+	io.ReadWriteCloser
+	SetReadDeadline(time.Time) error
+}
+
+// RelayDatagrams carries one UDP flow between a datagram connection and a stream of frames
+// (2-byte big-endian length, then the payload) until either side ends, or until no datagram has
+// moved in either direction for idle. Both are closed on return.
+func RelayDatagrams(pkt PacketConn, stream io.ReadWriteCloser, idle time.Duration) {
+	var last atomic.Int64
+	touch := func() { last.Store(time.Now().UnixNano()) }
+	touch()
+	defer pkt.Close()
+	defer stream.Close()
+	go func() { // stream -> datagrams
+		defer pkt.Close()
+		r := bufio.NewReader(stream)
+		var hdr [2]byte
+		buf := make([]byte, 65535)
+		for {
+			if _, err := io.ReadFull(r, hdr[:]); err != nil {
+				return
+			}
+			n := int(hdr[0])<<8 | int(hdr[1])
+			if _, err := io.ReadFull(r, buf[:n]); err != nil {
+				return
+			}
+			touch()
+			if _, err := pkt.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+	buf := make([]byte, 65535)
+	frame := make([]byte, 2+65535)
+	for { // datagrams -> stream
+		_ = pkt.SetReadDeadline(time.Now().Add(min(idle, 15*time.Second)))
+		n, err := pkt.Read(buf)
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(0, last.Load())) < idle {
+				continue // quiet this way, but the flow is alive in the other direction
+			}
+			return
+		}
+		touch()
+		frame[0], frame[1] = byte(n>>8), byte(n)
+		copy(frame[2:], buf[:n])
+		if _, err := stream.Write(frame[:2+n]); err != nil {
+			return
+		}
+	}
 }

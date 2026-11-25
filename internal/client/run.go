@@ -297,7 +297,16 @@ func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bo
 	if err == nil && (len(j.Spec.Relay) > 0 || j.Spec.Network == "client") && cfg != nil {
 		cbctx, stopCallbacks := context.WithCancel(ctx)
 		defer stopCallbacks()
-		go serveCallbacks(cbctx, h, "/v1/jobs/"+id, cfg, quiet)
+		allow := map[string]bool{"dial": j.Spec.Network == "client"}
+		for _, r := range j.Spec.Relay {
+			switch r {
+			case "git":
+				allow["git-credential"] = true
+			case "ssh-agent":
+				allow["ssh-agent"] = true
+			}
+		}
+		go serveCallbacks(cbctx, h, "/v1/jobs/"+id, cfg, quiet, allow)
 	}
 	if err == nil && j.State == api.StateQueued {
 		why := strings.TrimPrefix(j.Reason, "waiting: ")

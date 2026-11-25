@@ -177,6 +177,9 @@ func TestSessionFramesDeduplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := bufio.NewReader(c)
+	if !readGreeting(c, r) {
+		t.Fatal("wrapper did not greet with the framed protocol")
+	}
 	for _, f := range []struct {
 		seq  int64
 		body string

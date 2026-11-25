@@ -95,7 +95,12 @@ const writeBackLimit = 256 << 20
 
 // collectWriteBack finds synced files the job changed, packs them, and updates the slot record so
 // the next sync doesn't re-upload what the client is about to receive anyway.
-func collectWriteBack(root, recordPath, dest string) (*api.WriteBack, error) {
+func collectWriteBack(dir, recordPath, dest string) (*api.WriteBack, error) {
+	root, err := os.OpenRoot(dir) // confined: a job's symlinks can't redirect what is read back
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
 	b, err := os.ReadFile(recordPath)
 	if err != nil {
 		return nil, err
@@ -116,8 +121,7 @@ func collectWriteBack(root, recordPath, dest string) (*api.WriteBack, error) {
 		if ent.Link != "" {
 			continue
 		}
-		full := filepath.Join(root, filepath.FromSlash(p))
-		fi, err := os.Lstat(full)
+		fi, err := root.Lstat(p)
 		if err != nil {
 			wb.Deleted = append(wb.Deleted, p)
 			continue
@@ -125,7 +129,7 @@ func collectWriteBack(root, recordPath, dest string) (*api.WriteBack, error) {
 		if !fi.Mode().IsRegular() || (fi.Size() == ent.Size && fi.ModTime().UnixNano() == ent.MTime) {
 			continue
 		}
-		h, err := fileHash(full)
+		h, err := fileHash(root, p)
 		if err != nil {
 			continue
 		}
@@ -152,8 +156,8 @@ func collectWriteBack(root, recordPath, dest string) (*api.WriteBack, error) {
 	return wb, nil
 }
 
-func fileHash(p string) (string, error) {
-	f, err := os.Open(p)
+func fileHash(root *os.Root, p string) (string, error) {
+	f, err := root.Open(p)
 	if err != nil {
 		return "", err
 	}
@@ -165,7 +169,7 @@ func fileHash(p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func packFiles(dest, root string, files []api.ChangedFile) error {
+func packFiles(dest string, root *os.Root, files []api.ChangedFile) error {
 	f, err := os.Create(dest)
 	if err != nil {
 		return err
@@ -174,7 +178,7 @@ func packFiles(dest, root string, files []api.ChangedFile) error {
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)
 	for _, c := range files {
-		src, err := os.Open(filepath.Join(root, filepath.FromSlash(c.Path)))
+		src, err := root.Open(c.Path)
 		if err != nil {
 			return err
 		}
@@ -202,6 +206,10 @@ func cgroupInt(name string) int64 {
 	v, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
 	return v
 }
+
+// pipeGreeting starts every stdin connection, so the runner knows this wrapper speaks the framed
+// protocol (an older wrapper sends nothing and takes raw bytes).
+const pipeGreeting = "offload-pipe 2\n"
 
 // RunPipe is "offload runner pipe": run argv with stdin fed from the unix socket sock and stdout
 // appended to <dir>/stdout. Any number of connections may write to the socket over time.
@@ -232,11 +240,24 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	// Frames are "<seq> <len>\n<payload>"; each is acknowledged with "ok\n" once written to the
-	// process. lastSeq lives here, in the process that owns stdin, so a frame retried after a
-	// runner restart or a lost acknowledgement is skipped instead of delivered twice.
+	// Frames are "<seq> <len>\n<payload>" with seq > 0. A frame is acknowledged with "ok\n" once
+	// queued for the process (a duplicate seq, e.g. retried after a runner restart or a lost
+	// acknowledgement, is acknowledged and dropped); "busy\n" if the process isn't reading and
+	// the queue is full. lastSeq lives here, in the process that owns stdin.
 	var mu sync.Mutex
 	var lastSeq int64
+	var ended bool // the process exited; frames is closed
+	frames := make(chan []byte, 64)
+	go func() {
+		defer pw.Close()
+		for payload := range frames {
+			if _, err := pw.Write(payload); err != nil {
+				for range frames { // stdin is gone: drain so senders never block
+				}
+				return
+			}
+		}
+	}()
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -245,6 +266,9 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
+				if _, err := io.WriteString(c, pipeGreeting); err != nil {
+					return
+				}
 				r := bufio.NewReader(c)
 				for {
 					var seq int64
@@ -253,7 +277,7 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 					if err != nil {
 						return
 					}
-					if _, err := fmt.Sscanf(hdr, "%d %d", &seq, &n); err != nil || n < 0 || n > 64<<20 {
+					if _, err := fmt.Sscanf(hdr, "%d %d", &seq, &n); err != nil || seq <= 0 || n < 0 || n > 64<<20 {
 						fmt.Fprintf(c, "bad frame\n")
 						return
 					}
@@ -261,20 +285,20 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 					if _, err := io.ReadFull(r, payload); err != nil {
 						return
 					}
+					reply := "ok\n"
 					mu.Lock()
-					var werr error
-					if seq == 0 || seq > lastSeq {
-						_, werr = pw.Write(payload)
-						if seq > 0 && werr == nil {
+					if ended {
+						reply = "stdin closed\n"
+					} else if seq > lastSeq {
+						select {
+						case frames <- payload:
 							lastSeq = seq
+						default:
+							reply = "busy\n"
 						}
 					}
 					mu.Unlock()
-					if werr != nil {
-						fmt.Fprintf(c, "stdin closed\n")
-						return
-					}
-					if _, err := io.WriteString(c, "ok\n"); err != nil {
+					if _, err := io.WriteString(c, reply); err != nil {
 						return
 					}
 				}
@@ -283,7 +307,10 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 	}()
 	code, sig, runErr := runChild(argv, pr, out)
 	ln.Close()
-	pw.Close()
+	mu.Lock()
+	ended = true
+	close(frames) // the writer finishes (or drains) and closes the pipe
+	mu.Unlock()
 	rec := exitRecord{Code: code, Signal: sig, OOM: oomKilled()}
 	if runErr != nil {
 		rec.Error = runErr.Error()
@@ -361,6 +388,13 @@ func oomKilled() bool {
 
 // packArtifacts tars the given paths (files or directories, relative to the working directory).
 func packArtifacts(dest string, paths []string) error {
+	// Confined to the working directory: an artifact path (or a parent of it) that a job turned
+	// into a symlink can't make the runner pack files from elsewhere on the host.
+	root, err := os.OpenRoot(".")
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 	f, err := os.Create(dest)
 	if err != nil {
 		return err
@@ -370,36 +404,36 @@ func packArtifacts(dest string, paths []string) error {
 	tw := tar.NewWriter(gz)
 	found := 0
 	for _, p := range paths {
-		clean := filepath.Clean(p)
+		clean := filepath.ToSlash(filepath.Clean(p))
 		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
 			return fmt.Errorf("artifact path %q must stay inside the working directory", p)
 		}
-		err := filepath.WalkDir(clean, func(path string, d fs.DirEntry, err error) error {
+		err := fs.WalkDir(root.FS(), clean, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
-			info, err := d.Info()
+			info, err := root.Lstat(path)
 			if err != nil {
 				return err
 			}
 			link := ""
 			if info.Mode()&fs.ModeSymlink != 0 {
-				link, _ = os.Readlink(path)
+				link, _ = root.Readlink(path) // stored as a link, never followed
 			}
 			h, err := tar.FileInfoHeader(info, link)
 			if err != nil {
 				return err
 			}
-			h.Name = filepath.ToSlash(path)
+			h.Name = path
 			if err := tw.WriteHeader(h); err != nil {
 				return err
 			}
 			if info.Mode().IsRegular() {
-				src, err := os.Open(path)
+				src, err := root.Open(path)
 				if err != nil {
 					return err
 				}
-				_, err = io.Copy(tw, src)
+				_, err = io.CopyN(tw, src, info.Size())
 				src.Close()
 				if err != nil {
 					return err

@@ -118,12 +118,21 @@ func (s *Server) gitCheckout(sl *slot, key string, g *api.GitRef) error {
 	if _, err := gitCmd(shared, "cat-file", "-e", g.Head+"^{commit}"); err != nil {
 		return fmt.Errorf("commit %s was not uploaded", g.Head[:12])
 	}
+	// A fresh .git for every job: a previous job may have replaced parts of it with symlinks, and
+	// the runner is about to run git there. Objects live in the (read-only mounted) shared store,
+	// so this is cheap.
 	gitDir := filepath.Join(sl.Dir, ".git")
-	if _, err := os.Stat(filepath.Join(gitDir, "HEAD")); err != nil {
-		_ = os.RemoveAll(gitDir)
-		if _, err := gitCmd(sl.Dir, "init", "-q"); err != nil {
-			return err
-		}
+	root, err := os.OpenRoot(sl.Dir)
+	if err != nil {
+		return err
+	}
+	err = root.RemoveAll(".git")
+	root.Close()
+	if err != nil {
+		return err
+	}
+	if _, err := gitCmd(sl.Dir, "init", "-q"); err != nil {
+		return err
 	}
 	alt := filepath.Join(gitDir, "objects", "info", "alternates")
 	if err := os.MkdirAll(filepath.Dir(alt), 0o755); err != nil {
