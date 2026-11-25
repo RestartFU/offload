@@ -9,6 +9,11 @@
 - **Transport.** HTTP over the tailnet. Auth uses tailscaled WhoIs against `allow_users` and
   `allow_tags`. Bearer tokens are a fallback for hosts outside the tailnet. There is no SSH
   anywhere.
+- **No browsers.** Tailnet identity is ambient: a browser on an allowed machine carries it for
+  every page it shows. So the API refuses any request with `Origin` or a `Sec-Fetch-Site` other
+  than `none` (cross-site request forgery). Callers trusted by tailnet identity must also name
+  the runner in `Host` by IP address, localhost, its hostname or tailnet name, or an entry in
+  `hostnames` (DNS rebinding). Token holders may use any name; a page can't attach the token.
 
 ## Execution
 

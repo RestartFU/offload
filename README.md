@@ -122,6 +122,10 @@ token = "…"
 priority = 10
 ```
 
+Runners accept tailnet callers (no token) only when the URL names them by IP address, their
+hostname or tailnet name. Add any other DNS name to `hostnames` in the runner's `runner.toml`.
+The runner API refuses requests made by web pages.
+
 ## Agents
 
 - **Skill:** [`skill/offload/SKILL.md`](skill/offload/SKILL.md). Link it into `~/.claude/skills/`.
