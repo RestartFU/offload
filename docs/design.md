@@ -93,6 +93,12 @@ removed after `container.image_retain`.
 
 ## Sessions (MCP)
 
+Sessions run in a container by default too (`podman run -i`, stdin forwarded through the
+`runner pipe` socket into `runner inner --stdin`). The environment comes from the client's
+`--environment`, else the profile's `containerfile`, else the base. Profiles can add `devices`
+and persistent `volumes`. Sessions don't queue: if the image isn't ready the runner starts the
+build and answers 409, and the client retries until it is.
+
 `runner pipe` owns the process. Stdout is appended to a file and stdin is accepted on a unix
 socket. The client shim posts stdin lines with sequence numbers, which makes retries
 idempotent, and streams stdout from a byte offset, which makes reconnects lossless. A session
@@ -107,8 +113,7 @@ with no attached client for `session_grace` is stopped.
 
 ## Not built yet
 
-- Sessions (MCP servers) still run on the host; moving them into environments (with devices
-  such as `/dev/dri` via `# offload:device`) is next, starting with the Minecraft environment.
+- The Minecraft session profile still runs on the host (the launcher fork is a flatpak).
 - Sharing built images between runners (a tailnet registry) once there is a second runner.
 - devcontainer "features".
 - Kubernetes backend: a runner deployed in-cluster that creates Pods and Jobs with its own

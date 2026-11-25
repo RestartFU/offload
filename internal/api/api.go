@@ -158,6 +158,8 @@ type SessionSpec struct {
 	Client      string            `json:"client,omitempty"`
 	Secrets     map[string]string `json:"secrets,omitempty"` // as in JobSpec
 	SecretFiles map[string][]byte `json:"secret_files,omitempty"`
+	Environment *EnvDef           `json:"environment,omitempty"` // overrides the profile's
+	Runtime     string            `json:"runtime,omitempty"`     // "host" or "container"
 }
 
 // Session is a long-lived process (usually an MCP server) whose stdio is bridged over HTTP.
@@ -171,6 +173,8 @@ type Session struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	LastSeen   time.Time  `json:"last_seen"`
 	Attached   int        `json:"attached"`
+	Runtime    string     `json:"runtime,omitempty"`
+	Image      string     `json:"image,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	ExitCode   *int       `json:"exit_code,omitempty"`
 	Reason     string     `json:"reason,omitempty"`

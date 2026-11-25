@@ -43,6 +43,7 @@ type Server struct {
 	tz       string
 
 	builds      map[string]*envBuild // image tag -> build in progress
+	buildErrs   map[string]error     // last failed build per tag, reported to the next session
 	readyImages map[string]bool
 	imageUse    map[string]time.Time
 
@@ -66,7 +67,7 @@ func New(cfg *Config, version string) (*Server, error) {
 		cfg: cfg, version: version, self: self,
 		jobs: map[string]*job{}, sessions: map[string]*session{}, slots: map[string][]*slot{},
 		cpuUse: map[int]int{}, wake: make(chan struct{}, 1), whois: map[string]whoisEntry{},
-		builds: map[string]*envBuild{}, readyImages: map[string]bool{}, tz: hostTimezone(),
+		builds: map[string]*envBuild{}, buildErrs: map[string]error{}, readyImages: map[string]bool{}, tz: hostTimezone(),
 	}
 	ctrl := delegatedControllers()
 	s.features = map[string]bool{"cpuset": ctrl["cpuset"], "io": ctrl["io"], "memory": ctrl["memory"], "cpu": ctrl["cpu"]}

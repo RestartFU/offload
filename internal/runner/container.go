@@ -169,6 +169,7 @@ func (s *Server) build(b *envBuild, cf, ctxDir string) {
 			}
 		}
 	} else {
+		s.buildErrs[b.tag] = err
 		for _, j := range b.waiters {
 			if j.State == api.StateQueued {
 				s.finishLocked(j, api.StateFailed, nil, "environment build failed: "+err.Error())
@@ -327,63 +328,103 @@ func (s *Server) prebuildBase() {
 
 // --- running a job in a container ---
 
-// containerArgv wraps a job command in podman run. Paths are mounted at the same location as on
-// the host; the job's secrets are loaded inside by the mounted offload binary.
-func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets string) []string {
-	a := []string{"podman", "run", "--rm", "--name", "offload-" + j.ID,
+// runSpec describes one podman run for a job or session.
+type runSpec struct {
+	Name, Image, Workdir, CPUs, Secrets string
+	Mem                                 int64
+	Same                                []string // host paths mounted at the same path
+	Volumes                             []string // "host:container"
+	Devices                             []string
+	Env                                 map[string]string
+	Interactive                         bool // keep stdin (sessions)
+	Argv                                []string
+}
+
+// podmanRun builds the podman command line. Paths are mounted where they are on the host; the
+// mounted static offload binary is the entrypoint and loads secrets inside.
+func (s *Server) podmanRun(r runSpec) []string {
+	a := []string{"podman", "run", "--rm", "--name", r.Name,
 		"--cgroups=split", "--network=host", "--security-opt", "label=disable",
 		"--pids-limit=-1", "--init", "--pull=never",
-		fmt.Sprintf("--memory=%d", j.Resources.Mem), "--memory-swap=" + fmt.Sprint(j.Resources.Mem),
-		"-w", workdir,
+		fmt.Sprintf("--memory=%d", r.Mem), "--memory-swap=" + fmt.Sprint(r.Mem),
+		"-w", r.Workdir,
 	}
-	if j.AllowedCPUs != "" {
-		a = append(a, "--cpuset-cpus="+j.AllowedCPUs)
+	if r.Interactive {
+		a = append(a, "-i")
 	}
-	mount := func(src, dst, opt string) {
-		if src == "" {
-			return
+	if r.CPUs != "" {
+		a = append(a, "--cpuset-cpus="+r.CPUs)
+	}
+	same := append(r.Same, runtimeDir()) // relay sockets, runner socket, secrets
+	for _, p := range same {
+		if _, err := os.Stat(p); err == nil {
+			a = append(a, "-v", p+":"+p)
 		}
-		if _, err := os.Stat(src); err != nil {
-			return
-		}
-		m := src + ":" + dst
-		if opt != "" {
-			m += ":" + opt
-		}
+	}
+	a = append(a, "-v", s.self+":"+s.self+":ro")
+	for _, m := range append(s.cacheMounts(), r.Volumes...) {
 		a = append(a, "-v", m)
 	}
-	if j.slot != nil {
-		mount(j.slot.Dir, j.slot.Dir, "")
-		mount(s.sharedGit(j.Spec.WorkspaceKey), s.sharedGit(j.Spec.WorkspaceKey), "")
+	for _, d := range r.Devices {
+		a = append(a, "--device", d)
 	}
-	mount(j.dir, j.dir, "")               // TMPDIR, work dir for jobs without a workspace
-	mount(runtimeDir(), runtimeDir(), "") // relay sockets, runner socket, secrets
-	mount(s.self, s.self, "ro")           // credential helper and in-container entrypoint
-	for _, m := range s.cacheMounts() {
-		a = append(a, "-v", m)
+	if len(r.Devices) > 0 {
+		a = append(a, "--group-add", "keep-groups")
 	}
-	if j.Spec.Environment != nil {
-		for _, d := range j.Spec.Environment.Devices {
-			a = append(a, "--device", d)
-		}
-		if len(j.Spec.Environment.Devices) > 0 {
-			a = append(a, "--group-add", "keep-groups")
-		}
-	}
-	keys := make([]string, 0, len(env))
-	for k := range env {
+	keys := make([]string, 0, len(r.Env))
+	for k := range r.Env {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		a = append(a, "-e", k+"="+env[k])
+		a = append(a, "-e", k+"="+r.Env[k])
 	}
-	a = append(a, "--entrypoint", s.self, j.Image, "runner", "inner")
-	if secrets != "" {
-		a = append(a, "--secrets", secrets)
+	a = append(a, "--entrypoint", s.self, r.Image, "runner", "inner")
+	if r.Secrets != "" {
+		a = append(a, "--secrets", r.Secrets)
+	}
+	if r.Interactive {
+		a = append(a, "--stdin")
 	}
 	a = append(a, "--")
-	return append(a, j.Spec.Argv...)
+	return append(a, r.Argv...)
+}
+
+// containerArgv wraps a job command in podman run.
+func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets string) []string {
+	r := runSpec{Name: "offload-" + j.ID, Image: j.Image, Workdir: workdir, CPUs: j.AllowedCPUs,
+		Secrets: secrets, Mem: j.Resources.Mem, Env: env, Argv: j.Spec.Argv, Same: []string{j.dir}}
+	if j.slot != nil {
+		r.Same = append(r.Same, j.slot.Dir, s.sharedGit(j.Spec.WorkspaceKey))
+	}
+	if j.Spec.Environment != nil {
+		r.Devices = j.Spec.Environment.Devices
+	}
+	return s.podmanRun(r)
+}
+
+// sessionImageLocked returns a session environment's image tag and whether it's ready to run,
+// starting a build when needed (sessions don't queue; the client retries until it's ready).
+func (s *Server) sessionImageLocked(def *api.EnvDef) (string, bool, error) {
+	tag, cf, _ := envPlan(def)
+	if s.readyImages[tag] {
+		return tag, true, nil
+	}
+	if s.builds[tag] != nil {
+		return tag, false, nil
+	}
+	if err := s.buildErrs[tag]; err != nil {
+		delete(s.buildErrs, tag)
+		return tag, false, err
+	}
+	if imageExists(tag) && s.bootstrapped(tag) {
+		s.readyImages[tag] = true
+		return tag, true, nil
+	}
+	b := &envBuild{tag: tag, waiters: map[string]*job{}, sent: map[string]int64{}}
+	s.builds[tag] = b
+	go s.build(b, cf, "")
+	return tag, false, nil
 }
 
 // containerEnv is the environment a containerized job gets: no host PATH/HOME (the image has its
@@ -410,11 +451,15 @@ func (s *Server) containerEnv(prof *Profile, ncpu int, j *job) map[string]string
 
 // RunInner is "offload runner inner", the entrypoint inside a job's container: load secrets from
 // the tmpfs mount (never passed to podman, which would store them on disk), then run the job.
-func RunInner(secrets string, argv []string) int {
+func RunInner(secrets string, stdin bool, argv []string) int {
 	if secrets != "" {
 		loadSecrets(secrets)
 	}
-	code, _, err := runChild(argv, nil, os.Stdout)
+	var in io.Reader
+	if stdin {
+		in = os.Stdin
+	}
+	code, _, err := runChild(argv, in, os.Stdout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "offload: %v\n", err)
 	}

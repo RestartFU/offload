@@ -256,12 +256,14 @@ func cmdMCP(args []string) error {
 	var with, secrets multi
 	fs.Var(&with, "with", "credential set")
 	fs.Var(&secrets, "secret", "NAME or NAME=SOURCE")
+	environment := fs.String("environment", "", "named environment")
+	host := fs.Bool("host", false, "run on the runner host")
 	_ = fs.Parse(args[1:])
 	r, err := res()
 	if err != nil {
 		return err
 	}
-	return client.MCP(profile, *on, r, with, secrets)
+	return client.MCP(client.MCPOptions{Profile: profile, On: *on, Resources: r, With: with, Secrets: secrets, Environment: *environment, Host: *host})
 }
 
 func cmdHost(args []string) error {
@@ -354,12 +356,13 @@ func cmdRunner(args []string) (int, error) {
 	case "inner":
 		fs := flag.NewFlagSet("inner", flag.ExitOnError)
 		secrets := fs.String("secrets", "", "")
+		stdin := fs.Bool("stdin", false, "")
 		fl, rest := splitArgs(args[1:])
 		_ = fs.Parse(fl)
 		if len(rest) == 0 {
-			die("internal: runner inner [--secrets DIR] -- CMD")
+			die("internal: runner inner [--secrets DIR] [--stdin] -- CMD")
 		}
-		return runner.RunInner(*secrets, rest), nil
+		return runner.RunInner(*secrets, *stdin, rest), nil
 	case "credential":
 		op := ""
 		if len(args) > 1 {

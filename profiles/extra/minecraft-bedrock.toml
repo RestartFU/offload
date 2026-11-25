@@ -1,8 +1,10 @@
 # Minecraft Bedrock MCP (mcpelauncher-agent) on a private Xvfb display with software rendering.
-# Not installed by default: the runner needs Xvfb (xorg-x11-server-Xvfb, xorg-x11-xauth),
-# flatpak with io.mrarm.mcpelauncher and the game data, bun, and mcpelauncher-agent checked out.
-# Copy this file into ~/.config/offload/profiles/ on that runner once those exist.
+# Not installed by default. Today this runs on the runner host (runtime = "host"), because the
+# launcher fork ships as a flatpak; the host needs Xvfb + xauth, flatpak with the fork and its KDE
+# runtime, bun, mcpelauncher-agent, and the game data. Copy this file into
+# ~/.config/offload/profiles/ on that runner once those exist.
 kind = "session"
+runtime = "host"
 description = "Minecraft Bedrock client MCP (headless, Xvfb + llvmpipe)"
 command = ["bun", "run", "~/.local/share/mcpelauncher-agent/src/index.ts"]
 

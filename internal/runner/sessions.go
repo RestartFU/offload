@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,9 +89,45 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		spec.Client = r.Header.Get("X-Offload-Caller")
 	}
 	res := s.cfg.effective(spec.Resources, prof)
+	rt := spec.Runtime
+	if rt == "" {
+		rt = prof.Runtime
+	}
+	if rt == "" {
+		rt = "host"
+		if s.containersAvailable() {
+			rt = "container"
+		}
+	}
+	if rt == "container" && !s.containersAvailable() {
+		writeErr(w, 400, "containers are not available on this runner (install podman)")
+		return
+	}
+	def := spec.Environment
+	if def == nil && prof.Containerfile != "" {
+		b, err := os.ReadFile(filepath.Join(s.cfg.ProfilesDir, prof.Containerfile))
+		if err != nil {
+			writeErr(w, 500, "profile environment: "+err.Error())
+			return
+		}
+		def = &api.EnvDef{Name: prof.Containerfile, Containerfile: string(b)}
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	image := ""
+	if rt == "container" {
+		tag, ready, err := s.sessionImageLocked(def)
+		if err != nil {
+			writeErr(w, 500, "environment build failed: "+err.Error())
+			return
+		}
+		if !ready {
+			writeErr(w, http.StatusConflict, "building environment "+strings.TrimPrefix(tag, imageRepo+"/")+"; retry shortly")
+			return
+		}
+		image = tag
+	}
 	live := 0
 	for _, x := range s.sessions {
 		if !api.Terminal(x.State) {
@@ -108,7 +145,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	se := &session{Session: api.Session{
 		ID: newID("s-"), Runner: s.cfg.Name, Profile: spec.Profile, State: api.StateRunning,
-		Resources: res, CreatedAt: now, LastSeen: now,
+		Resources: res, CreatedAt: now, LastSeen: now, Runtime: rt, Image: image,
 	}}
 	se.dir = filepath.Join(s.cfg.StateDir, "sessions", se.ID)
 	if err := os.MkdirAll(filepath.Join(se.dir, "tmp"), 0o700); err != nil {
@@ -131,16 +168,55 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	home, _ := os.UserHomeDir()
 	pipe := []string{s.self, "runner", "pipe", "--dir", se.dir, "--sock", sessionSock(se.ID)}
-	if dir, err := writeSecrets(se.ID, spec.Secrets, spec.SecretFiles); err != nil {
+	secrets, err := writeSecrets(se.ID, spec.Secrets, spec.SecretFiles)
+	if err != nil {
 		s.releaseCPUsLocked(se.cpus)
 		writeErr(w, 500, "secrets: "+err.Error())
 		return
-	} else if dir != "" {
-		pipe = append(pipe, "--secrets", dir)
+	}
+	command := prof.Command
+	unitEnv := env
+	if rt == "container" {
+		cenv := parallelEnv(ncpu)
+		for k, v := range prof.Env {
+			if k != "PATH" && k != "HOME" {
+				cenv[k] = v
+			}
+		}
+		if def != nil {
+			for k, v := range def.Env {
+				cenv[k] = v
+			}
+		}
+		if s.tz != "" {
+			cenv["TZ"] = s.tz
+		}
+		cenv["TMPDIR"], cenv["OFFLOAD_SESSION"] = env["TMPDIR"], se.ID
+		devices := append([]string(nil), prof.Devices...)
+		if def != nil {
+			devices = append(devices, def.Devices...)
+		}
+		var volumes []string
+		for _, v := range prof.Volumes {
+			host, ctr, ok := strings.Cut(v, ":")
+			if !ok {
+				continue
+			}
+			host = expandHome(host)
+			_ = os.MkdirAll(host, 0o755)
+			volumes = append(volumes, host+":"+ctr)
+		}
+		command = s.podmanRun(runSpec{Name: "offload-" + se.ID, Image: image, Workdir: se.dir, CPUs: allowed,
+			Secrets: secrets, Mem: res.Mem, Env: cenv, Interactive: true, Argv: prof.Command,
+			Same: []string{se.dir}, Volumes: volumes, Devices: devices})
+		unitEnv = map[string]string{}
+		s.touchImage(image)
+	} else if secrets != "" {
+		pipe = append(pipe, "--secrets", secrets)
 	}
 	u := unitSpec{
-		Name: se.Unit, Slice: s.cfg.Slice, Dir: home, Env: env,
-		Argv:      append(append(pipe, "--"), prof.Command...),
+		Name: se.Unit, Slice: s.cfg.Slice, Dir: home, Env: unitEnv, Delegate: rt == "container",
+		Argv:      append(append(pipe, "--"), command...),
 		CPUWeight: cpuWeight(res.CPU), CPUQuotaPct: int(math.Ceil(res.CPUMax * 100)),
 		AllowedCPUs: allowed, MemoryMax: res.Mem, OOMScoreAdj: s.cfg.Policy.OOMScoreAdj,
 		Stdout: filepath.Join(se.dir, "stderr.log"),

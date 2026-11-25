@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,7 +19,16 @@ import (
 // MCP starts a session from a runner profile and bridges this process's stdio to it, so an MCP
 // client can use `offload mcp <profile>` as a stdio server. Stdin lines are sent in order with
 // sequence numbers (safe to retry); stdout resumes from the last byte after reconnects.
-func MCP(profile, on string, res api.Resources, with, secretArgs []string) error {
+// MCPOptions is `offload mcp`.
+type MCPOptions struct {
+	Profile, On, Environment string
+	Resources                api.Resources
+	With, Secrets            []string
+	Host                     bool
+}
+
+func MCP(o MCPOptions) error {
+	profile, on, res := o.Profile, o.On, o.Resources
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 	cfg, err := LoadConfig()
@@ -26,8 +36,16 @@ func MCP(profile, on string, res api.Resources, with, secretArgs []string) error
 		return err
 	}
 	spec := api.SessionSpec{Profile: profile, Resources: res, Client: clientLabel()}
-	if spec.Secrets, spec.SecretFiles, err = resolveSecrets(cfg, with, secretArgs, true, true); err != nil {
+	if spec.Secrets, spec.SecretFiles, err = resolveSecrets(cfg, o.With, o.Secrets, true, true); err != nil {
 		return err
+	}
+	if o.Environment != "" {
+		if spec.Environment, err = LoadEnvDef("", o.Environment); err != nil {
+			return err
+		}
+	}
+	if o.Host {
+		spec.Runtime, spec.Environment = "host", nil
 	}
 	hosts := Discover(ctx, cfg)
 	var h *Host
@@ -40,8 +58,25 @@ func MCP(profile, on string, res api.Resources, with, secretArgs []string) error
 		return err
 	}
 	var se api.Session
-	if err := h.do(ctx, "POST", "/v1/sessions", spec, &se); err != nil {
-		return fmt.Errorf("%s: %w", h.Name, err)
+	for announced := false; ; {
+		err := h.do(ctx, "POST", "/v1/sessions", spec, &se)
+		var ae *APIError
+		if errors.As(err, &ae) && ae.Code == 409 { // the environment is being built
+			if !announced {
+				fmt.Fprintf(os.Stderr, "offload: %s: %s\n", h.Name, ae.Msg)
+				announced = true
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(3 * time.Second):
+			}
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", h.Name, err)
+		}
+		break
 	}
 	fmt.Fprintf(os.Stderr, "offload: session %s:%s (%s)\n", h.Name, se.ID, profile)
 	defer func() {
@@ -50,16 +85,60 @@ func MCP(profile, on string, res api.Resources, with, secretArgs []string) error
 		_ = h.do(c, "DELETE", "/v1/sessions/"+se.ID, nil, nil)
 	}()
 
-	done := make(chan error, 3)
-	go func() { done <- pumpOut(ctx, h, se.ID, "stdout", os.Stdout) }()
+	out := &activityWriter{w: os.Stdout, started: time.Now()}
+	done := make(chan error, 2)
+	inDone := make(chan error, 1)
+	go func() { done <- pumpOut(ctx, h, se.ID, "stdout", out) }()
 	go func() { _ = pumpOut(ctx, h, se.ID, "stderr", os.Stderr) }()
-	go func() { done <- pumpIn(ctx, h, se.ID, os.Stdin) }()
+	go func() { inDone <- pumpIn(ctx, h, se.ID, os.Stdin) }()
 	select {
 	case <-ctx.Done():
 		return nil
 	case err := <-done:
 		return err
+	case err := <-inDone:
+		if err != nil {
+			return err
+		}
+		// Input closed: let answers already in flight arrive, then end the session. Wait at
+		// least 3s from the start (a fresh container may still be starting), stop once output
+		// has been quiet for a second, and never wait more than 10s.
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if time.Since(out.started) >= 3*time.Second && time.Since(out.last()) >= time.Second {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case err := <-done:
+				return err
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+		return nil
 	}
+}
+
+// activityWriter remembers when output last arrived.
+type activityWriter struct {
+	w       io.Writer
+	mu      sync.Mutex
+	at      time.Time
+	started time.Time
+}
+
+func (a *activityWriter) Write(p []byte) (int, error) {
+	a.mu.Lock()
+	a.at = time.Now()
+	a.mu.Unlock()
+	return a.w.Write(p)
+}
+
+func (a *activityWriter) last() time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.at
 }
 
 func pumpIn(ctx context.Context, h *Host, id string, in io.Reader) error {

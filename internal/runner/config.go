@@ -82,13 +82,20 @@ type Config struct {
 
 // Profile is a named job or session recipe (profiles_dir/<name>.toml).
 type Profile struct {
-	Name        string            `toml:"name"`
-	Kind        string            `toml:"kind"`  // "job" (env + resource defaults) or "session"
-	Match       []string          `toml:"match"` // job profiles: commands (globs) that select it automatically
-	Description string            `toml:"description"`
-	Command     []string          `toml:"command"` // required for sessions
-	Env         map[string]string `toml:"env"`
-	Resources   struct {
+	Name        string   `toml:"name"`
+	Kind        string   `toml:"kind"`  // "job" (env + resource defaults) or "session"
+	Match       []string `toml:"match"` // job profiles: commands (globs) that select it automatically
+	Description string   `toml:"description"`
+	Command     []string `toml:"command"` // required for sessions
+	// Sessions: where to run. Runtime "host" or "container" (default: container if available);
+	// Containerfile (relative to the profiles dir) is the environment; Devices are passed through
+	// (e.g. /dev/dri); Volumes are "host:container" directories kept between sessions.
+	Runtime       string            `toml:"runtime"`
+	Containerfile string            `toml:"containerfile"`
+	Devices       []string          `toml:"devices"`
+	Volumes       []string          `toml:"volumes"`
+	Env           map[string]string `toml:"env"`
+	Resources     struct {
 		CPU    float64 `toml:"cpu"`
 		CPUMax float64 `toml:"cpu_max"`
 		Mem    string  `toml:"mem"`

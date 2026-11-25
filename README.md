@@ -42,6 +42,10 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
   the same definition, layer-cached: the first build takes minutes, adding a tool takes seconds,
   and a warm job starts in about 0.5s. Toolchains (rustup, Go modules, npm and pip caches) live
   in shared volumes, so every environment reuses them. `--host` runs directly on the runner.
+- **Sessions too.** `offload mcp <profile>` runs the MCP server in the profile's environment
+  (`containerfile`, `devices` such as `/dev/dri`, persistent `volumes`), or the client's
+  `--environment NAME`, or on the host with `runtime = "host"`. The environment is built on first
+  use while the client waits.
 - **Any Linux runner.** The environment is the same on every distro. Runners report OS/arch,
   and the client prefers one matching the laptop (`--platform linux/arm64` forces one).
   Windows hosts can be runners through WSL2; macOS hosts through a Linux VM.
