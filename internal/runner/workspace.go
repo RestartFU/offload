@@ -116,8 +116,13 @@ func (s *slot) save(rec slotRecord) error {
 }
 
 // wipe removes the slot's files and record, leaving an empty directory.
+// rustupLayer is the slot's own writable layer over the shared Rust toolchains: it lives and
+// dies with the slot (a --fresh wipe or an eviction takes it too).
+func (s *slot) rustupLayer() string { return s.Dir + ".rustup" }
+
 func (s *slot) wipe() error {
 	_ = os.Remove(s.recordPath())
+	_ = removeAll(s.rustupLayer())
 	if err := removeAll(s.Dir); err != nil {
 		return err
 	}

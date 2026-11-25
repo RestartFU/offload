@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/RestartFU/offload/internal/units"
@@ -290,11 +291,13 @@ type stopRecord struct {
 	// OOM: the unit's cgroup counted OOM kills (the hook runs in it, before it's removed). With
 	// OOMPolicy=continue systemd keeps the result "signal" for those, so this is what tells.
 	OOM bool `json:"oom,omitempty"`
+	// OOMD: systemd-oomd killed the unit for host memory pressure (it marks the cgroup).
+	OOMD bool `json:"oomd,omitempty"`
 }
 
 // RunStopped is "offload runner stopped PATH", the ExecStopPost hook of job and session units.
 func RunStopped(path string) int {
-	_ = writeFileJSON(path, stopRecord{Result: os.Getenv("SERVICE_RESULT"), Code: os.Getenv("EXIT_CODE"), Status: os.Getenv("EXIT_STATUS"), OOM: oomKilled()})
+	_ = writeFileJSON(path, stopRecord{Result: os.Getenv("SERVICE_RESULT"), Code: os.Getenv("EXIT_CODE"), Status: os.Getenv("EXIT_STATUS"), OOM: oomKilled(), OOMD: oomdKilled()})
 	return 0
 }
 
@@ -302,6 +305,9 @@ func RunStopped(path string) int {
 func killedReason(dir string, mem int64) string {
 	var rec stopRecord
 	if b, err := os.ReadFile(filepath.Join(dir, "stop.json")); err == nil && json.Unmarshal(b, &rec) == nil {
+		if rec.OOMD {
+			return "host memory pressure: systemd-oomd killed it (it is retried once the pressure eases)"
+		}
 		if rec.Result == "oom-kill" || rec.OOM {
 			return fmt.Sprintf("out of memory (limit %s; the whole unit was killed, by its limit or host memory pressure)", units.FormatSize(mem))
 		}
@@ -310,4 +316,20 @@ func killedReason(dir string, mem int64) string {
 		}
 	}
 	return "killed before it could report an exit status"
+}
+
+// oomdKilled reports whether systemd-oomd killed this unit's cgroup: it marks a cgroup it acts
+// on with the extended attribute user.oomd_ooms (or user.oomd_kill on older versions).
+func oomdKilled() bool {
+	cg := unitCgroup()
+	if cg == "" {
+		return false
+	}
+	buf := make([]byte, 64)
+	for _, attr := range []string{"user.oomd_ooms", "user.oomd_kill"} {
+		if n, err := syscall.Getxattr(cg, attr, buf); err == nil && n > 0 && strings.Trim(string(buf[:n]), "0\x00") != "" {
+			return true
+		}
+	}
+	return false
 }

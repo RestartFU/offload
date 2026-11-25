@@ -955,7 +955,7 @@ func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets s
 	if j.slot != nil && j.Spec.WorkspaceKey != "" {
 		// One overlay layer per workspace slot: an overlay's upper directory can't be shared by
 		// two mounts, and a slot runs one job at a time.
-		r.RustupLayer = s.cacheDir("scoped", j.Spec.WorkspaceKey, "rustup", hash12(j.slot.Dir))
+		r.RustupLayer = j.slot.rustupLayer()
 	}
 	return s.podmanRun(r)
 }

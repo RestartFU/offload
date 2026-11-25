@@ -142,6 +142,9 @@ func (s *Server) restore() {
 		if json.Unmarshal(b, &j.Job) != nil {
 			continue
 		}
+		if api.Terminal(j.State) {
+			j.Spec.Manifest = nil // upload-only; a failed upload may have left it in the record
+		}
 		if j.Slot != "" {
 			j.slot = s.findSlot(j.Slot)
 		}
@@ -1042,6 +1045,9 @@ func (s *Server) checkRunning() {
 			// The unit is gone without a record: give the wrapper a moment, then call it killed.
 			if j.inactive++; j.inactive >= 3 {
 				state, reason := api.StateFailed, killedReason(j.dir, j.Resources.Mem)
+				if strings.HasPrefix(reason, "out of memory") { // the history learns from it too
+					s.learn(j, &exitRecord{Code: 137, OOM: true, PeakMem: j.Resources.Mem})
+				}
 				if j.cancel {
 					state, reason = api.StateCancelled, "cancelled"
 				}
@@ -1068,6 +1074,7 @@ func readExit(path string) (*exitRecord, error) {
 func (s *Server) finishLocked(j *job, state string, code *int, reason string) {
 	now := time.Now()
 	j.State, j.ExitCode, j.Reason, j.FinishedAt = state, code, reason, &now
+	j.Spec.Manifest, j.planNeeded, j.planHave, j.Needed, j.GitHave = nil, nil, nil, nil, nil // upload-only state
 	s.leaveBuildsLocked(j)
 	s.cleanupCredentials(j)
 	s.releaseCPUsLocked(j.cpus)
@@ -1095,6 +1102,7 @@ func (s *Server) releaseSlotLocked(sl *slot, drop bool) {
 
 func (s *Server) dropSlotLocked(sl *slot) {
 	_ = removeAll(sl.Dir)
+	_ = removeAll(sl.rustupLayer())
 	_ = os.Remove(sl.recordPath())
 	list := s.slots[sl.Key]
 	for i, x := range list {

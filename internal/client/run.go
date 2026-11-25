@@ -187,6 +187,18 @@ func Run(o RunOptions) (int, error) {
 			return code, err
 		}
 		j = *done
+		// Killed for the host's memory pressure (not its own limit): retry once, same size, after
+		// the pressure has had a moment to ease.
+		if j.State == api.StateFailed && strings.HasPrefix(j.Reason, "host memory pressure") && attempt == 0 {
+			logf(false, "%s was killed under host memory pressure; retrying in 30s", ref)
+			_ = os.Remove(baselinePath(j.ID))
+			select {
+			case <-ctx.Done():
+				return 130, nil
+			case <-time.After(30 * time.Second):
+			}
+			continue
+		}
 		// The runner chose the memory limit and it was too small: retry once with double.
 		if j.State == api.StateFailed && strings.HasPrefix(j.Reason, "out of memory") && j.AutoMem && attempt == 0 {
 			next := j.Resources.Mem * 2
@@ -1395,6 +1407,12 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string, snap map[stri
 			// stays, and this whole subtree goes aside.
 			if fi, err := tree.Lstat(name); err == nil && !fi.IsDir() {
 				relocDirs[orig] = true
+				name, relocated = path.Join(incomingDir, id, orig), true
+			}
+		default:
+			// A file or link where a directory exists here: the directory stays, the entry goes
+			// aside, and unpacking carries on.
+			if fi, err := tree.Lstat(name); err == nil && fi.IsDir() {
 				name, relocated = path.Join(incomingDir, id, orig), true
 			}
 		}
