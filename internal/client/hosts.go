@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -316,6 +317,30 @@ func (h *Host) free() api.Resources {
 	return api.Resources{CPU: st.Capacity.CPU - st.Allocated.CPU, Mem: min(st.Capacity.Mem-st.Allocated.Mem, st.MemAvailable-st.MemReserve)}
 }
 
+// PickFor chooses a runner for a job spec: like Pick, plus platform and runtime constraints.
+// Without an explicit platform, runners matching this machine's OS/arch are preferred (files
+// fetched with --get then run here).
+func PickFor(hosts []*Host, spec api.JobSpec, kind string) (*Host, error) {
+	var ok []*Host
+	var why []string
+	for _, h := range hosts {
+		st := h.Status
+		plat := st.OS + "/" + st.Arch
+		switch {
+		case spec.Platform != "" && plat != spec.Platform:
+			why = append(why, h.Name+": is "+plat)
+		case spec.Environment != nil && st.Runtime != "container":
+			why = append(why, h.Name+": no container runtime")
+		default:
+			ok = append(ok, h)
+		}
+	}
+	if len(ok) == 0 && len(hosts) > 0 {
+		return nil, fmt.Errorf("no runner fits: %s", strings.Join(why, "; "))
+	}
+	return Pick(ok, spec.Resources, spec.Profile, spec.WorkspaceKey, kind)
+}
+
 // Pick chooses the best runner for a request: it must be accepting, have the profile and be able
 // to fit the job eventually. Free capacity now, a warm workspace and priority decide among them.
 func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, error) {
@@ -359,12 +384,15 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 		}
 		if key != "" {
 			for _, k := range st.WarmKeys {
-				if k == key {
+				if k == key || strings.HasPrefix(k, key+"--") {
 					score += 200
 				}
 			}
 		}
 		score += f.CPU - st.Load1/4
+		if st.OS == goruntime.GOOS && st.Arch == goruntime.GOARCH {
+			score += 50
+		}
 		if score > bestScore {
 			best, bestScore = h, score
 		}

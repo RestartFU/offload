@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/RestartFU/offload/internal/api"
@@ -107,5 +108,20 @@ func TestCommandSig(t *testing.T) {
 		if got := commandSig(argv); got != want {
 			t.Errorf("commandSig(%q) = %q, want %q", argv, got, want)
 		}
+	}
+}
+
+func TestEnvPlan(t *testing.T) {
+	tag, cf, v := envPlan(nil)
+	if tag != baseTag() || cf != baseContainerfile || !strings.HasPrefix(v, "b") {
+		t.Fatalf("default plan: %s %s", tag, v)
+	}
+	tag2, cf2, v2 := envPlan(&api.EnvDef{Containerfile: "FROM offload/base\nRUN dnf install -y jq\n"})
+	if !strings.Contains(cf2, "FROM "+baseTag()+"\n") || v2 != v || tag2 == tag {
+		t.Fatalf("derived plan: %s %s\n%s", tag2, v2, cf2)
+	}
+	_, _, v3 := envPlan(&api.EnvDef{Containerfile: "FROM debian:12\n"})
+	if !strings.HasPrefix(v3, "e") {
+		t.Fatalf("standalone variant %s", v3)
 	}
 }

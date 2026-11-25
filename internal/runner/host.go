@@ -115,6 +115,7 @@ type unitSpec struct {
 	Env         map[string]string
 	Stdout      string // file path; stdout and stderr are appended here
 	Stderr      string // optional separate stderr file
+	Delegate    bool   // let podman create sub-cgroups (--cgroups=split)
 	Argv        []string
 }
 
@@ -143,6 +144,9 @@ func startUnit(ctx context.Context, u unitSpec) error {
 	args = append(args, "-p", "StandardError=append:"+stderr)
 	if u.AllowedCPUs != "" {
 		args = append(args, "-p", "AllowedCPUs="+u.AllowedCPUs)
+	}
+	if u.Delegate {
+		args = append(args, "-p", "Delegate=yes")
 	}
 	if u.IOWeight > 0 {
 		args = append(args, "-p", fmt.Sprintf("IOWeight=%d", u.IOWeight))

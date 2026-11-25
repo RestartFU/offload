@@ -61,6 +61,36 @@ an index at HEAD (`read-tree`), so the synced working tree shows your uncommitte
   when the job ends. Job records only list secret names. A runner restart drops queued jobs'
   secrets and fails those jobs.
 
+## Containers
+
+Jobs run as `podman run --cgroups=split` inside their transient unit (`Delegate=yes`), so the
+unit keeps owning CPU and memory limits, OOM accounting (`memory.events`/`memory.peak` read at
+the unit level, since the wrapper itself is moved into a child cgroup) and the keep-alive rules.
+Things measured before building this (Fedora 44, podman 5.8):
+
+- SELinux blocks writes to bind mounts, and `:z` would relabel the repo, so containers use
+  `label=disable`. They're confined no more than host jobs.
+- Inside, `nproc` and `memory.max` reflect only what podman sets, so `--cpuset-cpus` (when
+  cpuset is delegated; crun fails otherwise) and `--memory` mirror the unit's limits.
+- Podman's default 2048-process cap is lifted (`--pids-limit=-1`).
+- `-e` values land in the container's `config.json` on disk, so secrets come in through the tmpfs
+  runtime-dir mount and are loaded by the mounted static `offload` binary (`runner inner`).
+- Files written by non-root container users belong to subordinate IDs, so cleanup falls back to
+  `podman unshare rm`.
+- Cargo and `.git` store absolute paths, so the workspace, `shared.git`, the job dir, the runtime
+  dir and the binary are mounted at identical paths.
+- Startup overhead is about 0.17s. A warm job round trip from the laptop is about 0.5s.
+
+Environments are Containerfiles; `FROM offload/base` is rewritten to the runner's base tag
+(a hash of the embedded `envs/base.Containerfile`). Image tags are content hashes. Builds run as
+their own units with `container.build_mem`, never inside a job's limit, and their log streams to
+every waiting job's stderr. A build never blocks other jobs in the queue. After a build, the
+image's `/etc/offload/bootstrap.sh` runs once against the shared volumes (also in its own unit)
+to install or repair toolchains (rustup). A marker in the cache dir records it. Workspace slots
+are keyed by repo plus environment base (`<key>--b<base>`), so a different base never reuses
+stale `target/`, while adding tools on top of the same base keeps builds warm. Unused images are
+removed after `container.image_retain`.
+
 ## Sessions (MCP)
 
 `runner pipe` owns the process. Stdout is appended to a file and stdin is accepted on a unix
@@ -77,8 +107,10 @@ with no attached client for `session_grace` is stopped.
 
 ## Not built yet
 
-- Container runtime for profiles (`image = "…"` run through podman with `--cgroups=split`).
-  Today, profiles run on the host with the host's toolchains.
+- Sessions (MCP servers) still run on the host; moving them into environments (with devices
+  such as `/dev/dri` via `# offload:device`) is next, starting with the Minecraft environment.
+- Sharing built images between runners (a tailnet registry) once there is a second runner.
+- devcontainer "features".
 - Kubernetes backend: a runner deployed in-cluster that creates Pods and Jobs with its own
   service account.
 - Size-based workspace GC (today GC is age-based: `storage.cache.retain`).

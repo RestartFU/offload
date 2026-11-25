@@ -81,7 +81,7 @@ func (s *slot) save(rec slotRecord) error {
 // wipe removes the slot's files and record, leaving an empty directory.
 func (s *slot) wipe() error {
 	_ = os.Remove(s.recordPath())
-	if err := os.RemoveAll(s.Dir); err != nil {
+	if err := removeAll(s.Dir); err != nil {
 		return err
 	}
 	return os.MkdirAll(s.Dir, 0o755)

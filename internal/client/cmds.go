@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	goruntime "runtime"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -158,16 +159,19 @@ func Get(ref, dest string) error {
 	return fetchArtifacts(ctx, h, id, dest)
 }
 
-// Upgrade pushes this binary to runners, which swap it in and restart (running jobs continue).
-func Upgrade(names []string, all bool) error {
+// Upgrade pushes a binary (this one by default) to runners, which swap it in and restart; running
+// jobs continue. A runner of another OS/arch needs a matching build passed with --binary.
+func Upgrade(names []string, all bool, binary string) error {
 	ctx := context.Background()
 	hosts, err := discover(ctx)
 	if err != nil {
 		return err
 	}
-	self, err := os.Executable()
-	if err != nil {
-		return err
+	self := binary
+	if self == "" {
+		if self, err = os.Executable(); err != nil {
+			return err
+		}
 	}
 	var targets []*Host
 	if all {
@@ -184,6 +188,10 @@ func Upgrade(names []string, all bool) error {
 		return fmt.Errorf("name a runner or pass --all")
 	}
 	for _, h := range targets {
+		if binary == "" && h.Status.OS != "" && (h.Status.OS != goruntime.GOOS || h.Status.Arch != goruntime.GOARCH) {
+			return fmt.Errorf("%s is %s/%s; build a matching binary (CGO_ENABLED=0 GOOS=%s GOARCH=%s go build) and pass --binary",
+				h.Name, h.Status.OS, h.Status.Arch, h.Status.OS, h.Status.Arch)
+		}
 		f, err := os.Open(self)
 		if err != nil {
 			return err

@@ -110,8 +110,8 @@ func (s *Server) pruneGitRefs(shared string) {
 // gitCheckout makes the slot a repository at head without touching its files (they were just
 // synced from the client): HEAD and branch point at head, and the index matches head, so
 // `git status` / `git diff` show the client's uncommitted changes as working-tree changes.
-func (s *Server) gitCheckout(sl *slot, g *api.GitRef) error {
-	shared, err := s.ensureShared(sl.Key)
+func (s *Server) gitCheckout(sl *slot, key string, g *api.GitRef) error {
+	shared, err := s.ensureShared(key)
 	if err != nil {
 		return err
 	}

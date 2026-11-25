@@ -192,9 +192,9 @@ func packFiles(dest, root string, files []api.ChangedFile) error {
 	return gz.Close()
 }
 
-// cgroupInt reads a single-number file from this unit's cgroup (e.g. memory.peak).
+// cgroupInt reads a single-number file from this job's unit cgroup (e.g. memory.peak).
 func cgroupInt(name string) int64 {
-	b, err := os.ReadFile(filepath.Join(ownCgroup(), name))
+	b, err := os.ReadFile(filepath.Join(unitCgroup(), name))
 	if err != nil {
 		return 0
 	}
@@ -308,9 +308,22 @@ func runChild(argv []string, stdin io.Reader, stdout io.Writer) (int, string, er
 	return 1, "", err
 }
 
-// oomKilled reports whether the OOM killer fired inside this unit's cgroup.
+// unitCgroup is the job's unit cgroup. With podman's --cgroups=split, the wrapper itself is moved
+// into a child cgroup, so walk up to the offload-*.service directory: its counters cover the
+// container too.
+func unitCgroup() string {
+	dir := ownCgroup()
+	for d := dir; d != "/sys/fs/cgroup" && d != "/" && d != "."; d = filepath.Dir(d) {
+		if b := filepath.Base(d); strings.HasPrefix(b, "offload-") && strings.HasSuffix(b, ".service") {
+			return d
+		}
+	}
+	return dir
+}
+
+// oomKilled reports whether the OOM killer fired anywhere in this job's unit.
 func oomKilled() bool {
-	b, err := os.ReadFile(filepath.Join(ownCgroup(), "memory.events"))
+	b, err := os.ReadFile(filepath.Join(unitCgroup(), "memory.events"))
 	if err != nil {
 		return false
 	}

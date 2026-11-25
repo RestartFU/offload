@@ -59,6 +59,9 @@ Client:
       --no-sync        don't upload the current directory
       --no-git         don't give the runner the repository's git history
       --no-write-back  don't copy files the job edited (cargo fmt, lockfiles…) back here
+      --environment N  use ~/.config/offload/envs/N instead of the repo's environment
+      --host           run directly on the runner host instead of in a container
+      --platform P     require a runner platform, e.g. linux/arm64
       --fresh          start from an empty workspace (cold build)
       --ephemeral      drop the workspace afterwards
       --detach, -d     print the job id and return
@@ -73,7 +76,15 @@ Client:
 
 Secrets can also come from the environment (e.g. an MCP entry's "env"):
   OFFLOAD_SECRET_<NAME>=<source>   OFFLOAD_SECRET_FILE_<NAME>=<path>   OFFLOAD_WITH=set1,set2
-  offload host upgrade NAME|--all    push this binary to runners
+  offload host upgrade NAME|--all [--binary PATH]   push this (or a matching) binary to runners
+
+Environments (jobs run in containers; agents are root inside and can install anything):
+  offload env show [--environment N]            the environment a job here would use
+  offload env add PKG...                        add system packages (persisted, one sorted layer)
+  offload env add --run 'CMD'                   add a build step
+  offload env build [--all]                     build it now on the best (or every) runner
+    Files: .offload/Containerfile (FROM offload/base), .devcontainer/devcontainer.json,
+           ~/.config/offload/envs/NAME/Containerfile
 
 Runner (on the server):
   offload runner install [--name N] [--profiles] config, profiles, systemd user units
@@ -127,6 +138,8 @@ func main() {
 		err = cmdMCP(args)
 	case "host":
 		err = cmdHost(args)
+	case "env":
+		code, err = cmdEnv(args)
 	case "runner":
 		code, err = cmdRunner(args)
 	case "hook":
@@ -195,6 +208,9 @@ func cmdRun(args []string) (int, error) {
 	fs.Var(&with, "with", "credential set")
 	fs.Var(&secrets, "secret", "env var to pass as a secret")
 	fs.BoolVar(&o.NoCreds, "no-credentials", false, "")
+	fs.StringVar(&o.Environment, "environment", "", "named environment")
+	fs.BoolVar(&o.Host, "host", false, "run on the runner host, not in a container")
+	fs.StringVar(&o.Platform, "platform", "", "require os/arch, e.g. linux/arm64")
 	fs.BoolVar(&o.NoSync, "no-sync", false, "")
 	fs.BoolVar(&o.NoWriteBack, "no-write-back", false, "")
 	fs.BoolVar(&o.NoGit, "no-git", false, "")
@@ -254,8 +270,34 @@ func cmdHost(args []string) error {
 	}
 	fs := flag.NewFlagSet("upgrade", flag.ExitOnError)
 	all := fs.Bool("all", false, "upgrade every runner")
+	binary := fs.String("binary", "", "binary to push (default: this one)")
 	_ = fs.Parse(args[1:])
-	return client.Upgrade(fs.Args(), *all)
+	return client.Upgrade(fs.Args(), *all, *binary)
+}
+
+func cmdEnv(args []string) (int, error) {
+	if len(args) < 1 {
+		die("usage: offload env show|add|build")
+	}
+	fs := flag.NewFlagSet("env", flag.ExitOnError)
+	named := fs.String("environment", "", "named environment")
+	run := fs.String("run", "", "build step")
+	all := fs.Bool("all", false, "every runner")
+	on := fs.String("on", "", "runner")
+	_ = fs.Parse(args[1:])
+	switch args[0] {
+	case "show":
+		return 0, client.EnvShow(*named)
+	case "add":
+		if fs.NArg() == 0 && *run == "" {
+			die("usage: offload env add PKG... | --run 'CMD'")
+		}
+		return 0, client.EnvAdd(*named, fs.Args(), *run)
+	case "build":
+		return client.EnvBuild(*named, *on, *all)
+	}
+	die("usage: offload env show|add|build")
+	return 2, nil
 }
 
 func cmdRunner(args []string) (int, error) {
@@ -309,6 +351,15 @@ func cmdRunner(args []string) (int, error) {
 			die("internal: runner exec --job-dir DIR -- CMD")
 		}
 		return runner.RunExec(runner.ExecOptions{JobDir: *dir, Artifacts: arts, WriteBack: *wb, Record: *record, Secrets: *secrets, Argv: rest}), nil
+	case "inner":
+		fs := flag.NewFlagSet("inner", flag.ExitOnError)
+		secrets := fs.String("secrets", "", "")
+		fl, rest := splitArgs(args[1:])
+		_ = fs.Parse(fl)
+		if len(rest) == 0 {
+			die("internal: runner inner [--secrets DIR] -- CMD")
+		}
+		return runner.RunInner(*secrets, rest), nil
 	case "credential":
 		op := ""
 		if len(args) > 1 {

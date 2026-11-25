@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"sort"
 	"strings"
 	"time"
@@ -30,7 +31,10 @@ type job struct {
 	secrets     map[string]string // in memory until the job starts, then only in tmpfs
 	secretFiles map[string][]byte
 	queuedAt    time.Time
-	inactive    int // consecutive checks the unit was gone without an exit record
+	inactive    int       // consecutive checks the unit was gone without an exit record
+	checked     time.Time // last time systemd was asked whether the unit is active
+
+	contextBuilt bool // its environment (which COPYs from the workspace) was built for it
 }
 
 // exitRecord is written by the unit wrapper when the command ends.
@@ -183,10 +187,32 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if spec.Client == "" {
 		spec.Client = r.Header.Get("X-Offload-Caller")
 	}
+	if spec.Platform != "" && spec.Platform != goruntime.GOOS+"/"+goruntime.GOARCH {
+		writeErr(w, 400, "this runner is "+goruntime.GOOS+"/"+goruntime.GOARCH+", not "+spec.Platform)
+		return
+	}
+	rt := "host"
+	switch {
+	case spec.Runtime == "container" && !s.containersAvailable():
+		writeErr(w, 400, "containers are not available on this runner (install podman)")
+		return
+	case spec.Runtime == "container", spec.Runtime == "" && s.containersAvailable():
+		rt = "container"
+	case spec.Runtime != "" && spec.Runtime != "host":
+		writeErr(w, 400, "runtime must be host or container")
+		return
+	}
+	if rt == "host" && spec.Environment != nil {
+		writeErr(w, 400, "this job has a container environment but runs on the host; drop --host or install podman")
+		return
+	}
 	j := &job{Job: api.Job{
 		ID: newID("j-"), Runner: s.cfg.Name, State: api.StateUploading, Spec: spec,
-		Resources: s.cfg.effective(spec.Resources, prof), CreatedAt: time.Now(),
+		Resources: s.cfg.effective(spec.Resources, prof), CreatedAt: time.Now(), Runtime: rt,
 	}}
+	if rt == "container" {
+		j.Image, _, _ = envPlan(spec.Environment)
+	}
 	j.dir = s.jobDir(j.ID)
 	// Secrets stay in memory; the record on disk only names them.
 	j.secrets, j.secretFiles = spec.Secrets, spec.SecretFiles
@@ -244,7 +270,12 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "invalid workspace key")
 			return
 		}
-		sl, err := s.acquireSlotLocked(spec.WorkspaceKey, j.ID)
+		slotKey := spec.WorkspaceKey
+		if rt == "container" {
+			_, _, variant := envPlan(spec.Environment)
+			slotKey += "--" + variant // build output is kept apart per environment base
+		}
+		sl, err := s.acquireSlotLocked(slotKey, j.ID)
 		if err != nil {
 			_ = os.RemoveAll(j.dir)
 			writeErr(w, http.StatusConflict, err.Error())
@@ -358,7 +389,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	g := j.Spec.Git
 	s.mu.Unlock()
 	if err == nil && g != nil {
-		if gerr := s.gitCheckout(sl, g); gerr != nil {
+		if gerr := s.gitCheckout(sl, j.Spec.WorkspaceKey, g); gerr != nil {
 			s.note(j, "running without .git: "+gerr.Error())
 		}
 	} else if err == nil {
@@ -399,6 +430,12 @@ func (s *Server) admit() {
 	}
 	sort.Slice(queued, func(a, b int) bool { return queued[a].queuedAt.Before(queued[b].queuedAt) })
 	for _, j := range queued {
+		if j.Runtime == "container" && !s.ensureImageLocked(j) {
+			if j.State == api.StateQueued {
+				j.Reason = "waiting: building environment"
+			}
+			continue // a build never blocks other jobs
+		}
 		ok, why := s.fitsLocked(j.Resources)
 		if !ok {
 			if j.Reason != "waiting: "+why {
@@ -454,7 +491,11 @@ func (s *Server) startJobLocked(j *job) error {
 	}
 	ncpu := int(math.Ceil(j.Resources.CPUMax))
 	j.cpus = s.pickCPUsLocked(ncpu)
+	container := j.Runtime == "container"
 	env := s.baseEnv(prof, ncpu)
+	if container {
+		env = s.containerEnv(prof, ncpu, j)
+	}
 	env["TMPDIR"] = filepath.Join(j.dir, "tmp")
 	env["OFFLOAD_JOB"] = j.ID
 	for k, v := range j.Spec.Env {
@@ -470,16 +511,26 @@ func (s *Server) startJobLocked(j *job) error {
 		j.AllowedCPUs = units.FormatCPUList(j.cpus)
 	}
 	argv := append([]string{s.self, "runner", "exec", "--job-dir", j.dir}, artifactArgs(j.Spec.Artifacts)...)
-	if dir := s.setupCredentials(j, env); dir != "" {
-		argv = append(argv, "--secrets", dir)
+	secrets := s.setupCredentials(j, env)
+	if secrets != "" && !container {
+		argv = append(argv, "--secrets", secrets)
 	}
 	if j.slot != nil && j.Spec.WriteBack {
 		argv = append(argv, "--write-back", j.slot.Dir, "--record", j.slot.recordPath())
 	}
 	argv = append(argv, "--")
-	argv = append(argv, j.Spec.Argv...)
+	unitEnv := env
+	if container {
+		// The unit runs podman with the user manager's environment; the job's variables go to
+		// the container, and its secrets are loaded inside from the tmpfs mount.
+		argv = append(argv, s.containerArgv(j, env, dir, secrets)...)
+		unitEnv = map[string]string{}
+		s.touchImage(j.Image)
+	} else {
+		argv = append(argv, j.Spec.Argv...)
+	}
 	u := unitSpec{
-		Name: j.Unit, Slice: s.cfg.Slice, Dir: dir, Env: env, Argv: argv,
+		Name: j.Unit, Slice: s.cfg.Slice, Dir: dir, Env: unitEnv, Argv: argv, Delegate: container,
 		CPUWeight: cpuWeight(j.Resources.CPU), CPUQuotaPct: int(math.Ceil(j.Resources.CPUMax * 100)),
 		AllowedCPUs: j.AllowedCPUs, MemoryMax: j.Resources.Mem, OOMScoreAdj: s.cfg.Policy.OOMScoreAdj,
 		Stdout: filepath.Join(j.dir, "output.log"),
@@ -520,6 +571,10 @@ func (s *Server) checkRunning() {
 	s.mu.Unlock()
 	for _, j := range running {
 		rec, err := readExit(filepath.Join(j.dir, "exit.json"))
+		if err != nil && time.Since(j.checked) < time.Second {
+			continue // asking systemd is slower; once a second is plenty for crashed units
+		}
+		j.checked = time.Now()
 		active := err != nil && unitActive(j.Unit)
 		s.mu.Lock()
 		switch {
@@ -583,7 +638,7 @@ func (s *Server) finishLocked(j *job, state string, code *int, reason string) {
 }
 
 func (s *Server) dropSlotLocked(sl *slot) {
-	_ = os.RemoveAll(sl.Dir)
+	_ = removeAll(sl.Dir)
 	_ = os.Remove(sl.recordPath())
 	list := s.slots[sl.Key]
 	for i, x := range list {
@@ -757,6 +812,7 @@ func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 func (s *Server) gc() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.gcContainersLocked()
 	for id, j := range s.jobs {
 		if api.Terminal(j.State) && j.FinishedAt != nil && time.Since(*j.FinishedAt) > s.cfg.jobsRetain {
 			_ = os.RemoveAll(j.dir)

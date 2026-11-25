@@ -54,6 +54,12 @@ type Config struct {
 		} `toml:"jobs"`
 	} `toml:"storage"`
 
+	Container struct {
+		Runtime     string `toml:"runtime"`      // "container" (default when podman exists) or "host"
+		BuildMem    string `toml:"build_mem"`    // memory limit for environment builds
+		ImageRetain string `toml:"image_retain"` // drop environment images unused this long
+	} `toml:"container"`
+
 	Policy struct {
 		MaxSessions  int    `toml:"max_sessions"`
 		SessionGrace string `toml:"session_grace"`
@@ -70,6 +76,8 @@ type Config struct {
 	jobsRetain   time.Duration
 	sessionGrace time.Duration
 	persistent   bool
+	buildMem     int64
+	imageRetain  time.Duration
 }
 
 // Profile is a named job or session recipe (profiles_dir/<name>.toml).
@@ -188,6 +196,15 @@ func (c *Config) finish() error {
 		return err
 	}
 	if c.sessionGrace, err = durationOr(c.Policy.SessionGrace, 5*time.Minute); err != nil {
+		return err
+	}
+	if c.buildMem, err = units.ParseSize(c.Container.BuildMem); err != nil {
+		return err
+	}
+	if c.buildMem == 0 {
+		c.buildMem = min(8<<30, c.memCap)
+	}
+	if c.imageRetain, err = durationOr(c.Container.ImageRetain, 14*24*time.Hour); err != nil {
 		return err
 	}
 	if c.Policy.MaxSessions <= 0 {

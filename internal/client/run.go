@@ -34,7 +34,10 @@ type RunOptions struct {
 	NoGit       bool
 	With        []string // extra credential sets
 	Secrets     []string // local env vars to pass as secrets
-	NoCreds     bool     // no relays, no secrets
+	NoCreds     bool     // no relays, no auto secrets
+	Environment string   // named environment (~/.config/offload/envs/NAME)
+	Host        bool     // run on the runner host instead of a container
+	Platform    string   // require e.g. linux/arm64
 	Fresh       bool
 	Ephemeral   bool
 	Detach      bool
@@ -92,6 +95,15 @@ func Run(o RunOptions) (int, error) {
 	spec := api.JobSpec{Argv: o.Argv, Env: o.Env, Profile: o.Profile, Resources: o.Resources,
 		Artifacts: o.Artifacts, Fresh: o.Fresh, Ephemeral: o.Ephemeral, Client: clientLabel(), Detached: o.Detach}
 	// --no-credentials drops the relays and auto sets; explicit --with/--secret still apply.
+	if o.NoSync && o.Environment != "" {
+		if spec.Environment, err = LoadEnvDef("", o.Environment); err != nil {
+			return 1, err
+		}
+	}
+	if o.Host {
+		spec.Runtime, spec.Environment = "host", nil
+	}
+	spec.Platform = o.Platform
 	if !o.NoCreds {
 		spec.Relay = cfg.relays()
 		cwd, _ := os.Getwd()
@@ -109,6 +121,9 @@ func Run(o RunOptions) (int, error) {
 		}
 		spec.WorkspaceKey, spec.Manifest, spec.Dir = ws.Key, ws.Manifest, ws.Dir
 		spec.WriteBack = !o.NoWriteBack
+		if spec.Environment, err = LoadEnvDef(ws.Root, o.Environment); err != nil {
+			return 1, err
+		}
 		if !o.NoGit {
 			spec.Git = ws.Git
 		}
@@ -175,7 +190,7 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 			if len(avail) == 0 && len(hosts) > 0 {
 				avail, busy = hosts, map[string]bool{} // all busy: wait on the best one
 			}
-			h, err = Pick(avail, spec.Resources, spec.Profile, spec.WorkspaceKey, "job")
+			h, err = PickFor(avail, spec, "job")
 		}
 		if err != nil {
 			return nil, j, err
@@ -227,7 +242,11 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 		if j.Spec.Profile != "" {
 			prof = "profile " + j.Spec.Profile + ", "
 		}
-		logf(o.Quiet, "running on %s as %s:%s (%s%g cpu, %s memory %s)", h.Name, h.Name, j.ID, prof,
+		where := "host"
+		if j.Runtime == "container" {
+			where = "container " + strings.TrimPrefix(j.Image, "localhost/")
+		}
+		logf(o.Quiet, "running on %s as %s:%s (%s, %s%g cpu, %s memory %s)", h.Name, h.Name, j.ID, where, prof,
 			j.Resources.CPU, units.FormatSize(j.Resources.Mem), j.MemFrom)
 		return h, j, nil
 	}
@@ -318,7 +337,10 @@ func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bo
 		if j.ExitCode != nil && *j.ExitCode != 0 {
 			return *j.ExitCode, &j, nil
 		}
-		return 137, &j, nil
+		if strings.Contains(j.Reason, "out of memory") || strings.HasPrefix(j.Reason, "killed") {
+			return 137, &j, nil
+		}
+		return 1, &j, nil
 	case j.ExitCode != nil:
 		return *j.ExitCode, &j, nil
 	}

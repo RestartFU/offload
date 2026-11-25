@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -39,6 +40,11 @@ type Server struct {
 	features map[string]bool
 	history  map[string]*histEntry
 	wake     chan struct{}
+	tz       string
+
+	builds      map[string]*envBuild // image tag -> build in progress
+	readyImages map[string]bool
+	imageUse    map[string]time.Time
 
 	whoisMu sync.Mutex
 	whois   map[string]whoisEntry
@@ -60,6 +66,7 @@ func New(cfg *Config, version string) (*Server, error) {
 		cfg: cfg, version: version, self: self,
 		jobs: map[string]*job{}, sessions: map[string]*session{}, slots: map[string][]*slot{},
 		cpuUse: map[int]int{}, wake: make(chan struct{}, 1), whois: map[string]whoisEntry{},
+		builds: map[string]*envBuild{}, readyImages: map[string]bool{}, tz: hostTimezone(),
 	}
 	ctrl := delegatedControllers()
 	s.features = map[string]bool{"cpuset": ctrl["cpuset"], "io": ctrl["io"], "memory": ctrl["memory"], "cpu": ctrl["cpu"]}
@@ -69,6 +76,7 @@ func New(cfg *Config, version string) (*Server, error) {
 		}
 	}
 	s.loadHistory()
+	s.loadImageUse()
 	s.restore()
 	return s, nil
 }
@@ -111,6 +119,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		go func(addr string) { errc <- s.listen(ctx, addr, handler) }(addr)
 	}
 	go s.loop(ctx)
+	go s.prebuildBase()
 	select {
 	case <-ctx.Done():
 		return nil
@@ -286,7 +295,7 @@ func (s *Server) tailnetOK(ctx context.Context, remote string) (string, bool) {
 // loop runs the scheduler: finishes jobs whose units ended, admits queued work, reaps idle
 // sessions, and collects garbage.
 func (s *Server) loop(ctx context.Context) {
-	tick := time.NewTicker(time.Second)
+	tick := time.NewTicker(200 * time.Millisecond) // exit records are a cheap stat; see checkRunning
 	defer tick.Stop()
 	lastGC := time.Time{}
 	for {
@@ -321,6 +330,11 @@ func (s *Server) status() api.Status {
 		Profiles: map[string]api.ProfileInfo{}, Persistent: s.cfg.persistent, Accepting: true,
 	}
 	st.Hostname, _ = os.Hostname()
+	st.OS, st.Arch, st.Runtime = runtime.GOOS, runtime.GOARCH, "host"
+	if s.containersAvailable() {
+		st.Runtime = "container"
+		st.Images = len(s.imageUse)
+	}
 	st.Allocated = s.allocatedLocked()
 	for _, j := range s.jobs {
 		switch j.State {
@@ -336,7 +350,7 @@ func (s *Server) status() api.Status {
 		}
 	}
 	for k := range s.slots {
-		st.WarmKeys = append(st.WarmKeys, k)
+		st.WarmKeys = append(st.WarmKeys, k) // container slots are "<workspace>--<variant>"
 	}
 	sort.Strings(st.WarmKeys)
 	for name, p := range s.cfg.loadProfiles() {
@@ -438,6 +452,19 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "upgraded; restarting"})
 	log.Printf("binary replaced; exiting so systemd restarts the new version")
 	go func() { time.Sleep(300 * time.Millisecond); os.Exit(0) }()
+}
+
+// hostTimezone returns the IANA zone of /etc/localtime, so containers keep the host's clock zone.
+func hostTimezone() string {
+	if tz := os.Getenv("TZ"); tz != "" {
+		return tz
+	}
+	if p, err := os.Readlink("/etc/localtime"); err == nil {
+		if i := strings.Index(p, "zoneinfo/"); i >= 0 {
+			return p[i+len("zoneinfo/"):]
+		}
+	}
+	return ""
 }
 
 func newID(prefix string) string {

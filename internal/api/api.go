@@ -59,6 +59,12 @@ type JobSpec struct {
 	// file's path) exist only while the job runs, in tmpfs. The runner never stores them.
 	Secrets     map[string]string `json:"secrets,omitempty"`
 	SecretFiles map[string][]byte `json:"secret_files,omitempty"`
+	// Environment is the container environment to run in (nil = the runner's default base).
+	Environment *EnvDef `json:"environment,omitempty"`
+	// Runtime forces "host" or "container"; empty lets the runner decide (containers if available).
+	Runtime string `json:"runtime,omitempty"`
+	// Platform requires a runner OS/arch such as "linux/arm64"; empty means any.
+	Platform string `json:"platform,omitempty"`
 	// GitConfig is git configuration mirrored from the client (URL rewrites, identity), applied
 	// to the job through GIT_CONFIG_* so git on the runner behaves like git on the client.
 	GitConfig [][2]string `json:"git_config,omitempty"`
@@ -97,6 +103,9 @@ type Job struct {
 	// AutoMem is set when the runner chose the memory limit (from history or the profile)
 	// rather than the caller; clients may retry such a job with more memory after an OOM.
 	AutoMem bool `json:"auto_mem,omitempty"`
+	// Runtime is "container" or "host"; Image is the environment image when containerized.
+	Runtime string `json:"runtime,omitempty"`
+	Image   string `json:"image,omitempty"`
 	// MemFrom says where the memory limit came from: "requested", "learned", "profile", "default".
 	MemFrom string `json:"mem_from,omitempty"`
 	// Needed lists the manifest paths the client must upload. Only set in the create response.
@@ -106,6 +115,17 @@ type Job struct {
 	// GitNeeded means the runner lacks Spec.Git.Head: upload a bundle of HEAD minus GitHave.
 	GitNeeded bool     `json:"git_needed,omitempty"`
 	GitHave   []string `json:"git_have,omitempty"`
+}
+
+// EnvDef is a job environment: a Containerfile, usually starting `FROM offload/base`, which the
+// runner builds (layer-cached) and runs the job in. ContextDir (relative to the workspace root)
+// is the build context for COPY/ADD; empty means no context.
+type EnvDef struct {
+	Name          string            `json:"name"` // display name, e.g. ".offload/Containerfile"
+	Containerfile string            `json:"containerfile"`
+	ContextDir    string            `json:"context_dir,omitempty"`
+	Env           map[string]string `json:"env,omitempty"`     // extra environment (devcontainer containerEnv)
+	Devices       []string          `json:"devices,omitempty"` // e.g. /dev/dri
 }
 
 // GitRef is the client's checkout: commit and branch (empty when detached).
@@ -181,6 +201,10 @@ type Status struct {
 	WarmKeys     []string               `json:"warm_keys"` // workspace keys with a persistent slot
 	Profiles     map[string]ProfileInfo `json:"profiles"`
 	Persistent   bool                   `json:"persistent"`
+	OS           string                 `json:"os"`
+	Arch         string                 `json:"arch"`
+	Runtime      string                 `json:"runtime"` // default runtime: "container" or "host"
+	Images       int                    `json:"images,omitempty"`
 	Features     []string               `json:"features"` // cgroup controllers in use: cpuset, io…
 	Accepting    bool                   `json:"accepting"`
 	Reason       string                 `json:"reason,omitempty"`

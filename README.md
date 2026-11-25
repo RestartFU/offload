@@ -34,6 +34,17 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
   are answered by the attached client from the laptop. Credential sets in `client.toml` (for
   example `GH_TOKEN = "cmd:gh auth token"`) can be marked `auto` so every job gets them. They
   live in tmpfs only for the job's lifetime.
+- **Containers, with tools that persist.** Jobs run in rootless podman inside their systemd unit,
+  so all the limits above still apply. Agents are root inside and can install anything for one
+  run. Tools worth keeping go in the environment: `offload env add protobuf-compiler` maintains
+  a sorted package layer in `.offload/Containerfile` (`FROM offload/base`, Ubuntu 24.04 LTS).
+  `.devcontainer/devcontainer.json` (image or build, containerEnv) works too. Every runner builds
+  the same definition, layer-cached: the first build takes minutes, adding a tool takes seconds,
+  and a warm job starts in about 0.5s. Toolchains (rustup, Go modules, npm and pip caches) live
+  in shared volumes, so every environment reuses them. `--host` runs directly on the runner.
+- **Any Linux runner.** The environment is the same on every distro. Runners report OS/arch,
+  and the client prefers one matching the laptop (`--platform linux/arm64` forces one).
+  Windows hosts can be runners through WSL2; macOS hosts through a Linux VM.
 - **Survives restarts.** Jobs are systemd units, so the daemon can restart or upgrade
   (`offload host upgrade`) without killing work. Clients reattach from the last byte after
   network drops or laptop sleep.
@@ -45,6 +56,7 @@ On the server, once (copy the binary any way you like, e.g. `scp`, cloud-init or
 ```bash
 ./offload runner install                          # ~/.local/bin/offload, config, profiles, user units
 sudo ~/.local/bin/offload runner install-system   # linger, cgroup delegation, keep-alive, firewall
+sudo dnf install podman   # or apt: rootless podman for container jobs (optional; without it jobs run on the host)
 systemctl --user daemon-reexec && systemctl --user restart offload-runner
 ```
 
@@ -58,7 +70,7 @@ Minecraft MCP session.
 ## Use it from the laptop
 
 ```bash
-go build -o ~/.local/bin/offload .
+CGO_ENABLED=0 go build -o ~/.local/bin/offload .   # static: the same binary runs inside job containers
 offload hosts
 offload run -- cargo test
 offload run --profile cargo --mem 16G --get target/release/app -- cargo build --release

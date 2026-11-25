@@ -31,6 +31,15 @@ What the job sees on the runner:
   sets the user marked `auto` in `client.toml`. Detached jobs (`-d`) get no relay answers.
 - Real core counts (`nproc`, `CARGO_BUILD_JOBS`, `GOMAXPROCS`, `MAKEFLAGS`).
 
+Where it runs: a container built from the repo's environment (`.offload/Containerfile`,
+else `.devcontainer/devcontainer.json`, else the runner's Ubuntu 24.04 base with git, build tools,
+clang, cmake, Python, Node, Go and Rust). You are root in it.
+- Missing a tool for one run: install it in the command (`offload run -- sh -c 'apt-get update && apt-get install -y foo && …'`).
+- Needed again: `offload env add foo` (adds an apt package to `.offload/Containerfile`; commit it),
+  or `offload env add --run 'curl … | sh'` for anything else. The next job builds that layer once
+  per runner, in seconds. `offload env show` prints the environment.
+- Never `sudo` on the runner host and never `--host` just to get a tool.
+
 What comes back:
 - stdout and stderr (kept separate) and the exit code. Out of memory after the retry exits 137.
 - Synced files the job edited (`cargo fmt`, `Cargo.lock`, codegen) are written back here, unless
