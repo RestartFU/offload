@@ -1,0 +1,11 @@
+# Rust builds and tests. Use with: offload run --profile cargo -- cargo build
+kind = "job"
+description = "Rust (cargo) builds and tests"
+
+[resources]
+cpu = 4        # guaranteed share
+mem = "8G"     # hard limit; raise per job with --mem
+# cpu_max defaults to every core the runner allows, so an idle runner builds at full speed.
+
+[env]
+CARGO_TERM_PROGRESS_WHEN = "never"

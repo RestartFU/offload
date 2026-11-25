@@ -1,0 +1,10 @@
+# Smallest possible session: echoes stdin back. Used to check that session bridging works:
+#   printf '{"jsonrpc":"2.0","id":1,"method":"ping"}\n' | offload mcp echo
+kind = "session"
+description = "test session that echoes stdin"
+command = ["cat"]
+
+[resources]
+cpu = 0.1
+cpu_max = 1
+mem = "64M"

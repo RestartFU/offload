@@ -1,0 +1,19 @@
+# Minecraft Bedrock MCP (mcpelauncher-agent) on a private Xvfb display with software rendering.
+# Not installed by default: the runner needs Xvfb (xorg-x11-server-Xvfb, xorg-x11-xauth),
+# flatpak with io.mrarm.mcpelauncher and the game data, bun, and mcpelauncher-agent checked out.
+# Copy this file into ~/.config/offload/profiles/ on that runner once those exist.
+kind = "session"
+description = "Minecraft Bedrock client MCP (headless, Xvfb + llvmpipe)"
+command = ["bun", "run", "~/.local/share/mcpelauncher-agent/src/index.ts"]
+
+[resources]
+cpu = 2
+cpu_max = 6     # llvmpipe rendering is CPU-bound
+mem = "4G"
+
+[env]
+PATH = "~/.bun/bin:~/.local/bin:/usr/local/bin:/usr/bin:/bin"
+MCPELAUNCHER_CLIENT = "~/.local/bin/mcpelauncher-headless"
+MCPELAUNCHER_SOCKET_DIR = "~/.var/app/io.mrarm.mcpelauncher/data"
+MCPELAUNCHER_DATA = "~/.var/app/io.mrarm.mcpelauncher/data/mcpelauncher"
+MCPELAUNCHER_ABI = "x86_64"

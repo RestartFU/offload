@@ -1,0 +1,7 @@
+# Go builds and tests. Use with: offload run --profile go -- go test ./...
+kind = "job"
+description = "Go builds and tests"
+
+[resources]
+cpu = 4
+mem = "4G"
