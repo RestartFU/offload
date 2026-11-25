@@ -125,7 +125,7 @@ func gitFiles(root string) ([]string, error) {
 // workspaceKey names the runner-side workspace: repo name plus a hash of its origin (or path),
 // so every clone and worktree of a repository shares warm build directories.
 func workspaceKey(root string) string {
-	host, _ := os.Hostname()
+	host := clientID()
 	id := "path:" + host + ":" + root // no origin: this checkout on this machine
 	if url, err := git(root, "config", "--get", "remote.origin.url"); err == nil && strings.TrimSpace(url) != "" {
 		id = strings.TrimSpace(url)
@@ -286,30 +286,41 @@ func hashFiles(root string, files []string) ([]api.FileEntry, error) {
 	return out, nil
 }
 
-// readInTree reads a regular file inside root, through real directories only and never
-// following a symlink.
-func readInTree(root *os.Root, rel string) ([]byte, error) {
+// openInTree opens a regular file inside root for reading, through real directories only and
+// never following a symlink.
+func openInTree(root *os.Root, rel string) (*os.File, os.FileInfo, error) {
 	if err := checkRel(rel); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	parts := strings.Split(rel, "/")
 	for i := 1; i < len(parts); i++ {
 		fi, err := root.Lstat(strings.Join(parts[:i], "/"))
 		if err != nil {
-			return nil, err // missing parent: ErrNotExist, like a missing file
+			return nil, nil, err // missing parent: ErrNotExist, like a missing file
 		}
 		if !fi.IsDir() {
-			return nil, fmt.Errorf("%s: %s is not a real directory (a symlink?)", rel, strings.Join(parts[:i], "/"))
+			return nil, nil, fmt.Errorf("%s: %s is not a real directory (a symlink?)", rel, strings.Join(parts[:i], "/"))
 		}
 	}
 	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
+		return nil, nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, nil, fmt.Errorf("%s is not a regular file", rel)
+	}
+	return f, fi, nil
+}
+
+// readInTree reads a small file with openInTree's rules.
+func readInTree(root *os.Root, rel string) ([]byte, error) {
+	f, _, err := openInTree(root, rel)
+	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", rel)
-	}
 	return io.ReadAll(f)
 }
 
@@ -332,19 +343,24 @@ func writeTar(w io.Writer, root string, manifest []api.FileEntry, needed []strin
 		if !ok {
 			return fmt.Errorf("runner asked for unknown file %q", p)
 		}
-		b, err := readInTree(tree, p)
+		// Streamed, never held in memory: the hash is checked as it goes, and a file that
+		// changed while uploading fails the whole upload (the runner applies nothing).
+		f, fi, err := openInTree(tree, p)
 		if err != nil {
 			return err
 		}
-		sum := sha256.Sum256(b)
-		if hex.EncodeToString(sum[:]) != e.Hash {
+		if err := tw.WriteHeader(&tar.Header{Name: p, Mode: int64(e.Mode), Size: fi.Size(), Typeflag: tar.TypeReg, Format: tar.FormatPAX}); err != nil {
+			f.Close()
+			return err
+		}
+		h := sha256.New()
+		n, err := io.Copy(io.MultiWriter(tw, h), io.LimitReader(f, fi.Size()))
+		f.Close()
+		if err != nil {
+			return err
+		}
+		if n != fi.Size() || hex.EncodeToString(h.Sum(nil)) != e.Hash {
 			return fmt.Errorf("%s changed while uploading; run again", p)
-		}
-		if err := tw.WriteHeader(&tar.Header{Name: p, Mode: int64(e.Mode), Size: int64(len(b)), Typeflag: tar.TypeReg, Format: tar.FormatPAX}); err != nil {
-			return err
-		}
-		if _, err := tw.Write(b); err != nil {
-			return err
 		}
 	}
 	if err := tw.Close(); err != nil {

@@ -562,8 +562,14 @@ func (s *Server) retireOtherVersions() error {
 		finish func()
 	}
 	var victims []victim
-	live := map[string]bool{}
+	live, known := map[string]bool{}, map[string]bool{}
 	s.mu.Lock()
+	for id := range s.jobs {
+		known["offload-"+id] = true
+	}
+	for id := range s.sessions {
+		known["offload-"+id] = true
+	}
 	for _, j := range s.jobs {
 		if api.Terminal(j.State) {
 			continue
@@ -608,12 +614,24 @@ func (s *Server) retireOtherVersions() error {
 		s.mu.Unlock()
 	}
 	if s.containersAvailable() {
-		out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-[js]-", "--filter", "label="+s.ownerLabel(), "--format", "{{.Names}}")
+		owner := strings.TrimPrefix(s.ownerLabel(), "dev.offload.runner=")
+		out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-[js]-",
+			"--format", `{{.Names}} {{index .Labels "dev.offload.runner"}}`)
 		if err != nil {
 			problems = append(problems, "listing containers: "+err.Error())
 		} else {
-			for _, name := range strings.Fields(out) {
-				if live[name] {
+			for _, line := range strings.Split(out, "\n") {
+				f := strings.Fields(line)
+				if len(f) == 0 || live[f[0]] {
+					continue
+				}
+				name, label := f[0], ""
+				if len(f) > 1 {
+					label = f[1]
+				}
+				// Ours by label, or (made before labels existed) by our own records. Anything
+				// else belongs to another runner of this user.
+				if label != owner && !(label == "" && known[name]) {
 					continue
 				}
 				log.Printf("removing container %s: no current workload owns it", name)

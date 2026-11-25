@@ -380,3 +380,26 @@ func TestInterruptedApplyLeftoverIsRemoved(t *testing.T) {
 		t.Fatal("still dirty")
 	}
 }
+
+func TestFileBecomesDirectoryIsNotLeftDirty(t *testing.T) {
+	dir := t.TempDir()
+	sl := &slot{Key: "k", Index: 0, Dir: filepath.Join(dir, "0")}
+	os.MkdirAll(sl.Dir, 0o755)
+	a, ab := entry("a", "file")
+	need, _ := sl.plan([]api.FileEntry{a})
+	if err := sl.apply([]api.FileEntry{a}, need, tarOf(t, map[string][]byte{"a": ab}, need)); err != nil {
+		t.Fatal(err)
+	}
+	b, bb := entry("a/b", "now a directory")
+	m := []api.FileEntry{b}
+	need, _ = sl.plan(m)
+	if err := sl.apply(m, need, tarOf(t, map[string][]byte{"a/b": bb}, need)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(sl.Dir, "a", "b")); string(got) != "now a directory" {
+		t.Fatalf("a/b = %q", got)
+	}
+	if d := sl.load().Dirty; len(d) != 0 {
+		t.Fatalf("left dirty: %v", d)
+	}
+}

@@ -80,7 +80,9 @@ systemctl --user daemon-reexec && systemctl --user restart offload-runner
 `runner install` ends by printing a one-time pairing code (valid a day; `offload runner
 pair-code` prints a new one). On the laptop: `offload host pair <name> --code <code>`. To revoke every
 paired client (a lost laptop, a leaked token), run `offload runner reset-pairing` on the runner
-and pair again. After that, upgrades come from the laptop with
+and pair again; every pairing mints a new token. A detached job's (`-d`) edits are written back
+when you `offload attach` it. A data set whose local copy is empty is never synced (that would
+empty the runner's copy) unless its `[data.NAME]` sets `allow_empty = true`. After that, upgrades come from the laptop with
 `offload host upgrade <name>`.
 
 The config lives in `~/.config/offload/runner.toml` and holds capacity, reserve, storage and

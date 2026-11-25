@@ -35,6 +35,8 @@ type DataSetConfig struct {
 	Include []string `toml:"include"` // empty = everything
 	Exclude []string `toml:"exclude"`
 	Newest  []string `toml:"newest"`
+	// AllowEmpty lets an empty local copy empty the runner's (refused otherwise).
+	AllowEmpty bool `toml:"allow_empty"`
 }
 
 // SessionConfig is ~/.config/offload/sessions/NAME.toml: an MCP (or any stdio) server that runs
@@ -209,6 +211,10 @@ func dataFiles(cfg DataSetConfig) (string, []string, error) {
 	return root, files, err
 }
 
+// dataKey is a data set's name on runners: namespaced by this client, so another laptop's data
+// set of the same name is a different one.
+func dataKey(name string) string { return clientID() + "." + name }
+
 // preferData narrows hosts to those already holding every data set a session needs (their first
 // start is fast: no multi-gigabyte sync, environment build or toolchain install), if any do.
 func preferData(hosts []*Host, data map[string]string) []*Host {
@@ -223,7 +229,7 @@ func preferData(hosts []*Host, data map[string]string) []*Host {
 		}
 		ok := true
 		for name := range data {
-			ok = ok && have[name]
+			ok = ok && have[dataKey(name)]
 		}
 		if ok {
 			warm = append(warm, h)
@@ -254,11 +260,16 @@ func SyncData(ctx context.Context, h *Host, name string, cfg DataSetConfig, quie
 			Changed bool     `json:"changed"` // deletions, symlinks or modes changed: apply even with no files
 			Rev     int64    `json:"rev"`
 		}
-		if err := h.do(ctx, "POST", "/v1/data/"+name, api.DataPlan{Manifest: manifest}, &plan); err != nil {
+		if err := h.do(ctx, "POST", "/v1/data/"+dataKey(name), api.DataPlan{Manifest: manifest}, &plan); err != nil {
 			return fmt.Errorf("data set %s: %w", name, err)
 		}
 		if len(plan.Needed) == 0 && !plan.Changed {
 			return nil
+		}
+		if len(manifest) == 0 && !cfg.AllowEmpty {
+			// An empty local copy that would empty the runner's is far more often an unmounted
+			// disk or a moved folder than an intent.
+			return fmt.Errorf("data set %s: %s is empty here, and syncing would delete the runner's copy; check the path, or set allow_empty = true in [data.%s]", name, root, name)
 		}
 		var size int64
 		byPath := map[string]bool{}
@@ -297,7 +308,7 @@ func SyncData(ctx context.Context, h *Host, name string, cfg DataSetConfig, quie
 			}
 			pw.CloseWithError(err)
 		}()
-		req, err := newRequest(ctx, h, "PUT", "/v1/data/"+name, pr)
+		req, err := newRequest(ctx, h, "PUT", "/v1/data/"+dataKey(name), pr)
 		if err != nil {
 			return err
 		}

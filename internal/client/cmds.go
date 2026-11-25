@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	goruntime "runtime"
 	"strings"
 	"syscall"
@@ -130,7 +131,12 @@ func Attach(ref string) (int, error) {
 		return 1, err
 	}
 	cfg, _ := LoadConfig()
-	code, _, err := follow(ctx, h, id, false, false, cfg)
+	code, done, err := follow(ctx, h, id, false, false, cfg)
+	if err == nil && done != nil {
+		if werr := applyDetachedWriteBack(ctx, h, done); werr != nil {
+			logf(false, "write-back: %v", werr)
+		}
+	}
 	return code, err
 }
 
@@ -249,16 +255,43 @@ func Pair(names []string, all bool, code string) error {
 		return fmt.Errorf("a pairing code belongs to one runner: name it")
 	}
 	for _, h := range targets {
-		if h.Token == "" {
+		if h.sock != "" {
 			fmt.Printf("%s: local, nothing to pair\n", h.Name)
 			continue
 		}
-		sum := sha256.Sum256([]byte(h.Token))
-		body := map[string]any{"hash": hex.EncodeToString(sum[:]), "code": code}
-		var out map[string]string
-		err := h.do(ctx, "POST", "/v1/admin/pair", body, &out)
+		if !h.derived {
+			fmt.Printf("%s: its token is set in client.toml, nothing to pair\n", h.Name)
+			continue
+		}
+		// Every pairing mints a fresh token, so re-pairing after a reset never revives an old one.
+		// The request authenticates with what we have (the stored token, or an older client's
+		// derived one); the runner then retires that.
+		fresh, err := randomHex(32)
 		if err != nil {
+			return err
+		}
+		auth := *h
+		if auth.Token == "" {
+			auth.Token = legacyToken(h.URL)
+		}
+		sum := sha256.Sum256([]byte(fresh))
+		body := map[string]any{"hash": hex.EncodeToString(sum[:]), "code": code, "rotate": true}
+		// Saved before asking, so a runner that accepted it (and retired the old one) never
+		// leaves us without a usable token.
+		pending := runnerTokenPath(h.URL) + ".pending"
+		if err := os.MkdirAll(filepath.Dir(pending), 0o700); err != nil {
+			return err
+		}
+		if err := os.WriteFile(pending, []byte(fresh+"\n"), 0o600); err != nil {
+			return err
+		}
+		var out map[string]string
+		if err := auth.do(ctx, "POST", "/v1/admin/pair", body, &out); err != nil {
+			os.Remove(pending)
 			return fmt.Errorf("%s: %w", h.Name, err)
+		}
+		if err := os.Rename(pending, runnerTokenPath(h.URL)); err != nil {
+			return fmt.Errorf("%s: paired; the new token is in %s (rename failed: %v)", h.Name, pending, err)
 		}
 		fmt.Printf("%s: %s\n", h.Name, out["status"])
 	}

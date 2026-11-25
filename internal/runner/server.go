@@ -46,10 +46,11 @@ type Server struct {
 
 	tz string
 
-	builds      map[string]*envBuild // image tag -> build in progress
-	buildErrs   map[string]error     // last failed build per tag, reported to the next session
-	readyImages map[string]bool
-	imageUse    map[string]time.Time
+	builds       map[string]*envBuild // image tag -> build in progress
+	buildErrs    map[string]error     // last failed build per tag, reported to the next session
+	readyImages  map[string]bool
+	readyChecked map[string]time.Time // when readyImages was last confirmed against podman
+	imageUse     map[string]time.Time
 
 	upgrading bool   // a new binary is being swapped in: start nothing
 	retireErr string // set while workloads of another version couldn't be confirmed stopped
@@ -76,7 +77,7 @@ func New(cfg *Config, version string) (*Server, error) {
 		cfg: cfg, version: version, self: self,
 		jobs: map[string]*job{}, sessions: map[string]*session{}, slots: map[string][]*slot{},
 		cpuUse: map[int]int{}, wake: make(chan struct{}, 1), whois: map[string]whoisEntry{},
-		builds: map[string]*envBuild{}, buildErrs: map[string]error{}, readyImages: map[string]bool{}, tz: hostTimezone(),
+		builds: map[string]*envBuild{}, buildErrs: map[string]error{}, readyImages: map[string]bool{}, readyChecked: map[string]time.Time{}, tz: hostTimezone(),
 	}
 	ctrl := delegatedControllers()
 	s.features = map[string]bool{"cpuset": ctrl["cpuset"], "io": ctrl["io"], "memory": ctrl["memory"], "cpu": ctrl["cpu"]}
@@ -146,6 +147,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/data/{name}", s.handleDataPlan)
 	mux.HandleFunc("PUT /v1/data/{name}", s.handleDataUpload)
 	mux.HandleFunc("PUT /v1/admin/binary", s.handleUpgrade)
+	mux.HandleFunc("POST /v1/admin/reset-pairing", s.handleResetPairing)
 	mux.HandleFunc("POST /v1/admin/pair", s.handlePair)
 
 	handler := s.auth(mux)
@@ -299,6 +301,38 @@ func (s *Server) auth(next http.Handler) http.Handler {
 	})
 }
 
+// tokenHashPaired reports whether a token hash is still in the tokens file.
+func (s *Server) tokenHashPaired(hash string) bool {
+	for _, line := range s.pairedTokens() {
+		h, hashed := strings.CutPrefix(line, "sha256:")
+		if !hashed {
+			sum := sha256.Sum256([]byte(line))
+			h = hex.EncodeToString(sum[:])
+		}
+		if subtle.ConstantTimeCompare([]byte(h), []byte(hash)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// handleResetPairing forgets every paired client (local socket only) and returns a fresh code.
+func (s *Server) handleResetPairing(w http.ResponseWriter, r *http.Request) {
+	if r.Context().Value(unixMarker{}) == nil {
+		writeErr(w, http.StatusForbidden, "local socket only: run `offload runner reset-pairing` on the runner")
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	code, err := ResetPairing(s.tokensPath())
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	log.Printf("pairing reset: every client must pair again")
+	writeJSON(w, map[string]string{"code": code, "tokens": s.tokensPath()})
+}
+
 // removeToken drops the tokens-file line for a token hash (stored hashed or, legacy, raw).
 func (s *Server) removeToken(hash string) error {
 	b, err := os.ReadFile(s.tokensPath())
@@ -352,8 +386,9 @@ func (s *Server) consumePairCode(code string) error {
 	return os.Remove(s.pairCodePath())
 }
 
-// ResetPairing forgets every paired client (run on the runner itself, e.g. to revoke a token
-// that may have leaked) and returns a fresh pairing code.
+// ResetPairing forgets every paired client and returns a fresh pairing code. With the runner
+// running, `offload runner reset-pairing` asks it instead (handleResetPairing), so the reset
+// is ordered with pair requests in flight.
 func ResetPairing(tokensFile string) (string, error) {
 	if tokensFile == "" {
 		tokensFile = filepath.Join(filepath.Dir(DefaultConfigPath()), "tokens")
@@ -392,7 +427,7 @@ func NewPairCode(tokensFile string) (string, error) {
 func checkClientProto(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/status", "/v1/admin/pair", "/v1/admin/binary":
+		case "/v1/status", "/v1/admin/pair", "/v1/admin/binary", "/v1/admin/reset-pairing":
 		default:
 			if got := r.Header.Get(api.ProtoHeader); got != fmt.Sprint(api.Proto) {
 				if got == "" {
@@ -458,6 +493,12 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Re-check the caller's token under the lock: a reset that ran while this request was on its
+	// way must not be undone by it.
+	if old := r.Header.Get(callerTokenHeader); old != "" && !s.tokenHashPaired(old) {
+		writeErr(w, http.StatusForbidden, "this client isn't paired with the runner any more")
+		return
+	}
 	if r.Header.Get(pairByCodeHeader) == "1" {
 		if err := s.consumePairCode(req.Code); err != nil {
 			writeErr(w, http.StatusForbidden, err.Error())
@@ -592,6 +633,7 @@ func (s *Server) loop(ctx context.Context) {
 		if time.Since(lastRelays) > 5*time.Second {
 			lastRelays = time.Now()
 			s.ensureRelays()
+			retryStops()
 		}
 		s.admit()
 		if time.Since(lastGC) > 10*time.Minute {
@@ -886,4 +928,33 @@ func writeFileJSON(path string, v any) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// ResetPairingLocal resets pairing through the runner on this machine if it is running (so the
+// reset is ordered with pair requests in flight), or directly in the tokens file otherwise.
+func ResetPairingLocal(tokensFile string) (string, error) {
+	if tokensFile == "" {
+		tokensFile = filepath.Join(filepath.Dir(DefaultConfigPath()), "tokens")
+	}
+	if abs, err := filepath.Abs(tokensFile); err == nil {
+		tokensFile = abs
+	}
+	c := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", unixSocketPath())
+		}}}
+	resp, err := c.Post("http://local/v1/admin/reset-pairing", "application/json", nil)
+	if err != nil {
+		return ResetPairing(tokensFile) // not running: nothing can be in flight
+	}
+	defer resp.Body.Close()
+	var out struct{ Code, Tokens, Error string }
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || resp.StatusCode != 200 {
+		return "", fmt.Errorf("runner refused the reset: %s %s", resp.Status, out.Error)
+	}
+	if abs, err := filepath.Abs(out.Tokens); err == nil && abs != tokensFile {
+		return "", fmt.Errorf("the running runner uses %s, not %s: reset the right one (--config)", out.Tokens, tokensFile)
+	}
+	return out.Code, nil
 }

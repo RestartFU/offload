@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -172,8 +174,46 @@ func startUnit(ctx context.Context, u unitSpec) error {
 	return nil
 }
 
+// stopUnit asks systemd to stop a unit and keeps asking (retryStops) until it confirms the unit
+// is gone: a user manager that is briefly unavailable must not leave work running for good.
 func stopUnit(unit string) {
+	pendingStops.Lock()
+	pendingStops.m[unit] = time.Now()
+	pendingStops.Unlock()
 	go systemctl(context.Background(), "stop", "--no-block", unit)
+}
+
+var pendingStops = struct {
+	sync.Mutex
+	m       map[string]time.Time
+	running atomic.Bool
+}{m: map[string]time.Time{}}
+
+// retryStops re-sends stops that systemd hasn't confirmed yet. Called from the server loop.
+func retryStops() {
+	if !pendingStops.running.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer pendingStops.running.Store(false)
+		pendingStops.Lock()
+		units := make(map[string]time.Time, len(pendingStops.m))
+		for u, at := range pendingStops.m {
+			units[u] = at
+		}
+		pendingStops.Unlock()
+		for u, at := range units {
+			if active, known := unitActive(u); known && !active {
+				pendingStops.Lock()
+				delete(pendingStops.m, u)
+				pendingStops.Unlock()
+				continue
+			}
+			if time.Since(at) > 5*time.Second {
+				_, _ = systemctl(context.Background(), "stop", "--no-block", u)
+			}
+		}
+	}()
 }
 
 // cpuWeight maps a guaranteed CPU share to a cgroup weight (100 per CPU, clamped).

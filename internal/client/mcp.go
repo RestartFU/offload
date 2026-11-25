@@ -55,7 +55,11 @@ func MCP(o MCPOptions) error {
 			}
 			cmd = sc.Prepare
 		}
-		spec.Def = &api.SessionDef{Command: cmd, Env: sc.Env, Data: sc.Data, Volumes: sc.Volumes,
+		data := map[string]string{}
+		for name, ctr := range sc.Data {
+			data[dataKey(name)] = ctr
+		}
+		spec.Def = &api.SessionDef{Command: cmd, Env: sc.Env, Data: data, Volumes: sc.Volumes,
 			Devices: sc.Devices, NestedSandbox: sc.NestedSandbox, Network: sc.Network}
 		if sc.Network == "client" {
 			spec.Def.DNSSearch = dnsSearch()

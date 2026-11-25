@@ -179,6 +179,23 @@ func logicalLines(cf string) []string {
 	return out
 }
 
+// imageReadyLocked reports whether an image marked ready still exists, re-checking at most once
+// a minute (another runner of this user, or a manual prune, may have removed it).
+func (s *Server) imageReadyLocked(tag string) bool {
+	if !s.readyImages[tag] {
+		return false
+	}
+	if time.Since(s.readyChecked[tag]) < time.Minute {
+		return true
+	}
+	if !imageExists(tag) {
+		delete(s.readyImages, tag)
+		return false
+	}
+	s.readyChecked[tag] = time.Now()
+	return true
+}
+
 func podman(ctx context.Context, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -206,7 +223,7 @@ func (s *Server) ensureImageLocked(j *job) bool {
 		b.waiters[j.ID] = j
 		return false
 	}
-	if s.readyImages[tag] {
+	if s.imageReadyLocked(tag) {
 		return true
 	}
 	if imageExists(tag) && s.bootstrapped(tag) {
@@ -750,7 +767,7 @@ func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets s
 // starting a build when needed (sessions don't queue; the client retries until it's ready).
 func (s *Server) sessionImageLocked(def *api.EnvDef) (string, bool, error) {
 	tag, cf, _ := envPlan(def)
-	if s.readyImages[tag] {
+	if s.imageReadyLocked(tag) {
 		return tag, true, nil
 	}
 	if s.builds[tag] != nil {

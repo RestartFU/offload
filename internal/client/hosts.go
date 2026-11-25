@@ -77,7 +77,7 @@ type Host struct {
 	Status   *api.Status
 	http     *http.Client
 	sock     string // unix socket path for a local runner
-	derived  bool   // Token is runnerToken(URL), not configured
+	derived  bool   // Token is the one stored for this URL by `host pair`, not configured
 }
 
 // dialRaw opens a plain connection to the runner (for stream upgrades).
@@ -135,49 +135,96 @@ func localSocket() string {
 // vetted: a redirect is returned as an error, never followed.
 func noRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
-// clientTokenPath holds this client's secret token; runners store only its hash (`offload host
-// pair`). Jobs never see it, so they can't use a runner's API even from inside the tailnet.
-func clientTokenPath() string { return filepath.Join(configDir(), "client.token") }
-
-// clientToken returns this client's token, creating it on first use.
-func clientToken() string {
-	if b, err := os.ReadFile(clientTokenPath()); err == nil && len(strings.TrimSpace(string(b))) >= 32 {
-		return strings.TrimSpace(string(b))
+// publishOnce returns the content of a small private file, creating it with gen() first if it
+// doesn't exist. Creation never replaces a file: racing first runs all end up with one value.
+func publishOnce(path string, valid func(string) bool, gen func() (string, error)) (string, error) {
+	read := func() (string, bool, error) {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", false, err
+		}
+		v := strings.TrimSpace(string(b))
+		if !valid(v) {
+			return "", true, fmt.Errorf("%s is damaged; delete it to start over (runners must then be paired again)", path)
+		}
+		return v, true, nil
 	}
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
-		return ""
+	if v, exists, err := read(); err == nil || exists {
+		return v, err
 	}
-	tok := hex.EncodeToString(buf)
-	_ = os.MkdirAll(configDir(), 0o700)
-	// Publish without replacing: two first runs racing must end up with one secret, not each
-	// pairing with its own and one of them overwritten.
-	tmp, err := os.CreateTemp(configDir(), ".client.token-*")
+	v, err := gen()
 	if err != nil {
-		return ""
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".publish-*")
+	if err != nil {
+		return "", err
 	}
 	defer os.Remove(tmp.Name())
-	_, err = tmp.WriteString(tok + "\n")
+	_, err = tmp.WriteString(v + "\n")
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		return ""
+		return "", err
 	}
-	if err := os.Link(tmp.Name(), clientTokenPath()); err != nil && !errors.Is(err, os.ErrExist) {
-		return ""
+	if err := os.Link(tmp.Name(), path); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", err
 	}
-	if b, err := os.ReadFile(clientTokenPath()); err == nil && len(strings.TrimSpace(string(b))) >= 32 {
-		return strings.TrimSpace(string(b)) // ours, or the one that won
-	}
-	return ""
+	v, _, err = read() // ours, or the one that won
+	return v, err
 }
 
-// runnerToken is this client's token for one runner: derived from the client secret and the
-// runner's URL, so a token that reached some other address is useless at the real runner.
-func runnerToken(url string) string {
-	secret := clientToken()
-	if secret == "" {
+func randomHex(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// clientID is a stable, non-secret identity for this client machine. It namespaces what only
+// makes sense per client on a shared runner: data sets, and workspaces of local-path origins.
+func clientID() string {
+	id, err := publishOnce(filepath.Join(configDir(), "client.id"),
+		func(v string) bool { return len(v) == 16 && validHex(v) },
+		func() (string, error) { return randomHex(8) })
+	if err != nil {
+		h, _ := os.Hostname()
+		sum := sha256.Sum256([]byte(h))
+		return hex.EncodeToString(sum[:8]) // degraded, but stable
+	}
+	return id
+}
+
+func validHex(s string) bool {
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+// runnerTokenPath stores this client's token for one runner (a fresh random one per pairing).
+func runnerTokenPath(url string) string {
+	sum := sha256.Sum256([]byte(url))
+	return filepath.Join(configDir(), "runner-tokens", hex.EncodeToString(sum[:16]))
+}
+
+func storedToken(url string) string {
+	b, err := os.ReadFile(runnerTokenPath(url))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// legacyToken is the token older clients derived from client.token; only `host pair` uses it,
+// to authenticate once and replace it with a stored random token.
+func legacyToken(url string) string {
+	b, err := os.ReadFile(filepath.Join(configDir(), "client.token"))
+	secret := strings.TrimSpace(string(b))
+	if err != nil || len(secret) < 32 {
 		return ""
 	}
 	m := hmac.New(sha256.New, []byte(secret))
@@ -186,7 +233,7 @@ func runnerToken(url string) string {
 }
 
 // sendsToken says whether a request carries the token. A discovery probe of a peer that may not
-// be a runner at all never carries the token this client derived for it.
+// be a runner at all never carries one.
 func (h *Host) sendsToken(path string) bool {
 	return h.Token != "" && !(h.derived && path == "/v1/status")
 }
@@ -195,7 +242,7 @@ func newHost(name, url, token string, prio int) *Host {
 	url = strings.TrimRight(url, "/")
 	derived := false
 	if token == "" && !strings.HasPrefix(url, "unix://") {
-		token, derived = runnerToken(url), true
+		token, derived = storedToken(url), true
 	}
 	h := &Host{Name: name, URL: url, Token: token, Priority: prio, derived: derived}
 	if sock, ok := strings.CutPrefix(url, "unix://"); ok {

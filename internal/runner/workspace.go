@@ -318,19 +318,35 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 	for p := range dirtyBefore {
 		gone[p] = true
 	}
+	wantDirs := map[string]bool{} // parents of wanted paths: a file "a" that became "a/b"
+	for p := range want {
+		for d := path.Dir(p); d != "." && d != "/"; d = path.Dir(d) {
+			wantDirs[d] = true
+		}
+	}
 	var stillDirty []string
 	for p := range gone {
 		if _, ok := want[p]; ok {
 			continue
 		}
+		delete(rec.Files, p)
+		if wantDirs[p] {
+			continue // now a directory of the tree, replaced by the staged files
+		}
+		if _, err := cleanRel(p); err != nil {
+			continue
+		}
 		// Only through real directories: a parent the runner turned into a symlink (even one
-		// pointing inside the tree) must not redirect this delete onto another tracked file.
-		if _, err := cleanRel(p); err == nil && realParents(root, p) {
+		// pointing inside the tree) must not redirect this delete onto another tracked file. A
+		// parent we can't inspect (permissions) keeps the path journaled, to retry next time.
+		switch parentsState(root, p) {
+		case parentsReal:
 			if err := root.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				stillDirty = append(stillDirty, p)
 			}
+		case parentsUnknown:
+			stillDirty = append(stillDirty, p)
 		}
-		delete(rec.Files, p)
 	}
 	for _, e := range manifest {
 		old, had := rec.Files[e.Path]
@@ -378,6 +394,29 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 	sort.Strings(stillDirty)
 	rec.Dirty, rec.Stages = stillDirty, nil
 	return s.save(rec)
+}
+
+const (
+	parentsReal    = iota
+	parentsGone    // a parent doesn't exist: so doesn't the path
+	parentsAliased // a parent is a symlink or not a directory
+	parentsUnknown // a parent couldn't be inspected
+)
+
+func parentsState(root *os.Root, rel string) int {
+	parts := strings.Split(rel, "/")
+	for i := 1; i < len(parts); i++ {
+		fi, err := root.Lstat(strings.Join(parts[:i], "/"))
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return parentsGone
+		case err != nil:
+			return parentsUnknown
+		case !fi.IsDir():
+			return parentsAliased
+		}
+	}
+	return parentsReal
 }
 
 // realParents reports whether every parent directory of rel is a real directory (no symlinks).

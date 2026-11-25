@@ -356,16 +356,22 @@ func cmdRunner(args []string) (int, error) {
 		log.Printf("offload runner %s (%s) starting", cfg.Name, versionString())
 		return 0, s.Serve(ctx)
 	case "pair-code", "reset-pairing":
-		cfg, err := runner.LoadConfig(runner.DefaultConfigPath())
+		fs := flag.NewFlagSet(args[0], flag.ExitOnError)
+		cfgPath := fs.String("config", runner.DefaultConfigPath(), "config file")
+		_ = fs.Parse(args[1:])
+		cfg, err := runner.LoadConfig(*cfgPath)
 		if err != nil {
 			return 1, err
 		}
+		tokens := cfg.TokensFile // "" is the default the runner uses too
 		newCode := runner.NewPairCode
 		if args[0] == "reset-pairing" {
-			newCode = runner.ResetPairing
+			newCode = runner.ResetPairingLocal
+		}
+		code, err := newCode(tokens)
+		if err == nil && args[0] == "reset-pairing" {
 			fmt.Println("forgot every paired client")
 		}
-		code, err := newCode(cfg.TokensFile)
 		if err != nil {
 			return 1, err
 		}

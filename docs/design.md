@@ -13,9 +13,13 @@
   `tokens` file. An allowed WhoIs identity (`allow_users`, `allow_tags`) may only read
   `/v1/status`; pairing needs a paired client or a one-time code that only someone on the
   runner can read (`offload runner pair-code`; a wrong guess burns it). The local unix socket
-  needs nothing. Each runner gets its own token, an HMAC of the client secret and the runner's
-  URL, and discovery probes carry none: a peer that only pretends to be a runner learns nothing
-  usable elsewhere.
+  needs nothing. Every pairing mints a fresh random token for that one runner (stored under
+  `runner-tokens/` on the client) and retires the one it authenticated with, so re-pairing after
+  `offload runner reset-pairing` never revives a leaked token. Discovery probes carry no token.
+  Resets go through the running daemon's lock, so a pair request in flight can't undo one.
+- **Per-client names.** Data sets live on runners as `<client id>.<name>` and local-path git
+  origins are keyed by the client id (`client.id`), so two laptops' same-named data sets or
+  `../upstream.git` checkouts never share a directory.
 - **One protocol version at a time.** Clients send `X-Offload-Proto`; runners refuse other
   versions except for status, pairing and upgrades. A runner of a new version stops workloads
   the old one started (their mounts and sockets differ) and admits nothing until it has

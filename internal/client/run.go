@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -127,8 +129,10 @@ func Run(o RunOptions) (int, error) {
 		}
 		spec.WorkspaceKey, spec.Manifest, spec.Dir = ws.Key, ws.Manifest, ws.Dir
 		spec.WriteBack = !o.NoWriteBack
-		if spec.Environment, err = LoadEnvDef(ws.Root, o.Environment); err != nil {
-			return 1, err
+		if !o.Host { // --host runs on the runner itself: no environment, even if the repo has one
+			if spec.Environment, err = LoadEnvDef(ws.Root, o.Environment); err != nil {
+				return 1, err
+			}
 		}
 		if !o.NoGit {
 			spec.Git = ws.Git
@@ -148,6 +152,9 @@ func Run(o RunOptions) (int, error) {
 		}
 		ref := h.Name + ":" + j.ID
 		if o.Detach {
+			if ws != nil {
+				saveBaseline(j.ID, ws) // `offload attach` applies the job's write-back later
+			}
 			fmt.Println(ref)
 			return 0, nil
 		}
@@ -414,6 +421,48 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 	}
 }
 
+// baseline is what a detached job was sent, kept so `offload attach` can apply its write-back.
+type baseline struct {
+	Root     string          `json:"root"`
+	Manifest []api.FileEntry `json:"manifest"`
+}
+
+func baselinePath(id string) string { return filepath.Join(stateDir(), "writeback", id+".json") }
+
+func saveBaseline(id string, ws *Workspace) {
+	dir := filepath.Dir(baselinePath(id))
+	_ = os.MkdirAll(dir, 0o700)
+	if old, err := os.ReadDir(dir); err == nil { // a week is longer than runners keep jobs
+		for _, e := range old {
+			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > 7*24*time.Hour {
+				_ = os.Remove(filepath.Join(dir, e.Name()))
+			}
+		}
+	}
+	if b, err := json.Marshal(baseline{Root: ws.Root, Manifest: ws.Manifest}); err == nil {
+		_ = os.WriteFile(baselinePath(id), b, 0o600)
+	}
+}
+
+// applyDetachedWriteBack applies a finished detached job's write-back, once.
+func applyDetachedWriteBack(ctx context.Context, h *Host, j *api.Job) error {
+	if j.WriteBack == nil || !api.Terminal(j.State) {
+		return nil
+	}
+	b, err := os.ReadFile(baselinePath(j.ID))
+	if err != nil {
+		return nil // not started from this machine with -d, or already applied
+	}
+	var bl baseline
+	if err := json.Unmarshal(b, &bl); err != nil {
+		return err
+	}
+	if err := applyWriteBack(ctx, h, j, bl.Root, bl.Manifest, false); err != nil {
+		return err
+	}
+	return os.Remove(baselinePath(j.ID))
+}
+
 // finish applies write-back and artifacts and prints a one-line summary.
 func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOptions) {
 	if j.WriteBack != nil && ws != nil {
@@ -467,6 +516,13 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, sent 
 		return err
 	}
 	defer tree.Close()
+	if err := mkdirReal(tree, path.Join(incomingDir, stageSub)); err != nil {
+		return err
+	}
+	defer func() { // leave nothing behind unless a conflict was saved there
+		_ = tree.Remove(path.Join(incomingDir, stageSub))
+		_ = tree.Remove(incomingDir)
+	}()
 	tr := tar.NewReader(gz)
 	var wrote, skipped []string
 	for {
@@ -484,42 +540,43 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, sent 
 		if err := checkRel(c.Path); err != nil {
 			return err
 		}
-		if !realParents(tree, c.Path) {
-			// The directory moved or became a symlink (which could alias another file): keep the
-			// job's version in a fresh directory of its own instead of dropping it.
-			saved := path.Join(".offload-incoming", j.ID, c.Path)
-			err := mkdirReal(tree, path.Dir(saved))
-			if err == nil {
-				err = writeInIf(tree, saved, tr, os.FileMode(c.Mode).Perm(), c.Hash, nil)
-			}
-			if err != nil {
-				return fmt.Errorf("%s: its directory changed, and saving the job's version failed: %w", c.Path, err)
-			}
-			skipped = append(skipped, c.Path+" (job's version: "+saved+")")
-			continue
+		// Stage in a directory of our own first, so whatever happens to the destination's
+		// directory meanwhile, the verified incoming copy is never lost.
+		tmp, err := stageIncoming(tree, tr, os.FileMode(c.Mode).Perm(), c.Hash)
+		if err != nil {
+			return fmt.Errorf("%s: %w", c.Path, err)
 		}
 		// Replace only if the local file is still exactly what this job was sent (content and
 		// mode), re-checked right before the rename. Otherwise the job's version is kept next to
-		// it as <file>.offload-incoming[.N], never silently dropped or written over an edit.
+		// it as <file>.offload-incoming[.N], or under .offload-incoming/<job>/ when its directory
+		// moved or isn't a real directory any more.
 		orig, known := base[c.Path]
-		cur, before, err := hashFileIn(tree, c.Path)
-		same := known && orig.Link == "" && orig.Hash == c.BaseHash
-		unchanged := func() bool {
-			if !same || err != nil || cur != orig.Hash || before.Mode().Perm() != os.FileMode(orig.Mode).Perm() {
-				return false
+		if realParents(tree, c.Path) {
+			cur, before, herr := hashFileIn(tree, c.Path)
+			unchanged := known && orig.Link == "" && orig.Hash == c.BaseHash && herr == nil && cur == orig.Hash &&
+				before.Mode().Perm() == os.FileMode(orig.Mode).Perm()
+			if unchanged {
+				h, now, err := hashFileIn(tree, c.Path)
+				unchanged = err == nil && os.SameFile(before, now) && now.Mode() == before.Mode() && h == orig.Hash
 			}
-			h, now, err := hashFileIn(tree, c.Path)
-			return err == nil && os.SameFile(before, now) && now.Mode() == before.Mode() && h == orig.Hash
-		}
-		if err := writeInIf(tree, c.Path, tr, os.FileMode(c.Mode).Perm(), c.Hash, unchanged); err != nil {
-			var ce *conflictError
-			if errors.As(err, &ce) {
-				skipped = append(skipped, c.Path+" (job's version: "+ce.saved+")")
+			if unchanged && tree.Rename(tmp, c.Path) == nil {
+				wrote = append(wrote, c.Path)
 				continue
 			}
-			return err
+			if saved, ok := linkBeside(tree, tmp, c.Path); ok {
+				_ = tree.Remove(tmp)
+				skipped = append(skipped, c.Path+" (job's version: "+saved+")")
+				continue
+			}
 		}
-		wrote = append(wrote, c.Path)
+		saved := path.Join(incomingDir, j.ID, c.Path)
+		if err := mkdirReal(tree, path.Dir(saved)); err != nil {
+			return fmt.Errorf("%s: saving the job's version: %w (it is in %s)", c.Path, err, tmp)
+		}
+		if err := tree.Rename(tmp, saved); err != nil {
+			return fmt.Errorf("%s: saving the job's version: %w (it is in %s)", c.Path, err, tmp)
+		}
+		skipped = append(skipped, c.Path+" (job's version: "+saved+")")
 	}
 	if len(wrote) > 0 {
 		logf(quiet, "wrote back %d file(s) the job changed: %s", len(wrote), strings.Join(firstN(wrote, 8), ", "))
@@ -617,6 +674,54 @@ func mkdirReal(root *os.Root, dir string) error {
 // and an atomic rename; wantHash, when set, must match.
 func writeIn(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHash string) error {
 	return writeInIf(root, rel, r, mode, wantHash, nil)
+}
+
+const (
+	incomingDir = ".offload-incoming"
+	stageSub    = ".stage"
+)
+
+// stageIncoming writes r into a new file under .offload-incoming/.stage, verifying its hash and
+// setting its mode, and returns its path.
+func stageIncoming(root *os.Root, r io.Reader, mode os.FileMode, wantHash string) (string, error) {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	tmp := path.Join(incomingDir, stageSub, hex.EncodeToString(b))
+	f, err := root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	_, err = io.Copy(io.MultiWriter(f, h), r)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && wantHash != "" && hex.EncodeToString(h.Sum(nil)) != wantHash {
+		err = errors.New("corrupted in transfer")
+	}
+	if err == nil {
+		err = root.Chmod(tmp, mode)
+	}
+	if err != nil {
+		_ = root.Remove(tmp)
+		return "", err
+	}
+	return tmp, nil
+}
+
+// linkBeside hard-links tmp next to rel as rel.offload-incoming[.N], under a name no existing
+// file has (links never replace anything).
+func linkBeside(root *os.Root, tmp, rel string) (string, bool) {
+	for i := 0; i < 100; i++ {
+		name := rel + ".offload-incoming"
+		if i > 0 {
+			name = fmt.Sprintf("%s.%d", name, i)
+		}
+		if root.Link(tmp, name) == nil {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // writeInIf is writeIn, but replaces rel only if still() reports true just before the rename.
