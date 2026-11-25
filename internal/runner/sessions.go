@@ -230,6 +230,9 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	home, _ := os.UserHomeDir()
 	pipe := []string{s.self, "runner", "pipe", "--dir", se.dir, "--sock", sessionSock(se.ID)}
+	if spec.NoStdin {
+		pipe = append(pipe, "--no-stdin")
+	}
 	secrets, err := writeSecrets(se.ID, spec.Secrets, spec.SecretFiles)
 	if err != nil {
 		s.releaseCPUsLocked(se.cpus)

@@ -908,5 +908,7 @@ func (s *Server) gcContainersLocked() {
 			}
 		}
 	}
-	_, _ = podman(context.Background(), "image", "prune", "-f")
+	// Only dangling layers of our own images (they all carry the base's label): never images
+	// someone builds with podman on this account for other reasons.
+	_, _ = podman(context.Background(), "image", "prune", "-f", "--filter", "label=dev.offload.base=1")
 }

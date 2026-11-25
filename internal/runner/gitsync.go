@@ -175,7 +175,17 @@ func (s *Server) gitCheckout(ctx context.Context, sl *slot, key string, g *api.G
 // the client didn't send (generated sources, say): they would otherwise survive into builds of
 // other branches. Ignored files (target/, node_modules/ …) stay; that's what keeps slots warm.
 func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.FileEntry) {
-	out, err := gitCmdCtx(ctx, sl.Dir, "ls-files", "-z", "--others", "--exclude-standard")
+	// A scratch repository with an empty index: everything in the slot is "untracked", minus
+	// what the tree's .gitignore files ignore, whether or not this job gets a .git.
+	scratch, err := os.MkdirTemp("", "offload-prune-")
+	if err != nil {
+		return
+	}
+	defer os.RemoveAll(scratch)
+	if _, err := gitCmdCtx(ctx, scratch, "init", "-q", "--bare"); err != nil {
+		return
+	}
+	out, err := gitCmdCtx(ctx, sl.Dir, "--git-dir="+scratch, "--work-tree=.", "ls-files", "-z", "--others", "--exclude-standard", "--exclude=/.git")
 	if err != nil || out == "" {
 		return
 	}

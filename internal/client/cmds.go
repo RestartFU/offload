@@ -134,7 +134,7 @@ func Attach(ref string) (int, error) {
 	cfg, _ := LoadConfig()
 	code, done, err := follow(ctx, h, id, false, false, cfg)
 	if err == nil && done != nil {
-		if werr := applyDetachedWriteBack(ctx, h, done); werr != nil {
+		if werr := consumeWriteBack(ctx, h, done, false, false); werr != nil {
 			logf(false, "write-back: %v", werr)
 		}
 	}
@@ -169,7 +169,7 @@ func Get(ref, dest string) error {
 	if err != nil {
 		return err
 	}
-	return fetchArtifacts(ctx, h, id, dest)
+	return fetchArtifacts(ctx, h, id, dest, nil)
 }
 
 // Upgrade pushes a binary (this one by default) to runners, which swap it in and restart; running

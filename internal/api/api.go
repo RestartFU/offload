@@ -92,6 +92,9 @@ type JobSpec struct {
 	Fresh     bool   `json:"fresh,omitempty"`     // start from an empty workspace (cold build)
 	Ephemeral bool   `json:"ephemeral,omitempty"` // drop the workspace when the job ends
 	Client    string `json:"client,omitempty"`    // free-form label of the caller
+	// GitTree says the manifest is git's view of the tree: then anything else in the slot that
+	// git wouldn't ignore was made by an earlier job and is removed before this one runs.
+	GitTree bool `json:"git_tree,omitempty"`
 }
 
 // Job is a job record as returned by the runner.
@@ -184,7 +187,8 @@ type SessionSpec struct {
 	DNSSearch   []string          `json:"dns_search,omitempty"`  // the client's search list, for network = "client"
 	// Def is a session defined on the client (~/.config/offload/sessions/NAME.toml); when set,
 	// the runner needs no profile of that name.
-	Def *SessionDef `json:"def,omitempty"`
+	Def     *SessionDef `json:"def,omitempty"`
+	NoStdin bool        `json:"no_stdin,omitempty"` // the command's stdin is at EOF from the start (mcp --prepare)
 }
 
 // SessionDef is a client-side session definition. Data maps synced data sets (by name) to

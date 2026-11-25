@@ -128,6 +128,7 @@ func Run(o RunOptions) (int, error) {
 			return 1, fmt.Errorf("reading workspace: %w", err)
 		}
 		spec.WorkspaceKey, spec.Manifest, spec.Dir = ws.Key, ws.Manifest, ws.Dir
+		spec.GitTree = ws.GitTree
 		spec.WriteBack = !o.NoWriteBack
 		if !o.Host { // --host runs on the runner itself: no environment, even if the repo has one
 			if spec.Environment, err = LoadEnvDef(ws.Root, o.Environment); err != nil {
@@ -142,14 +143,16 @@ func Run(o RunOptions) (int, error) {
 		}
 	}
 
-	pendingBaseline := ""
-	if o.Detach && ws != nil && spec.WriteBack {
-		if pendingBaseline, err = saveBaseline(ws); err != nil {
-			return 1, fmt.Errorf("can't save the write-back baseline for a detached job (use --no-write-back to skip): %w", err)
-		}
-		defer os.Remove(pendingBaseline) // a no-op once renamed to the job's
-	}
 	for attempt := 0; ; attempt++ {
+		// Every write-back job gets a baseline bound to its ID, so `offload attach` can still
+		// apply its edits if this terminal goes away before it finishes.
+		pendingBaseline := ""
+		if ws != nil && spec.WriteBack {
+			if pendingBaseline, err = saveBaseline(ws); err != nil {
+				return 1, fmt.Errorf("can't save the write-back baseline (use --no-write-back to skip): %w", err)
+			}
+			defer os.Remove(pendingBaseline) // a no-op once renamed to the job's
+		}
 		h, j, err := submit(ctx, cfg, o, spec, ws, pendingBaseline)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -177,6 +180,7 @@ func Run(o RunOptions) (int, error) {
 				logf(false, "%s ran out of memory at %s; retrying with %s", ref, units.FormatSize(j.Resources.Mem), units.FormatSize(next))
 				spec.Resources.Mem = next
 				spec.Fresh = false
+				_ = os.Remove(baselinePath(j.ID)) // that attempt's edits are not applied
 				continue
 			}
 		}
@@ -189,8 +193,23 @@ func Run(o RunOptions) (int, error) {
 // workspace slots are all busy is skipped for the next best one; if every runner is busy it waits.
 func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws *Workspace, pendingBaseline string) (*Host, api.Job, error) {
 	var j api.Job
+	// Rounds: try each eligible runner once (a busy one is skipped for the next best); when a
+	// round has found them all busy, wait a moment and start a fresh round.
 	busy := map[string]bool{}
-	waited, allBusy := false, false
+	waited := false
+	backoff := func(msg string) error {
+		if !waited {
+			logf(o.Quiet, "%s; waiting", msg)
+			waited = true
+		}
+		busy = map[string]bool{}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+			return nil
+		}
+	}
 	for {
 		hosts := Discover(ctx, cfg)
 		var h *Host
@@ -204,10 +223,13 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 					avail = append(avail, x)
 				}
 			}
-			if len(avail) == 0 && len(hosts) > 0 {
-				avail, busy, allBusy = hosts, map[string]bool{}, true // all busy: wait on the best one
-			}
 			h, err = PickFor(avail, spec, "job")
+			if err != nil && len(busy) > 0 { // the runners left can't take it: wait for a busy one
+				if berr := backoff("every runner that fits is busy"); berr != nil {
+					return nil, j, berr
+				}
+				continue
+			}
 		}
 		if err != nil {
 			return nil, j, err
@@ -218,18 +240,12 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 		err = h.do(ctx, "POST", "/v1/jobs", spec, &j)
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Code == 409 {
-			if o.On == "" && !allBusy && !busy[h.URL] && len(hosts) > 1 {
-				busy[h.URL] = true
+			if o.On == "" {
+				busy[h.URL] = true // next best this round
 				continue
 			}
-			if !waited {
-				logf(o.Quiet, "%s: %s; waiting", h.Name, ae.Msg)
-				waited = true
-			}
-			select {
-			case <-ctx.Done():
-				return nil, j, ctx.Err()
-			case <-time.After(3 * time.Second):
+			if berr := backoff(h.Name + ": " + ae.Msg); berr != nil {
+				return nil, j, berr
 			}
 			continue
 		}
@@ -436,16 +452,27 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 	}
 }
 
-// baseline is what a detached job was sent, kept so `offload attach` can apply its write-back.
+// baseline is what a job was sent, kept until its write-back is applied (by `run` when it sees
+// the job finish, or later by `offload attach`).
 type baseline struct {
 	Root     string          `json:"root"`
+	Dir      string          `json:"dir"` // the job's working directory, relative to Root
 	Manifest []api.FileEntry `json:"manifest"`
 }
 
 func baselinePath(id string) string { return filepath.Join(stateDir(), "writeback", id+".json") }
 
+// lockPath is a lock file. Lock files live apart from anything cleaned up by age, so a lock
+// held right now is never unlinked under its holder.
+func lockPath(name string) string { return filepath.Join(stateDir(), "locks", name) }
+
+func checkoutLock(root string) string {
+	sum := sha256.Sum256([]byte(root))
+	return lockPath("checkout-" + hex.EncodeToString(sum[:8]))
+}
+
 // saveBaseline writes the baseline to a pending file before the job is submitted (renamed to
-// the job's once it has an ID), so a detached job never starts without one.
+// the job's once it has an ID), so a job never starts without one.
 func saveBaseline(ws *Workspace) (string, error) {
 	dir := filepath.Dir(baselinePath("x"))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -453,12 +480,12 @@ func saveBaseline(ws *Workspace) (string, error) {
 	}
 	if old, err := os.ReadDir(dir); err == nil { // a week is longer than runners keep jobs
 		for _, e := range old {
-			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > 7*24*time.Hour {
+			if fi, err := e.Info(); err == nil && fi.Mode().IsRegular() && time.Since(fi.ModTime()) > 7*24*time.Hour {
 				_ = os.Remove(filepath.Join(dir, e.Name()))
 			}
 		}
 	}
-	b, err := json.Marshal(baseline{Root: ws.Root, Manifest: ws.Manifest})
+	b, err := json.Marshal(baseline{Root: ws.Root, Dir: ws.Dir, Manifest: ws.Manifest})
 	if err != nil {
 		return "", err
 	}
@@ -477,21 +504,26 @@ func saveBaseline(ws *Workspace) (string, error) {
 	return f.Name(), nil
 }
 
-// applyDetachedWriteBack applies a finished detached job's write-back, once.
-func applyDetachedWriteBack(ctx context.Context, h *Host, j *api.Job) error {
-	if j.WriteBack == nil || !api.Terminal(j.State) {
+// consumeWriteBack applies a finished job's write-back from its baseline, once. With
+// checkoutLocked the caller already holds the checkout's lock.
+func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, quiet bool) error {
+	if !api.Terminal(j.State) {
 		return nil
 	}
-	// The baseline is consumed under the checkout's write-back lock, so two attaches of the
-	// same job apply it once.
-	unlock, err := lockFile(filepath.Join(stateDir(), "writeback", ".lock-job-"+j.ID))
+	if j.WriteBack == nil { // finished with nothing to write back (or cancelled): just forget it
+		if err := os.Remove(baselinePath(j.ID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	unlock, err := lockFile(lockPath("job-" + j.ID)) // two attaches of one job apply it once
 	if err != nil {
 		return err
 	}
 	defer unlock()
 	b, err := os.ReadFile(baselinePath(j.ID))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil // not started from this machine with -d, or already applied
+		return nil // not started from this machine, or already applied
 	}
 	if err != nil {
 		return fmt.Errorf("reading the write-back baseline: %w", err)
@@ -500,21 +532,46 @@ func applyDetachedWriteBack(ctx context.Context, h *Host, j *api.Job) error {
 	if err := json.Unmarshal(b, &bl); err != nil {
 		return err
 	}
-	if err := applyWriteBack(ctx, h, j, bl.Root, bl.Manifest, false); err != nil {
+	if !checkoutLocked {
+		unlockCheckout, err := lockFile(checkoutLock(bl.Root))
+		if err != nil {
+			return err
+		}
+		defer unlockCheckout()
+	}
+	if err := applyWriteBackLocked(ctx, h, j, bl.Root, bl.Manifest, quiet); err != nil {
 		return err
 	}
 	return os.Remove(baselinePath(j.ID))
 }
 
-// finish applies write-back and artifacts and prints a one-line summary.
+// finish applies write-back and artifacts and prints a one-line summary. Both run under the
+// checkout's lock, and artifacts never overwrite a tracked file edited here meanwhile.
 func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOptions) {
-	if j.WriteBack != nil && ws != nil {
-		if err := applyWriteBack(ctx, h, j, ws.Root, ws.Manifest, o.Quiet); err != nil {
+	if ws != nil {
+		if unlock, err := lockFile(checkoutLock(ws.Root)); err == nil {
+			defer unlock()
+		} else {
 			logf(false, "write-back: %v", err)
+			return
 		}
 	}
+	if err := consumeWriteBack(ctx, h, j, true, o.Quiet); err != nil {
+		logf(false, "write-back: %v", err)
+	}
 	if j.HasArtifact && len(o.Artifacts) > 0 {
-		if err := fetchArtifacts(ctx, h, j.ID, "."); err != nil {
+		var protect func(string) (api.FileEntry, bool)
+		if ws != nil {
+			sent := map[string]api.FileEntry{}
+			for _, e := range ws.Manifest {
+				sent[e.Path] = e
+			}
+			protect = func(name string) (api.FileEntry, bool) { // artifact paths are cwd-relative
+				e, ok := sent[path.Join(filepath.ToSlash(ws.Dir), name)]
+				return e, ok
+			}
+		}
+		if err := fetchArtifacts(ctx, h, j.ID, ".", protect); err != nil {
 			logf(false, "artifacts: %v", err)
 		}
 	}
@@ -527,23 +584,16 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 	}
 }
 
-// applyWriteBack writes files the job edited into the local tree, unless the local copy also
-// changed since upload (then it's left alone and reported).
 // applyWriteBack applies a finished job's edits to root. One write-back per checkout at a time:
 // two jobs that both started from the same file must not both find it unchanged and the
 // second silently replace the first one's result.
 func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, sent []api.FileEntry, quiet bool) error {
-	unlock, err := lockFile(writeBackLock(root))
+	unlock, err := lockFile(checkoutLock(root))
 	if err != nil {
 		return err
 	}
 	defer unlock()
 	return applyWriteBackLocked(ctx, h, j, root, sent, quiet)
-}
-
-func writeBackLock(root string) string {
-	sum := sha256.Sum256([]byte(root))
-	return filepath.Join(stateDir(), "writeback", ".lock-"+hex.EncodeToString(sum[:8]))
 }
 
 func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string, sent []api.FileEntry, quiet bool) error {
@@ -838,7 +888,10 @@ func firstN(s []string, n int) []string {
 }
 
 // fetchArtifacts downloads and unpacks a job's artifacts into dest.
-func fetchArtifacts(ctx context.Context, h *Host, id, dest string) error {
+// fetchArtifacts extracts a job's artifacts into dest. protect, when set, gives the content the
+// job was sent for a path: a tracked file changed here since then is kept, and the artifact is
+// saved beside it as <file>.offload-incoming[.N].
+func fetchArtifacts(ctx context.Context, h *Host, id, dest string, protect func(string) (api.FileEntry, bool)) error {
 	resp, err := h.request(ctx, "GET", "/v1/jobs/"+id+"/artifacts", nil)
 	if err != nil {
 		return err
@@ -881,7 +934,24 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string) error {
 				return fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
 			}
 		case tar.TypeReg:
-			if err := writeIn(tree, name, tr, os.FileMode(hd.Mode).Perm(), ""); err != nil {
+			var still func() bool
+			if protect != nil {
+				if orig, tracked := protect(name); tracked && orig.Link == "" {
+					still = func() bool {
+						cur, fi, err := hashFileIn(tree, name)
+						if errors.Is(err, os.ErrNotExist) {
+							return true // deleted here: nothing to lose
+						}
+						return err == nil && cur == orig.Hash && fi.Mode().Perm() == os.FileMode(orig.Mode).Perm()
+					}
+				}
+			}
+			if err := writeInIf(tree, name, tr, os.FileMode(hd.Mode).Perm(), "", still); err != nil {
+				var ce *conflictError
+				if errors.As(err, &ce) {
+					logf(false, "artifact %s not written over local edits (saved as %s)", name, ce.saved)
+					continue
+				}
 				return err
 			}
 			n++

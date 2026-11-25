@@ -429,12 +429,13 @@ func cmdRunner(args []string) (int, error) {
 		dir := fs.String("dir", "", "")
 		sock := fs.String("sock", "", "")
 		secrets := fs.String("secrets", "", "")
+		noStdin := fs.Bool("no-stdin", false, "")
 		fl, rest := splitArgs(args[1:])
 		_ = fs.Parse(fl)
 		if *dir == "" || *sock == "" || len(rest) == 0 {
 			die("internal: runner pipe --dir DIR --sock PATH -- CMD")
 		}
-		return runner.RunPipe(*dir, *sock, *secrets, rest), nil
+		return runner.RunPipe(*dir, *sock, *secrets, *noStdin, rest), nil
 	}
 	die("usage: offload runner serve|install|install-system|pair-code|reset-pairing")
 	return 2, nil

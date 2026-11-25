@@ -144,6 +144,9 @@ func (s *Server) restore() {
 		switch j.State {
 		case api.StateUploading:
 			j.State, j.Reason = api.StateFailed, "runner restarted during upload"
+			if j.StopRequested {
+				j.State, j.Reason = api.StateCancelled, "cancelled"
+			}
 			now := time.Now()
 			j.FinishedAt = &now
 			j.save()
@@ -511,8 +514,6 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 				_ = root.RemoveAll(".git")
 				root.Close()
 			}
-		} else {
-			s.pruneUntracked(gitCtx, sl, manifest)
 		}
 	} else if err == nil {
 		// No git for this job: don't leave a stale .git describing some other commit.
@@ -522,6 +523,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if err == nil && j.Spec.GitTree {
+		s.pruneUntracked(gitCtx, sl, manifest)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	j.syncing, j.abortUpload = false, nil

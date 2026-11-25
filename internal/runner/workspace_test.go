@@ -167,7 +167,7 @@ func TestSessionFramesDeduplicate(t *testing.T) {
 	sock := filepath.Join(dir, "in.sock")
 	outFile := filepath.Join(dir, "stdout")
 	done := make(chan int, 1)
-	go func() { done <- RunPipe(dir, sock, "", []string{"cat"}) }()
+	go func() { done <- RunPipe(dir, sock, "", false, []string{"cat"}) }()
 	var c net.Conn
 	var err error
 	for i := 0; i < 50; i++ {
@@ -223,7 +223,7 @@ func TestContextProblem(t *testing.T) {
 func TestSessionFramesGapAndClosedStdin(t *testing.T) {
 	dir := t.TempDir()
 	sock := fmt.Sprintf("/tmp/oft-%d.sock", time.Now().UnixNano()) // short: unix socket paths are limited
-	go RunPipe(dir, sock, "", []string{"sh", "-c", "exec 0<&-; sleep 2"})
+	go RunPipe(dir, sock, "", false, []string{"sh", "-c", "exec 0<&-; sleep 2"})
 	var c net.Conn
 	var err error
 	for i := 0; i < 50; i++ {

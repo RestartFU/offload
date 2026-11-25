@@ -30,6 +30,7 @@ type Workspace struct {
 	Dir      string // cwd relative to Root
 	Manifest []api.FileEntry
 	Git      *api.GitRef // HEAD and branch, nil outside git or before the first commit
+	GitTree  bool        // the manifest is git's view (tracked + untracked, minus ignored)
 }
 
 // skipDirs are never synced when the tree is not a git repository.
@@ -42,7 +43,7 @@ func LoadWorkspace(cwd string) (*Workspace, error) {
 	ws := &Workspace{Root: cwd}
 	var files []string
 	if top, err := git(cwd, "rev-parse", "--show-toplevel"); err == nil {
-		ws.Root = strings.TrimSpace(top)
+		ws.Root, ws.GitTree = strings.TrimSpace(top), true
 		if head, err := git(ws.Root, "rev-parse", "--verify", "-q", "HEAD"); err == nil {
 			ws.Git = &api.GitRef{Head: strings.TrimSpace(head)}
 			if br, err := git(ws.Root, "symbolic-ref", "-q", "--short", "HEAD"); err == nil {

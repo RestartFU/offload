@@ -222,7 +222,7 @@ const pipeGreeting = "offload-pipe 2\n"
 
 // RunPipe is "offload runner pipe": run argv with stdin fed from the unix socket sock and stdout
 // appended to <dir>/stdout. Any number of connections may write to the socket over time.
-func RunPipe(dir, sock, secrets string, argv []string) int {
+func RunPipe(dir, sock, secrets string, noStdin bool, argv []string) int {
 	if secrets != "" {
 		if err := loadSecrets(secrets); err != nil {
 			_ = writeFileJSON(filepath.Join(dir, "exit.json"), exitRecord{Code: 1, Error: err.Error()})
@@ -260,8 +260,12 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 	// the queue is full. lastSeq lives here, in the process that owns stdin.
 	var mu sync.Mutex
 	var lastSeq int64
-	var ended bool             // the process exited; frames is closed
-	var broken atomic.Bool     // the process closed its stdin
+	var ended bool         // the process exited; frames is closed
+	var broken atomic.Bool // the process closed its stdin
+	if noStdin {           // nothing will ever be sent: the command reads EOF at once
+		pw.Close()
+		broken.Store(true)
+	}
 	var queued atomic.Int64    // bytes waiting in frames
 	const maxQueued = 16 << 20 // backpressure ("busy") beyond this
 	frames := make(chan []byte, 64)

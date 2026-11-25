@@ -39,7 +39,7 @@ func MCP(o MCPOptions) error {
 	if err != nil {
 		return err
 	}
-	spec := api.SessionSpec{Profile: profile, Resources: res, Client: clientLabel(), DNSSearch: dnsSearch()}
+	spec := api.SessionSpec{Profile: profile, Resources: res, Client: clientLabel(), DNSSearch: dnsSearch(), NoStdin: o.Prepare}
 	if spec.Secrets, spec.SecretFiles, err = resolveSecrets(cfg, o.With, o.Secrets, true, true); err != nil {
 		return err
 	}
@@ -304,14 +304,35 @@ func sendStdin(ctx context.Context, h *Host, id string, seq int64, line []byte) 
 }
 
 // pumpOut copies a session stream, reconnecting at the last offset, until the session ends.
+// recordingWriter remembers a write error, to tell it apart from a read error in io.Copy.
+type recordingWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (r *recordingWriter) Write(p []byte) (int, error) {
+	n, err := r.w.Write(p)
+	if err != nil {
+		r.err = err
+	}
+	return n, err
+}
+
 func pumpOut(ctx context.Context, h *Host, id, stream string, w io.Writer) error {
 	var offset int64
 	for {
 		resp, err := h.request(ctx, "GET", fmt.Sprintf("/v1/sessions/%s/%s?follow=1&offset=%d", id, stream, offset), nil)
 		if err == nil {
-			n, _ := io.Copy(w, resp.Body)
+			ew := &recordingWriter{w: w}
+			n, cerr := io.Copy(ew, resp.Body)
 			resp.Body.Close()
 			offset += n
+			if ew.err != nil {
+				return ew.err // our own output is gone (the MCP client went away)
+			}
+			err = cerr // a broken stream resumes at offset; only a clean end counts as drained
+		}
+		if err == nil {
 			var se api.Session
 			if gerr := h.do(ctx, "GET", "/v1/sessions/"+id, nil, &se); gerr == nil && api.Terminal(se.State) {
 				if se.Reason != "" && stream == "stdout" {
