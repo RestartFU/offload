@@ -1,6 +1,8 @@
 // Package api holds the wire types shared by the offload client and runner.
 package api
 
+import "strings"
+
 import "time"
 
 // DefaultPort is the TCP port a runner listens on inside the tailnet.
@@ -302,4 +304,14 @@ func AgentRequestAllowed(msg []byte) bool {
 		return false
 	}
 	return msg[4] == 11 || msg[4] == 13
+}
+
+// SkipDir reports whether a directory of a tree that isn't a git repository is build output the
+// client never syncs (and the runner never prunes).
+func SkipDir(name string) bool {
+	switch name {
+	case ".git", "target", "node_modules", ".venv", "__pycache__", ".zig-cache", "zig-out", "build", "dist":
+		return true
+	}
+	return strings.HasPrefix(name, ".cache")
 }

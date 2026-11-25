@@ -88,6 +88,9 @@ func runInPlace(argv []string, env map[string]string) (int, error) {
 // memory limit from earlier runs, and an out-of-memory kill is retried once with twice the memory.
 // Ctrl-C (or SIGTERM) cancels the remote job.
 func Run(o RunOptions) (int, error) {
+	// A closed output (piped into `head`) must surface as a write error, which ends following
+	// with the job's reference, instead of killing offload mid-write.
+	signal.Ignore(syscall.SIGPIPE)
 	if inJob() && o.On == "" {
 		return runInPlace(o.Argv, o.Env)
 	}
@@ -458,7 +461,7 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 			n, cerr := io.Copy(rw, resp.Body)
 			if rw.err != nil { // our own output failed (disk full, closed pipe): not a network matter
 				resp.Body.Close()
-				return fmt.Errorf("writing the job's %s: %w", stream, rw.err)
+				return fmt.Errorf("writing the job's %s: %w (it keeps running: offload attach %s:%s)", stream, rw.err, h.Name, id)
 			}
 			resp.Body.Close()
 			offset += n

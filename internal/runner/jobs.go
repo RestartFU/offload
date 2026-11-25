@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"math"
 	"net/http"
@@ -439,6 +440,36 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	s.kick()
 }
 
+// pruneNonGit is pruneUntracked for trees that aren't git repositories: files a previous job
+// left that the client didn't send go, except in the build-output directories the client
+// never syncs (api.SkipDir), which is what keeps such slots warm.
+func pruneNonGit(sl *slot, manifest []api.FileEntry) {
+	sent := make(map[string]bool, len(manifest))
+	for _, e := range manifest {
+		sent[e.Path] = true
+	}
+	root, err := os.OpenRoot(sl.Dir)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+	_ = fs.WalkDir(root.FS(), ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || p == "." {
+			return nil
+		}
+		if d.IsDir() {
+			if api.SkipDir(d.Name()) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !sent[p] {
+			_ = root.Remove(p)
+		}
+		return nil
+	})
+}
+
 // note appends an offload message to the job's stderr, so the caller sees it in order.
 func (s *Server) note(j *job, msg string) {
 	f, err := os.OpenFile(filepath.Join(j.dir, "stderr.log"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
@@ -545,6 +576,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	if err == nil && j.Spec.GitTree {
 		s.pruneUntracked(gitCtx, sl, manifest, j.Spec.IgnoreRules, j.Spec.IgnoreGlobal)
+	} else if err == nil && len(manifest) > 0 {
+		pruneNonGit(sl, manifest)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

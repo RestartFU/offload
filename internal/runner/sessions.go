@@ -145,6 +145,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		out.err(400, err.Error())
 		return
 	}
+	if spec.Resources.CPUMax > 0 && spec.Resources.CPU > spec.Resources.CPUMax {
+		out.err(400, fmt.Sprintf("--cpu %.1f is more than --cpu-max %.1f", spec.Resources.CPU, spec.Resources.CPUMax))
+		return
+	}
 	if spec.Resources.CPU > s.cfg.Capacity.CPU+1e-9 {
 		out.err(http.StatusUnprocessableEntity, fmt.Sprintf("session asks for %.1f cpu; this runner guarantees at most %.1f", spec.Resources.CPU, s.cfg.Capacity.CPU))
 		return

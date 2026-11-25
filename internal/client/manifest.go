@@ -37,9 +37,6 @@ type Workspace struct {
 	IgnoreGlobal string      // the user's excludes file (ranked below the repository's rules)
 }
 
-// skipDirs are never synced when the tree is not a git repository.
-var skipDirs = map[string]bool{".git": true, "target": true, "node_modules": true, ".venv": true, "__pycache__": true, ".zig-cache": true, "zig-out": true, "build": true, "dist": true}
-
 // LoadWorkspace finds the tree around cwd and builds its manifest. In a git repository the
 // manifest is every tracked file plus untracked files that aren't ignored, so build output
 // (already ignored) stays on the runner and is never uploaded.
@@ -94,7 +91,7 @@ func LoadWorkspace(cwd string) (*Workspace, error) {
 			if err != nil { // an unreadable directory: its files must not look deleted
 				return err
 			}
-			if d.IsDir() && p != cwd && (skipDirs[d.Name()] || strings.HasPrefix(d.Name(), ".cache")) {
+			if d.IsDir() && p != cwd && api.SkipDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			if !d.IsDir() {

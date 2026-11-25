@@ -375,6 +375,9 @@ func prepareResult(ctx context.Context, h *Host, id string, prepare bool) error 
 	if err := h.do(ctx, "GET", "/v1/sessions/"+id, nil, &se); err != nil {
 		return fmt.Errorf("%s: can't read its result: %w", what, err)
 	}
+	if se.StopRequested { // stopped from elsewhere: whatever it exited with, it didn't finish
+		return fmt.Errorf("%s was stopped (%s)", what, se.Reason)
+	}
 	if se.ExitCode == nil {
 		return fmt.Errorf("%s ended without an exit status (%s)", what, se.Reason)
 	}

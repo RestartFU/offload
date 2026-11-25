@@ -637,50 +637,50 @@ func checkProto(h *Host) error {
 }
 
 func FindHost(hosts []*Host, name string) (*Host, error) {
-	for _, h := range hosts { // a runner's name (client.toml's, or the advertised one) first
-		if strings.EqualFold(h.Name, name) {
-			return h, nil
-		}
-	}
-	var found []*Host // then aliases: advertised names and hostnames, if unambiguous
+	// A name from client.toml is the user's own: it wins, if it's unique.
+	var named []*Host
 	for _, h := range hosts {
-		if h.Status != nil && (strings.EqualFold(h.Status.Hostname, name) || strings.EqualFold(h.Status.Name, name)) {
-			found = append(found, h)
+		if h.named && strings.EqualFold(h.Name, name) {
+			named = append(named, h)
 		}
 	}
-	// One runner can be listed twice (pinned by DNS name, discovered by tailnet IP): the same
-	// runner ID is one runner, the pinned entry preferred. Distinct runners stay distinct.
-	byMachine := map[string]*Host{}
-	var machines []*Host
-	for _, h := range found {
+	if len(named) == 1 {
+		return named[0], nil
+	}
+	// Otherwise every runner that answers to it (its advertised name or hostname), one entry
+	// per runner ID (a runner listed under two addresses), preferring a pinned entry.
+	byID := map[string]*Host{}
+	var order []string
+	for _, h := range hosts {
+		if h.Status == nil {
+			continue
+		}
+		if !strings.EqualFold(h.Name, name) && !strings.EqualFold(h.Status.Name, name) && !strings.EqualFold(h.Status.Hostname, name) {
+			continue
+		}
 		k := h.Status.ID
 		if k == "" {
 			k = h.URL
 		}
-		if cur, ok := byMachine[k]; !ok {
-			byMachine[k] = h
-			machines = append(machines, h)
+		if cur, ok := byID[k]; !ok {
+			byID[k] = h
+			order = append(order, k)
 		} else if h.named && !cur.named {
-			byMachine[k] = h
-			for i := range machines {
-				if machines[i] == cur {
-					machines[i] = h
-				}
-			}
+			byID[k] = h
 		}
 	}
-	found = machines
-	switch len(found) {
-	case 1:
-		return found[0], nil
+	switch len(order) {
 	case 0:
 		return nil, fmt.Errorf("runner %q not found", name)
+	case 1:
+		return byID[order[0]], nil
 	}
 	var names []string
-	for _, h := range found {
-		names = append(names, h.Name)
+	for _, k := range order {
+		h := byID[k]
+		names = append(names, h.URL)
 	}
-	return nil, fmt.Errorf("%q could mean %s: use one of those names", name, strings.Join(names, " or "))
+	return nil, fmt.Errorf("%q matches several runners (%s): name them in client.toml ([[host]] name = …)", name, strings.Join(names, ", "))
 }
 
 // recent remembers which runner holds a job, so `offload logs j-…` works without --on.
