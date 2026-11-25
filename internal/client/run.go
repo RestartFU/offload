@@ -467,6 +467,9 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 		if errors.As(err, &ae) && ae.Code == 412 { // the runner was upgraded to another protocol
 			return fmt.Errorf("%s: %s", h.Name, ae.Msg)
 		}
+		if errors.As(err, &ae) && ae.Code == 403 { // pairing reset: retrying can't help
+			return fmt.Errorf("%s: %s; pair again (offload host pair %s --code CODE), then offload attach %s:%s", h.Name, ae.Msg, h.Name, h.Name, id)
+		}
 		if err == nil {
 			var j api.Job
 			if gerr := h.do(ctx, "GET", "/v1/jobs/"+id, nil, &j); gerr == nil && api.Terminal(j.State) {

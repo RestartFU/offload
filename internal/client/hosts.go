@@ -592,6 +592,10 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 			reasons = append(reasons, h.Name+": too little memory")
 			continue
 		}
+		if want.CPU > st.Capacity.CPU+1e-9 { // an explicit guarantee is never quietly shrunk
+			reasons = append(reasons, fmt.Sprintf("%s: guarantees at most %.0f cpu", h.Name, st.Capacity.CPU))
+			continue
+		}
 		r.Mem = min(r.Mem, st.Capacity.Mem)
 		f := h.free()
 		score := float64(h.Priority) * 1000
@@ -632,12 +636,28 @@ func checkProto(h *Host) error {
 }
 
 func FindHost(hosts []*Host, name string) (*Host, error) {
-	for _, h := range hosts {
-		if strings.EqualFold(h.Name, name) || (h.Status != nil && (strings.EqualFold(h.Status.Hostname, name) || strings.EqualFold(h.Status.Name, name))) {
+	for _, h := range hosts { // a runner's name (client.toml's, or the advertised one) first
+		if strings.EqualFold(h.Name, name) {
 			return h, nil
 		}
 	}
-	return nil, fmt.Errorf("runner %q not found", name)
+	var found []*Host // then aliases: advertised names and hostnames, if unambiguous
+	for _, h := range hosts {
+		if h.Status != nil && (strings.EqualFold(h.Status.Hostname, name) || strings.EqualFold(h.Status.Name, name)) {
+			found = append(found, h)
+		}
+	}
+	switch len(found) {
+	case 1:
+		return found[0], nil
+	case 0:
+		return nil, fmt.Errorf("runner %q not found", name)
+	}
+	var names []string
+	for _, h := range found {
+		names = append(names, h.Name)
+	}
+	return nil, fmt.Errorf("%q could mean %s: use one of those names", name, strings.Join(names, " or "))
 }
 
 // recent remembers which runner holds a job, so `offload logs j-…` works without --on.

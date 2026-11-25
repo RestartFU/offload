@@ -421,7 +421,11 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 	write("target/out", "build output")
 	write("vendor/mod/x.go", "package mod // go mod vendor, on the runner")
 	write("local-out/bin", "ignored only by the client's .git/info/exclude")
-	os.MkdirAll(filepath.Join(dir, "vendor2", "deep"), 0o755)                  // left empty by an aborted job
+	os.MkdirAll(filepath.Join(dir, "vendor2", "deep"), 0o755) // left empty by an aborted job
+	write("generated-tools/helper.sh", "a job's git clone")
+	if out, err := exec.Command("git", "-C", filepath.Join(dir, "generated-tools"), "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("nested git init: %v %s", err, out)
+	}
 	os.MkdirAll(filepath.Join(dir, "web", "node_modules", "empty-pkg"), 0o755) // ignored: kept
 	write("web/index.js", "untracked source the client sent")
 	s := &Server{cfg: &Config{}}
@@ -434,6 +438,9 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "vendor2")); !os.IsNotExist(err) {
 		t.Fatal("already-empty vendor2/ left behind")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "generated-tools")); !os.IsNotExist(err) {
+		t.Fatal("a job's nested git checkout survived")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "web", "node_modules", "empty-pkg")); err != nil {
 		t.Fatal("pruning entered an ignored directory")
@@ -500,5 +507,18 @@ func TestStockInstallEnvFinalStage(t *testing.T) {
 	cf = "FROM offload/base AS tools\nENV GOBIN=/opt/t\nFROM tools\n"
 	if env := stockInstallEnv(&api.EnvDef{Containerfile: cf}); env["GOPATH"] != "" {
 		t.Fatalf("inherited GOBIN ignored: %v", env)
+	}
+}
+
+func TestOwnerFromLabels(t *testing.T) {
+	for in, want := range map[string]string{
+		"dev.offload.base=1,dev.offload.runner=3e673d5b1390,io.buildah.version=1.45.1": "3e673d5b1390",
+		"map[dev.offload.base:1 dev.offload.runner:abc io.x:y]":                        "abc",
+		"dev.offload.base=1": "",
+		"":                   "",
+	} {
+		if got := ownerFromLabels(in); got != want {
+			t.Errorf("ownerFromLabels(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

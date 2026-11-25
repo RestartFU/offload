@@ -650,8 +650,10 @@ func (s *Server) retireOtherVersions() error {
 	}
 	if s.containersAvailable() {
 		owner := strings.TrimPrefix(s.ownerLabel(), "dev.offload.runner=")
+		// .Labels prints as "k=v,k=v" (or "map[k:v ...]" on older podman); index on it isn't
+		// portable, so the owner label is read from that text.
 		out, err := podman(context.Background(), "ps", "-a", "--filter", "name=^offload-[js]-",
-			"--format", `{{.Names}} {{index .Labels "dev.offload.runner"}}`)
+			"--format", "{{.Names}} {{.Labels}}")
 		if err != nil {
 			problems = append(problems, "listing containers: "+err.Error())
 		} else {
@@ -660,10 +662,7 @@ func (s *Server) retireOtherVersions() error {
 				if len(f) == 0 || live[f[0]] {
 					continue
 				}
-				name, label := f[0], ""
-				if len(f) > 1 {
-					label = f[1]
-				}
+				name, label := f[0], ownerFromLabels(strings.Join(f[1:], " "))
 				// Ours by label, or (made before labels existed) by our own records. Anything
 				// else belongs to another runner of this user.
 				if label != owner && !(label == "" && known[name]) {
@@ -680,6 +679,20 @@ func (s *Server) retireOtherVersions() error {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+// ownerFromLabels finds dev.offload.runner in podman's printed labels ("" if absent).
+func ownerFromLabels(labels string) string {
+	for _, sep := range []string{"dev.offload.runner=", "dev.offload.runner:"} {
+		if i := strings.Index(labels, sep); i >= 0 {
+			v := labels[i+len(sep):]
+			if j := strings.IndexAny(v, ", ]"); j >= 0 {
+				v = v[:j]
+			}
+			return v
+		}
+	}
+	return ""
 }
 
 // stopUnitConfirmed stops a unit, waiting, and confirms it is gone.

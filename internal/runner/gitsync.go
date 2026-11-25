@@ -317,8 +317,22 @@ func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.Fi
 		return
 	}
 	defer root.Close()
+	sentDirs := map[string]bool{} // directories holding something the client sent
+	for p := range sent {
+		for d := path.Dir(p); d != "." && d != "/"; d = path.Dir(d) {
+			sentDirs[d] = true
+		}
+	}
 	for _, p := range strings.Split(out, "\x00") {
 		if p == "" || sent[p] || strings.HasPrefix(p, ".git/") {
+			continue
+		}
+		if d, ok := strings.CutSuffix(p, "/"); ok {
+			// Git lists a nested repository (a job's `git clone` of a helper) as one opaque
+			// entry: it goes as a whole, unless the client sent something inside it.
+			if !sentDirs[d] && parentsState(root, d) == parentsReal {
+				_ = root.RemoveAll(d)
+			}
 			continue
 		}
 		if _, err := cleanRel(p); err == nil && parentsState(root, p) == parentsReal {

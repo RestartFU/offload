@@ -92,8 +92,12 @@ func MCP(o MCPOptions) error {
 		}
 	}
 	if on == "" && sc != nil && len(sc.Volumes) > 0 && !o.Prepare {
-		if p := preparedOn(profile, Discover(ctx, cfg)); p != nil {
-			on = p.Name // its volumes are filled there: wait for it rather than start empty elsewhere
+		if url := preparedURL(profile); url != "" {
+			p := preparedOn(profile, Discover(ctx, cfg))
+			if p == nil { // its volumes are filled there: never start empty on another runner
+				return fmt.Errorf("session %s was prepared on %s, which isn't reachable now; wait for it, or run it elsewhere with --on NAME (and --prepare there)", profile, url)
+			}
+			on = p.Name
 		}
 	}
 	var h *Host
@@ -273,7 +277,20 @@ pick:
 		return err
 	case err := <-inDone:
 		if err != nil {
-			drainStderr() // the server's last words (why it stopped reading) are usually there
+			// Often the server closed its input on its way out: its exit status is the real
+			// result, if it arrives soon.
+			select {
+			case derr := <-done:
+				drainStderr()
+				if derr == nil {
+					if r := prepareResult(ctx, h, se.ID, o.Prepare); r == nil || errors.As(r, new(*ExitError)) {
+						return r
+					}
+				}
+			case <-time.After(10 * time.Second):
+				drainStderr()
+			case <-ctx.Done():
+			}
 			return err
 		}
 		// Input ended and the server's stdin is closed after it: answers still being worked on
@@ -373,12 +390,19 @@ func rememberPrepared(profile string, h *Host) {
 	_ = os.WriteFile(preparedPath(profile), []byte(h.URL+"\n"), 0o600)
 }
 
-func preparedOn(profile string, hosts []*Host) *Host {
+func preparedURL(profile string) string {
 	b, err := os.ReadFile(preparedPath(profile))
 	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func preparedOn(profile string, hosts []*Host) *Host {
+	url := preparedURL(profile)
+	if url == "" {
 		return nil
 	}
-	url := strings.TrimSpace(string(b))
 	for _, h := range hosts {
 		if h.URL == url {
 			return h
