@@ -1313,10 +1313,10 @@ func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 
 // gc drops finished jobs past retention and workspace slots unused for too long.
 func (s *Server) gc() {
+	s.gcLedger() // without s.mu: it can read a large file
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcContainersLocked()
-	s.gcLedgerLocked()
 	for id, j := range s.jobs {
 		if api.Terminal(j.State) && j.FinishedAt != nil && time.Since(*j.FinishedAt) > s.cfg.jobsRetain {
 			_ = os.RemoveAll(j.dir)

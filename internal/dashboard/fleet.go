@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"context"
+	"net/url"
 	"sort"
 	"sync"
 	"time"
@@ -25,16 +26,16 @@ type fleet struct {
 	cfg *client.Config
 
 	mu       sync.Mutex
-	runners  map[string]*runnerState
-	lastSeen time.Time // last time a page asked for the fleet
-	found    time.Time // last discovery
+	runners  map[string]*runnerState // by URL: two runners may report the same name
+	lastSeen time.Time               // last time a page asked for the fleet
+	found    time.Time               // last discovery
 	scanning bool
 	wake     chan struct{}
 }
 
 type runnerState struct {
 	host     *client.Host
-	Name     string        `json:"name"`
+	Name     string        `json:"name"` // unique here: a runner's own name, or name (address) for a second one
 	URL      string        `json:"url"`
 	Online   bool          `json:"online"`
 	Error    string        `json:"error,omitempty"`
@@ -105,13 +106,35 @@ func (f *fleet) discover(ctx context.Context) {
 	defer f.mu.Unlock()
 	f.found, f.scanning = time.Now(), false
 	for _, h := range hosts {
-		if r := f.runners[h.Name]; r != nil {
-			r.host, r.URL = h, h.URL
-			continue
-		}
-		f.runners[h.Name] = &runnerState{host: h, Name: h.Name, URL: h.URL, Status: h.Status, Online: true, LastSeen: time.Now(),
-			Jobs: []api.Job{}, Sessions: []api.Session{}}
+		f.addLocked(h)
 	}
+}
+
+// addLocked adds a runner found by discovery, or points a known one at its fresh client.
+func (f *fleet) addLocked(h *client.Host) {
+	if r := f.runners[h.URL]; r != nil {
+		r.host = h
+		return
+	}
+	name := h.Name
+	if f.byNameLocked(name) != nil { // another runner already has it: tell them apart by address
+		addr := h.URL
+		if u, err := url.Parse(h.URL); err == nil && u.Host != "" {
+			addr = u.Host
+		}
+		name += " (" + addr + ")"
+	}
+	f.runners[h.URL] = &runnerState{host: h, Name: name, URL: h.URL, Status: h.Status, Online: true, LastSeen: time.Now(),
+		Jobs: []api.Job{}, Sessions: []api.Session{}}
+}
+
+func (f *fleet) byNameLocked(name string) *runnerState {
+	for _, r := range f.runners {
+		if r.Name == name {
+			return r
+		}
+	}
+	return nil
 }
 
 func (f *fleet) poll(ctx context.Context) {
@@ -197,12 +220,19 @@ func (f *fleet) snapshot(version string) fleetView {
 }
 
 func (f *fleet) host(name string) *client.Host {
+	h, _ := f.runner(name)
+	return h
+}
+
+// runner returns a runner's client and whether it is new enough for the dashboard's log
+// viewer: observe-only session streams and tailing came with usage metrics.
+func (f *fleet) runner(name string) (h *client.Host, current bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if r := f.runners[name]; r != nil {
-		return r.host
+	if r := f.byNameLocked(name); r != nil {
+		return r.host, r.Status != nil && r.Status.Metrics
 	}
-	return nil
+	return nil, false
 }
 
 // ledgerHosts lists online runners that keep a ledger.
@@ -210,9 +240,9 @@ func (f *fleet) ledgerHosts() map[string]*client.Host {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := map[string]*client.Host{}
-	for name, r := range f.runners {
+	for _, r := range f.runners {
 		if r.Online && r.Status != nil && r.Status.Metrics {
-			out[name] = r.host
+			out[r.Name] = r.host
 		}
 	}
 	return out

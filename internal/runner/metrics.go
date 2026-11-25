@@ -78,8 +78,14 @@ func (s *Server) loadMetrics() {
 	m.saved = time.Now()
 }
 
-// sampleLoop takes a sample every MetricsStep until ctx ends.
+// sampleLoop takes a sample every MetricsStep until ctx ends. It is the only writer of
+// metrics.json: saves never overlap, and the last one is done when samplerDone closes.
 func (s *Server) sampleLoop(ctx context.Context) {
+	defer func() {
+		if s.samplerDone != nil {
+			close(s.samplerDone)
+		}
+	}()
 	tick := time.NewTicker(api.MetricsStep)
 	defer tick.Stop()
 	s.sample() // primes the CPU counters; the first busy values are since boot
@@ -89,12 +95,15 @@ func (s *Server) sampleLoop(ctx context.Context) {
 			s.saveMetrics()
 			return
 		case <-tick.C:
-			s.sample()
+			if s.sample() {
+				s.saveMetrics()
+			}
 		}
 	}
 }
 
-func (s *Server) sample() {
+// sample takes one sample. It reports whether the minute averages are due to be saved.
+func (s *Server) sample() (save bool) {
 	now := time.Now()
 	// Snapshot the scheduler's view under s.mu, then read /proc and cgroups without it.
 	s.mu.Lock()
@@ -180,10 +189,18 @@ func (s *Server) sample() {
 	pt.MemUsed = total - avail
 	disk := s.diskUsage()
 
+	// Publish CPU time only for workloads still live: one that finished while we read has
+	// already taken its value, and nothing would remove a late entry. Lock order: s.mu, m.mu.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for id, v := range cpuSecs {
-		m.cpuSecs[id] = v
+		if j := s.jobs[id]; j != nil && j.State == api.StateRunning {
+			m.cpuSecs[id] = v
+		} else if se := s.sessions[id]; se != nil && !api.Terminal(se.State) {
+			m.cpuSecs[id] = v
+		}
 	}
 	m.latest = api.Metrics{At: now, CPUs: cpus, MemTotal: total, MemAvailable: avail, Workloads: work, Disk: disk}
 
@@ -201,8 +218,9 @@ func (s *Server) sample() {
 	m.pending = append(m.pending, pt)
 	if time.Since(m.saved) > 5*time.Minute {
 		m.saved = time.Now()
-		go s.saveMetrics()
+		return true
 	}
+	return false
 }
 
 func (s *Server) saveMetrics() {

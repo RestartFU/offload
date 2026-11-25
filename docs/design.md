@@ -185,14 +185,30 @@ build step: plain JS and hand-drawn SVG charts, embedded in the binary.
 It acts with the laptop's tailnet identity, so it guards that identity:
 
 - it listens on loopback only, and checks `Host` against its own address (no DNS rebinding);
-- a random key in the printed link becomes an `HttpOnly`, `SameSite=Strict` cookie (other local
-  users can't use it);
+- every API request carries a random per-run key in an `X-Offload-Key` header, so other local
+  users can't use it. The key arrives in the printed link's fragment (`#key=…`), which browsers
+  never send to the server. The page keeps it in its own origin's storage. It isn't a cookie,
+  because cookies are shared by every port on `127.0.0.1`, so any other local web server the
+  browser visits would receive one;
+- the browser is opened on a private (0600) HTML file that redirects to the link, so the key
+  never appears on a command line, where `ps` would show it to other users;
 - changes (cancel, stop) need an `X-Offload-Dashboard` header and a same-origin request;
 - a strict CSP forbids inline script and style;
 - runner data goes into the page as text nodes only.
 
 Session logs are read with `observe=1`, so watching doesn't count as an attached client and
-doesn't keep an idle session alive.
+doesn't keep an idle session alive. Runners older than that (no usage metrics) would count the
+viewer as a client and ignore `tail`, so the dashboard doesn't show their logs.
+
+Runners are keyed by URL. Two runners that report the same name are both listed: the second
+one's name gets its address added.
+
+The ledger is append-only. Each append writes a whole line under its own lock, and starts a
+fresh line if a crash left a torn one. Readers skip lines that don't parse or are over 1 MiB,
+and keep the last entry per workload. That covers a job recorded twice because the runner
+crashed before saving its final state. Garbage collection reads and filters without holding
+the scheduler lock, then briefly takes the ledger lock to copy what was appended meanwhile and
+swap the file in.
 
 ## Keeping the host alive
 

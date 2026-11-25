@@ -64,8 +64,10 @@ type Server struct {
 
 	ownNames selfNames // our own DNS names, for the Host check
 
-	started time.Time
-	metrics metricsState // usage samples (metrics.go)
+	started     time.Time
+	metrics     metricsState  // usage samples (metrics.go)
+	samplerDone chan struct{} // closed once the sampler has saved its last minute averages
+	ledgerMu    sync.Mutex    // serializes ledger appends with the ledger GC's swap (ledger.go)
 }
 
 type whoisEntry struct {
@@ -177,9 +179,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	go s.loop(ctx)
 	go s.prebuildBase()
+	s.samplerDone = make(chan struct{})
 	go s.sampleLoop(ctx)
 	select {
 	case <-ctx.Done():
+		<-s.samplerDone // its final save
 		return nil
 	case err := <-errc:
 		return err

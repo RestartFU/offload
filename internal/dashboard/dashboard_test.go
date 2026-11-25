@@ -3,8 +3,13 @@ package dashboard
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/RestartFU/offload/internal/client"
 )
 
 func testServer() (*server, http.Handler) {
@@ -30,27 +35,37 @@ func do(h http.Handler, method, target string, hdr map[string]string) *httptest.
 
 func TestGuard(t *testing.T) {
 	_, h := testServer()
-	cookie := map[string]string{"Cookie": cookieName + "=k3y"}
+	key := map[string]string{keyHeader: "k3y"}
 	with := func(m map[string]string) map[string]string {
-		out := map[string]string{"Cookie": cookieName + "=k3y"}
+		out := map[string]string{keyHeader: "k3y"}
 		for k, v := range m {
 			out[k] = v
 		}
 		return out
 	}
-	// The printed link sets the cookie and drops the key from the address bar.
-	w := do(h, "GET", "/?token=k3y", nil)
-	if w.Code != http.StatusSeeOther || !strings.Contains(w.Header().Get("Set-Cookie"), "SameSite=Strict") || !strings.Contains(w.Header().Get("Set-Cookie"), "HttpOnly") {
-		t.Fatalf("token link: %d %v", w.Code, w.Header())
+	// The page holds no secrets: served without the key, but never a cookie.
+	w := do(h, "GET", "/", nil)
+	if w.Code != 204 || w.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("page: %d %v", w.Code, w.Header())
 	}
-	if w := do(h, "GET", "/?token=nope", nil); w.Code != 403 {
-		t.Errorf("wrong token: %d", w.Code)
+	if w := do(h, "POST", "/", key); w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("post to the page: %d", w.Code)
 	}
+	if w := do(h, "GET", "/", map[string]string{"Host": "evil.example:7421"}); w.Code != 403 {
+		t.Errorf("rebound host, page: %d", w.Code)
+	}
+	// The API needs the key, in the header only.
 	if w := do(h, "GET", "/api/fleet", nil); w.Code != 401 {
-		t.Errorf("no cookie: %d", w.Code)
+		t.Errorf("no key: %d", w.Code)
 	}
-	if w := do(h, "GET", "/api/fleet", cookie); w.Code != 204 {
-		t.Errorf("cookie: %d", w.Code)
+	if w := do(h, "GET", "/api/fleet", map[string]string{keyHeader: "nope"}); w.Code != 401 {
+		t.Errorf("wrong key: %d", w.Code)
+	}
+	if w := do(h, "GET", "/api/fleet?token=k3y", map[string]string{"Cookie": "offload_dashboard=k3y"}); w.Code != 401 {
+		t.Errorf("key outside the header: %d", w.Code)
+	}
+	if w := do(h, "GET", "/api/fleet", key); w.Code != 204 {
+		t.Errorf("key: %d", w.Code)
 	}
 	if w := do(h, "GET", "/api/fleet", with(map[string]string{"Host": "localhost:7421"})); w.Code != 204 {
 		t.Errorf("localhost: %d", w.Code)
@@ -59,7 +74,7 @@ func TestGuard(t *testing.T) {
 		t.Errorf("rebound host: %d", w.Code)
 	}
 	// Changes need our own page: the custom header, and no cross-site markers.
-	if w := do(h, "POST", "/api/stop", cookie); w.Code != 403 {
+	if w := do(h, "POST", "/api/stop", key); w.Code != 403 {
 		t.Errorf("post without header: %d", w.Code)
 	}
 	if w := do(h, "POST", "/api/stop", with(map[string]string{"X-Offload-Dashboard": "1", "Sec-Fetch-Site": "same-origin", "Origin": "http://127.0.0.1:7421"})); w.Code != 204 {
@@ -71,8 +86,57 @@ func TestGuard(t *testing.T) {
 	if w := do(h, "POST", "/api/stop", with(map[string]string{"X-Offload-Dashboard": "1", "Origin": "http://evil.example"})); w.Code != 403 {
 		t.Errorf("foreign origin post: %d", w.Code)
 	}
-	if csp := do(h, "GET", "/", cookie).Header().Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'self'") {
+	if csp := do(h, "GET", "/", nil).Header().Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'self'") {
 		t.Errorf("CSP: %q", csp)
+	}
+}
+
+func TestFleetNamesStayUnique(t *testing.T) {
+	f := newFleet(nil)
+	f.addLocked(&client.Host{Name: "build", URL: "http://100.64.0.1:7422"})
+	f.addLocked(&client.Host{Name: "build", URL: "http://100.64.0.2:7422"})
+	f.addLocked(&client.Host{Name: "build", URL: "http://100.64.0.1:7422"}) // rediscovered: same row
+	v := f.snapshot("")
+	if len(v.Runners) != 2 || v.Runners[0].Name != "build" || v.Runners[1].Name != "build (100.64.0.2:7422)" {
+		t.Fatalf("runners: %+v", v.Runners)
+	}
+	if h := f.host("build (100.64.0.2:7422)"); h == nil || h.URL != "http://100.64.0.2:7422" {
+		t.Fatalf("lookup: %+v", h)
+	}
+}
+
+func TestOpenBrowserKeepsKeyOffTheCommandLine(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	bin := t.TempDir()
+	// A stand-in for xdg-open/open that records its arguments.
+	script := "#!/bin/sh\necho \"$@\" > " + filepath.Join(dir, "args") + "\n"
+	for _, name := range []string{"xdg-open", "open"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin)
+	link := "http://127.0.0.1:7421/#key=s3cret"
+	if err := openBrowser(t.Context(), link); err != nil {
+		t.Fatal(err)
+	}
+	var args []byte
+	for i := 0; i < 100 && len(args) == 0; i++ {
+		args, _ = os.ReadFile(filepath.Join(dir, "args"))
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(args) == 0 || strings.Contains(string(args), "s3cret") {
+		t.Fatalf("opener got %q", args)
+	}
+	page := strings.TrimSpace(string(args))
+	st, err := os.Stat(page)
+	if err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("redirect file %q: %v %v", page, st, err)
+	}
+	b, _ := os.ReadFile(page)
+	if !strings.Contains(string(b), "url="+link) {
+		t.Fatalf("redirect page: %s", b)
 	}
 }
 

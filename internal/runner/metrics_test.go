@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RestartFU/offload/internal/api"
 )
@@ -85,14 +86,14 @@ func TestLedgerAppendReadGC(t *testing.T) {
 	f.WriteString(`{"id":"j-torn","fin`)
 	f.Close()
 
-	got := s.readLedger(time.Now().Add(-time.Hour))
+	got, _, _ := s.readLedger(time.Now().Add(-time.Hour))
 	if len(got) != 1 || got[0].ID != "j-new" || got[0].QueueWait != 10 || got[0].Duration != 30 {
 		t.Fatalf("read: %+v", got)
 	}
-	if all := s.readLedger(time.Time{}); len(all) != 2 {
+	if all, _, _ := s.readLedger(time.Time{}); len(all) != 2 {
 		t.Fatalf("read all: %d entries", len(all))
 	}
-	s.gcLedgerLocked()
+	s.gcLedger()
 	b, _ := os.ReadFile(s.ledgerPath())
 	if strings.Contains(string(b), "j-old") || !strings.Contains(string(b), "j-new") {
 		t.Fatalf("gc kept %q", b)
@@ -113,5 +114,41 @@ func TestCgroupCPUUsec(t *testing.T) {
 	}
 	if _, ok := cgroupCPUUsec(filepath.Join(dir, "gone")); ok {
 		t.Fatal("missing cgroup reported usage")
+	}
+}
+
+func TestLedgerRepairsTornLineAndDedups(t *testing.T) {
+	s := &Server{cfg: &Config{StateDir: t.TempDir(), ledgerRetain: 24 * time.Hour}}
+	now := time.Now()
+	s.appendLedger(api.LedgerEntry{ID: "j-1", Kind: "job", CreatedAt: now}, &now)
+	f, _ := os.OpenFile(s.ledgerPath(), os.O_WRONLY|os.O_APPEND, 0)
+	f.WriteString(`{"id":"j-torn","fin`) // a crash mid-append
+	f.Close()
+	// The next completion must survive, not be glued to the torn fragment.
+	s.appendLedger(api.LedgerEntry{ID: "j-2", Kind: "job", CreatedAt: now}, &now)
+	// Recorded twice (a crash before its terminal state was saved): counted once, last wins.
+	s.appendLedger(api.LedgerEntry{ID: "j-1", Kind: "job", CreatedAt: now, State: "exited"}, &now)
+	// An oversized line is skipped without hiding what follows it.
+	f, _ = os.OpenFile(s.ledgerPath(), os.O_WRONLY|os.O_APPEND, 0)
+	f.WriteString(`{"id":"j-big","client":"` + strings.Repeat("x", ledgerMaxLine+10) + "\"}\n")
+	f.Close()
+	s.appendLedger(api.LedgerEntry{ID: "j-3", Kind: "job", CreatedAt: now, Client: strings.Repeat("é", 1000)}, &now)
+
+	got, truncated, err := s.readLedger(time.Time{})
+	if err != nil || truncated {
+		t.Fatalf("read: %v truncated=%v", err, truncated)
+	}
+	var ids []string
+	for _, e := range got {
+		ids = append(ids, e.ID)
+	}
+	if strings.Join(ids, ",") != "j-1,j-2,j-3" {
+		t.Fatalf("ids %v", ids)
+	}
+	if got[0].State != "exited" {
+		t.Errorf("dedup kept the first entry: %+v", got[0])
+	}
+	if c := got[2].Client; len(c) > ledgerMaxField || !utf8.ValidString(c) {
+		t.Errorf("client not clipped on a rune boundary: %d bytes", len(c))
 	}
 }

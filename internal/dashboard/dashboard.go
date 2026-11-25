@@ -12,15 +12,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/RestartFU/offload/internal/api"
@@ -37,7 +40,10 @@ type Options struct {
 	Version string // this binary's version, compared with the runners'
 }
 
-const cookieName = "offload_dashboard"
+// keyHeader carries the per-run key on every API request. The page keeps the key in its own
+// origin's storage (scoped to this port), not in a cookie: cookies are shared by every port on
+// 127.0.0.1, so any other local web server the browser visits would receive one.
+const keyHeader = "X-Offload-Key"
 
 type server struct {
 	opts  Options
@@ -73,10 +79,14 @@ func Run(ctx context.Context, opts Options) error {
 	s := &server{opts: opts, token: hex.EncodeToString(b), host: ln.Addr().String(), fleet: newFleet(cfg)}
 	go s.fleet.run(ctx)
 
-	link := "http://" + s.host + "/?token=" + s.token
+	// The key travels in the fragment: browsers don't send it to the server or keep it in
+	// Referer. The page moves it to its own origin's storage and sends it with each API call.
+	link := "http://" + s.host + "/#key=" + s.token
 	fmt.Printf("offload dashboard: %s\n(the link holds this session's key; Ctrl-C stops the dashboard)\n", link)
 	if opts.Open {
-		openBrowser(link)
+		if err := openBrowser(ctx, link); err != nil {
+			fmt.Printf("could not open a browser (%v); open the link above\n", err)
+		}
 	}
 	srv := &http.Server{Handler: s.routes(), ReadHeaderTimeout: 10 * time.Second}
 	go func() { <-ctx.Done(); _ = srv.Close() }()
@@ -86,12 +96,44 @@ func Run(ctx context.Context, opts Options) error {
 	return nil
 }
 
-func openBrowser(link string) {
+// openBrowser opens link without putting it on a command line, where other local users could
+// read the key (ps, /proc/PID/cmdline): it writes a private HTML file that redirects to link
+// and opens that file instead. The file is removed after a minute, or when the dashboard stops.
+func openBrowser(ctx context.Context, link string) error {
+	dir := os.Getenv("XDG_RUNTIME_DIR")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	f, err := os.CreateTemp(dir, "offload-dashboard-*.html") // mode 0600
+	if err != nil {
+		return err
+	}
+	esc := html.EscapeString(link)
+	_, err = fmt.Fprintf(f, "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer>"+
+		"<meta http-equiv=refresh content=\"0;url=%s\"><title>offload dashboard</title><a href=\"%s\">Open the offload dashboard</a>\n", esc, esc)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return err
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Minute):
+		}
+		os.Remove(f.Name())
+	}()
 	cmd := "xdg-open"
 	if runtime.GOOS == "darwin" {
 		cmd = "open"
 	}
-	_ = exec.Command(cmd, link).Start()
+	if err := exec.Command(cmd, f.Name()).Start(); err != nil {
+		os.Remove(f.Name())
+		return err
+	}
+	return nil
 }
 
 func (s *server) routes() http.Handler {
@@ -108,9 +150,11 @@ func (s *server) routes() http.Handler {
 }
 
 // guard keeps the dashboard to this browser session. It acts with this machine's tailnet
-// identity, so: the Host must be our own loopback address (no DNS rebinding), every request
-// needs the session cookie (another local user can't use it), and anything that changes state
-// must come from our own page (no cross-site requests).
+// identity, so: the Host must be our own loopback address (no DNS rebinding), every API request
+// needs the per-run key (another local user can't use it, and a cross-site page can neither
+// read it nor attach the header without a CORS preflight, which we never grant), and anything
+// that changes state must come from our own page. The page itself (HTML, JS, CSS) holds no
+// secrets and is served to anyone who passes the Host check.
 func (s *server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
@@ -122,18 +166,16 @@ func (s *server) guard(next http.Handler) http.Handler {
 			http.Error(w, "unexpected Host", http.StatusForbidden)
 			return
 		}
-		if tok := r.URL.Query().Get("token"); tok != "" && r.URL.Path == "/" {
-			if !s.tokenOK(tok) {
-				http.Error(w, "this link is from an earlier dashboard session; use the link offload dashboard printed", http.StatusForbidden)
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			http.SetCookie(w, &http.Cookie{Name: cookieName, Value: s.token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
-			http.Redirect(w, r, "/", http.StatusSeeOther) // drop the key from the address bar
+			next.ServeHTTP(w, r)
 			return
 		}
-		c, err := r.Cookie(cookieName)
-		if err != nil || !s.tokenOK(c.Value) {
-			http.Error(w, "open the link offload dashboard printed (it carries this session's key)", http.StatusUnauthorized)
+		if !s.tokenOK(r.Header.Get(keyHeader)) {
+			writeErr(w, http.StatusUnauthorized, "open the link offload dashboard printed (it carries this session's key)")
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -154,7 +196,7 @@ func (s *server) hostOK(h string) bool {
 }
 
 func (s *server) tokenOK(t string) bool {
-	return subtle.ConstantTimeCompare([]byte(t), []byte(s.token)) == 1
+	return t != "" && subtle.ConstantTimeCompare([]byte(t), []byte(s.token)) == 1
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -247,10 +289,16 @@ func (s *server) handleLedger(w http.ResponseWriter, r *http.Request) {
 // line also gets a quiet stream going: browsers wait for a first byte before handing it over.
 func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	h := s.fleet.host(q.Get("host"))
+	h, current := s.fleet.runner(q.Get("host"))
 	id := q.Get("id")
 	if h == nil || !idRE.MatchString(id) {
 		writeErr(w, 404, "no such runner or workload")
+		return
+	}
+	if !current {
+		// An older runner would read a log stream as an attached client (keeping an idle
+		// session alive while the page is open) and ignore tail (sending the whole log).
+		writeErr(w, 409, "this runner is too old to show logs here; upgrade it with offload host upgrade")
 		return
 	}
 	tail, _ := strconv.ParseInt(q.Get("tail"), 10, 64)

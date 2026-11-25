@@ -124,6 +124,21 @@ function tipFor(el, fn) {
 
 // ---------- state ----------
 const store = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch { return null; } };
+
+// The per-run key arrives in the link's fragment (#key=…), which the browser never sends to the
+// server. It is kept in this origin's storage (scoped to the port, unlike a cookie) so other tabs
+// and reloads work, and sent with every API request.
+let KEY = store("key") || "";
+// takeKey picks the key out of the address, on load or when a new link is pasted into an open tab.
+function takeKey() {
+  const m = location.hash.match(/^#key=([0-9a-f]+)$/);
+  if (!m) return;
+  KEY = m[1];
+  store("key", KEY);
+  history.replaceState(null, "", location.pathname + "#/overview"); // out of the address bar and history
+}
+takeKey();
+const withKey = (opts = {}) => ({ ...opts, headers: { ...(opts.headers || {}), "X-Offload-Key": KEY } });
 const state = {
   fleet: null, fleetErr: null, fleetAt: 0,
   view: null,
@@ -139,9 +154,10 @@ const state = {
 const RANGES = [["1h", 3600], ["6h", 6 * 3600], ["24h", 86400], ["7d", 7 * 86400]];
 const rangeSecs = () => (RANGES.find((r) => r[0] === state.range) || RANGES[0])[1];
 
+const NOKEY = "No key for this dashboard: open the link offload dashboard printed";
 async function api(path, opts) {
-  const r = await fetch(path, opts);
-  if (r.status === 401) throw new Error("This page's session ended. Open the link offload dashboard printed.");
+  const r = await fetch(path, withKey(opts));
+  if (r.status === 401) throw new Error(NOKEY);
   if (!r.ok) {
     let msg = r.statusText;
     try { msg = (await r.json()).error || msg; } catch {}
@@ -162,8 +178,7 @@ async function pollFleet() {
   } catch (e) {
     state.fleetErr = e.message;
   }
-  render();
-  setTimeout(pollFleet, 2000);
+  try { render(); } finally { setTimeout(pollFleet, 2000); } // a render bug mustn't stop the updates
 }
 
 function recordUsage() {
@@ -184,7 +199,7 @@ const metricRunners = () => (state.fleet?.runners || []).filter((r) => r.online 
 async function loadSeries() {
   const key = state.range + "|" + state.runner;
   const runners = metricRunners();
-  if (!runners.length) { state.series = {}; state.seriesFor = key; return; }
+  if (!runners.length) { state.series = {}; state.seriesFor = key; state.seriesLoading = false; renderCharts(); return; }
   state.seriesLoading = true;
   renderCharts();
   const out = {};
@@ -209,16 +224,19 @@ async function loadLedger() {
   renderActivity();
 }
 
-let seriesTimer, ledgerTimer;
+let seriesTimer, ledgerTimer, dataGen = 0;
 function scheduleData() {
   clearTimeout(seriesTimer); clearTimeout(ledgerTimer);
-  const tickSeries = async () => { if (state.view === "overview") await loadSeries(); seriesTimer = setTimeout(tickSeries, state.range === "1h" ? 5000 : 30000); };
-  const tickLedger = async () => { if (state.view === "overview") await loadLedger(); ledgerTimer = setTimeout(tickLedger, 30000); };
+  // A load still in flight from an earlier schedule must not queue another loop when it ends.
+  const gen = ++dataGen;
+  const tickSeries = async () => { if (state.view === "overview") await loadSeries(); if (gen === dataGen) seriesTimer = setTimeout(tickSeries, state.range === "1h" ? 5000 : 30000); };
+  const tickLedger = async () => { if (state.view === "overview") await loadLedger(); if (gen === dataGen) ledgerTimer = setTimeout(tickLedger, 30000); };
   tickSeries(); tickLedger();
 }
 
 // ---------- routing ----------
 function route() {
+  takeKey();
   const parts = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent);
   const view = parts[0] === "containers" ? "containers" : "overview";
   const changed = view !== state.view;
@@ -283,7 +301,7 @@ function renderLive() {
   const el = $("#live");
   const stale = state.fleetErr || (state.fleetAt && Date.now() - state.fleetAt > 8000);
   el.classList.toggle("stale", !!stale);
-  const txt = state.fleetErr ? "Dashboard not responding" : state.fleetAt ? "Live" : "Connecting…";
+  const txt = state.fleetErr === NOKEY ? NOKEY : state.fleetErr ? "Dashboard not responding" : state.fleetAt ? "Live" : "Connecting…";
   const on = state.fleet ? state.fleet.runners.filter((r) => r.online).length : 0;
   const all = state.fleet ? state.fleet.runners.length : 0;
   el.replaceChildren(h("span", { class: "dot", "aria-hidden": "true" }), h("span", { class: "txt" }, txt + (state.fleet ? ` · ${on} of ${all} runner${all === 1 ? "" : "s"} online` : "")));
@@ -824,7 +842,7 @@ function renderDrawer() {
     return;
   }
   let head = d.querySelector(".drawer-head"), body = d.querySelector(".drawer-body");
-  if (!head) {
+  if (!d.querySelector("#dr-info")) { // first render, or replacing the loading placeholder
     head = h("div", { class: "drawer-head" }); body = h("div", { class: "drawer-body" });
     body.append(h("div", { id: "dr-info" }), h("div", { id: "dr-logs" }));
     d.replaceChildren(head, body);
@@ -951,7 +969,7 @@ async function startLogs() {
   const tail = 256 * 1024;
   const url = `/api/logs?host=${encodeURIComponent(v.w.runner)}&kind=${v.w.kind}&id=${encodeURIComponent(v.w.id)}&stream=${v.stream}&tail=${tail}`;
   try {
-    const r = await fetch(url, { signal: ac.signal });
+    const r = await fetch(url, withKey({ signal: ac.signal }));
     if (!r.ok) {
       let msg = r.statusText;
       try { msg = (await r.json()).error || msg; } catch {}
