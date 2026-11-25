@@ -82,7 +82,13 @@ func (sl *slot) planData(manifest []api.FileEntry) (needed []string, changed boo
 	// that file aside and recreates the directory, so everything the client has below it must
 	// come along, not only the changed file.
 	aliased := map[string]bool{}
-	for _, p := range needed {
+	changedEntries := append([]string(nil), needed...) // contents, and links/modes that changed
+	for _, e := range manifest {
+		if old, ok := rec.Files[e.Path]; !ok || old.Link != e.Link || old.Mode != e.Mode {
+			changedEntries = append(changedEntries, e.Path)
+		}
+	}
+	for _, p := range changedEntries {
 		parts := strings.Split(p, "/")
 		for i := 1; i < len(parts); i++ {
 			anc := strings.Join(parts[:i], "/")

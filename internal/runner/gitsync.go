@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -99,7 +100,14 @@ func (s *Server) gitPlan(key, head string, tags map[string]string) (needed bool,
 }
 
 // gitReceive fetches an uploaded bundle into the store and pins head with a ref.
+// gitLocks serializes bundle imports per repository: clearing the store's tag refs and fetching
+// must not interleave with another job's.
+var gitLocks sync.Map
+
 func (s *Server) gitReceive(ctx context.Context, key, head, bundle string) error {
+	m, _ := gitLocks.LoadOrStore(key, &sync.Mutex{})
+	m.(*sync.Mutex).Lock()
+	defer m.(*sync.Mutex).Unlock()
 	shared, err := s.ensureShared(key)
 	if err != nil {
 		return err

@@ -47,6 +47,9 @@ func Hosts() error {
 			profs = append(profs, name)
 		}
 		state := "ok"
+		if h.derived && h.Token == "" {
+			state = "not paired"
+		}
 		if !st.Accepting {
 			state = st.Reason
 		}

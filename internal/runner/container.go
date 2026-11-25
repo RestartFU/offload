@@ -549,12 +549,20 @@ func (s *Server) workloadMounts(scope string) []string {
 		_ = os.MkdirAll(s.cacheDir(name), 0o755)
 		out = append(out, s.cacheDir(name)+":"+dst+":ro")
 	}
-	if scope != "" && validKey(scope) {
+	// Repository caches live in cache/scoped/<key> (aged out by GC), session caches in
+	// cache/sessions/<profile> (scope "session:<profile>"): distinct trees, no name games.
+	base := ""
+	if name, ok := strings.CutPrefix(scope, "session:"); ok && validKey(name) {
+		base = s.cacheDir("sessions", name)
+	} else if scope != "" && validKey(scope) {
+		base = s.cacheDir("scoped", scope)
+	}
+	if base != "" {
 		for name, dst := range map[string]string{
 			"cargo-registry": "/opt/offload/cargo/registry", "cargo-git": "/opt/offload/cargo/git",
 			"go-mod": "/opt/offload/go/pkg/mod", "go-build": "/opt/offload/go/cache", "npm": "/opt/offload/npm",
 		} {
-			dir := s.cacheDir("scoped", scope, name)
+			dir := filepath.Join(base, name)
 			_ = os.MkdirAll(dir, 0o755)
 			out = append(out, dir+":"+dst)
 		}

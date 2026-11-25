@@ -168,6 +168,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		out.err(503, "runner is upgrading; try again in a few seconds")
 		return
 	}
+	if why := s.neverFitsLocked(res); why != "" { // not a matter of waiting
+		out.err(http.StatusUnprocessableEntity, why)
+		return
+	}
 	// Capacity first: a full runner says so at once (503), and the client tries another.
 	live := 0
 	for _, x := range s.sessions {
@@ -301,7 +305,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		command = s.podmanRun(runSpec{Name: "offload-" + se.ID, Image: image, Workdir: filepath.Join(se.dir, "tmp"), CPUs: allowed,
 			Secrets: secrets, Mem: res.Mem, Env: cenv, Interactive: true, Argv: prof.Command, ClientNet: prof.Network == "client", DNSSearch: dnsSearch,
 			Same: same, Volumes: volumes, Devices: devices, NestedSandbox: prof.NestedSandbox,
-			CacheScope: "session-" + prof.Name})
+			CacheScope: "session:" + prof.Name})
 		unitEnv = map[string]string{}
 		s.touchImage(image)
 	} else if secrets != "" {

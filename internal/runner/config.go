@@ -221,11 +221,12 @@ func (c *Config) finish() error {
 	if total := meminfo("MemTotal"); total > c.memReserve && (total-c.memReserve)/2 < limit {
 		limit = (total - c.memReserve) / 2
 	}
-	if c.buildMem > limit {
-		log.Printf("container.build_mem %s can never be admitted on this host; using %s", units.FormatSize(c.buildMem), units.FormatSize(limit))
-	}
-	if c.buildMem == 0 || c.buildMem > limit {
+	switch {
+	case c.buildMem == 0:
 		c.buildMem = min(8<<30, limit)
+	case c.buildMem > limit:
+		log.Printf("container.build_mem %s can never be admitted on this host; using %s", units.FormatSize(c.buildMem), units.FormatSize(limit))
+		c.buildMem = limit
 	}
 	if c.imageRetain, err = durationOr(c.Container.ImageRetain, 14*24*time.Hour); err != nil {
 		return err

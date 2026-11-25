@@ -252,6 +252,7 @@ func newHost(name, url, token string, prio int) *Host {
 				var d net.Dialer
 				return d.DialContext(ctx, "unix", sock)
 			},
+			IdleConnTimeout: 60 * time.Second,
 		}}
 	} else {
 		h.http = &http.Client{CheckRedirect: noRedirects, Transport: &http.Transport{
@@ -426,6 +427,9 @@ func probe(ctx context.Context, cands []*Host) []*Host {
 		}(h)
 	}
 	wg.Wait()
+	for _, h := range cands { // probes are one-off: don't keep their connections around
+		h.http.CloseIdleConnections()
+	}
 	var out []*Host
 	seen := map[string]bool{}
 	for _, h := range cands {
@@ -544,6 +548,10 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 	for _, h := range hosts {
 		if err := checkProto(h); err != nil {
 			reasons = append(reasons, err.Error())
+			continue
+		}
+		if h.derived && h.Token == "" { // discovered, but this client can't use it yet
+			reasons = append(reasons, h.Name+": not paired (offload host pair "+h.Name+" --code CODE)")
 			continue
 		}
 		st := h.Status

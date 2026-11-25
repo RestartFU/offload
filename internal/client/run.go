@@ -97,6 +97,11 @@ func Run(o RunOptions) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	for _, a := range o.Artifacts {
+		if c := path.Clean(filepath.ToSlash(a)); c == "." || c == "/" || c == ".." || strings.HasPrefix(c, "../") || path.IsAbs(c) {
+			return 1, fmt.Errorf("--get %s: name the outputs, relative to the working directory and inside it (for example --get dist)", a)
+		}
+	}
 	spec := api.JobSpec{Argv: o.Argv, Env: o.Env, Profile: o.Profile, Resources: o.Resources,
 		Artifacts: o.Artifacts, Fresh: o.Fresh, Ephemeral: o.Ephemeral, Client: clientLabel(), Detached: o.Detach}
 	// --no-credentials drops the relays and auto sets; explicit --with/--secret still apply.
@@ -206,6 +211,7 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 	// Rounds: try each eligible runner once (a busy one is skipped for the next best); when a
 	// round has found them all busy, wait a moment and start a fresh round.
 	busy := map[string]bool{}
+	refused := map[string]bool{} // answered 403 (pairing reset there): not a candidate this run
 	waited := false
 	backoff := func(msg string) error {
 		if !waited {
@@ -229,7 +235,7 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 		} else {
 			var avail []*Host
 			for _, x := range hosts {
-				if !busy[x.URL] {
+				if !busy[x.URL] && !refused[x.URL] {
 					avail = append(avail, x)
 				}
 			}
@@ -249,6 +255,11 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 		}
 		err = h.do(ctx, "POST", "/v1/jobs", spec, &j)
 		var ae *APIError
+		if errors.As(err, &ae) && ae.Code == 403 && o.On == "" {
+			logf(false, "%s: %s; using another runner", h.Name, ae.Msg)
+			refused[h.URL] = true
+			continue
+		}
 		if errors.As(err, &ae) && ae.Code == 409 {
 			if o.On == "" {
 				busy[h.URL] = true // next best this round

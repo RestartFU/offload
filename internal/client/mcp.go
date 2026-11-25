@@ -91,24 +91,15 @@ func MCP(o MCPOptions) error {
 	var h *Host
 	var se api.Session
 	excluded := map[string]bool{}
+	refused := map[string]bool{} // answered 403 (pairing reset there): skipped for this session
 pick:
 	for {
 		hosts := Discover(ctx, cfg)
 		var avail []*Host
 		for _, x := range hosts {
-			if !excluded[x.URL] {
+			if !excluded[x.URL] && !refused[x.URL] {
 				avail = append(avail, x)
 			}
-		}
-		if len(avail) == 0 && len(excluded) > 0 { // every runner was full: wait, then a fresh round
-			fmt.Fprintf(os.Stderr, "offload: every runner is full right now; waiting\n")
-			select {
-			case <-ctx.Done():
-				return interrupted(o)
-			case <-time.After(5 * time.Second):
-			}
-			excluded = map[string]bool{}
-			continue
 		}
 		hosts = avail
 		if on != "" {
@@ -130,6 +121,17 @@ pick:
 			}
 		} else {
 			h, err = Pick(hosts, res, profile, "", "session")
+		}
+		if err != nil && len(excluded) > 0 {
+			// Every runner that can take it was full: wait, then a fresh round.
+			fmt.Fprintf(os.Stderr, "offload: every runner that fits is full right now; waiting\n")
+			select {
+			case <-ctx.Done():
+				return interrupted(o)
+			case <-time.After(5 * time.Second):
+			}
+			excluded = map[string]bool{}
+			continue
 		}
 		if err == nil {
 			err = checkProto(h)
@@ -167,6 +169,11 @@ pick:
 				case <-time.After(3 * time.Second):
 				}
 				continue
+			}
+			if errors.As(err, &ae) && ae.Code == 403 && on == "" {
+				fmt.Fprintf(os.Stderr, "offload: %s: %s; trying another runner\n", h.Name, ae.Msg)
+				refused[h.URL] = true
+				continue pick
 			}
 			if errors.As(err, &ae) && ae.Code == 503 {
 				// Full right now (capacity, session limit, upgrading): try the next runner, or

@@ -230,6 +230,7 @@ func (s *Server) listen(ctx context.Context, addr string, h http.Handler) error 
 		srv := &http.Server{
 			Handler:           h,
 			ReadHeaderTimeout: 30 * time.Second,
+			IdleTimeout:       2 * time.Minute, // clients that go away don't leave idle connections
 			ConnContext: func(c context.Context, _ net.Conn) context.Context {
 				if isUnix {
 					return context.WithValue(c, unixMarker{}, true)

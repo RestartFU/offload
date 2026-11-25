@@ -1218,7 +1218,9 @@ func (s *Server) touchRepoStores(key string) {
 }
 
 // gcRepoStoresLocked removes a repository's git store and dependency caches once nothing has used
-// them for cache.retain: no slot left, no live job, marker older than the retention.
+// them for cache.retain: no slot left, no live job, marker older than the retention. Removal
+// renames into trash/ under the lock and deletes from there in the background (retried on
+// every pass, so an interrupted delete finishes later).
 func (s *Server) gcRepoStoresLocked() {
 	inUse := map[string]bool{}
 	for _, j := range s.jobs {
@@ -1226,33 +1228,52 @@ func (s *Server) gcRepoStoresLocked() {
 			inUse[j.Spec.WorkspaceKey] = true
 		}
 	}
-	for k := range s.slots {
-		inUse[strings.SplitN(k, "--", 2)[0]] = true
+	for _, list := range s.slots {
+		for _, sl := range list {
+			inUse[filepath.Base(filepath.Dir(sl.Dir))] = true // work/<dir>/<n>
+		}
 	}
+	trash := filepath.Join(s.cfg.StateDir, "trash")
 	stale := func(marker string) bool {
 		fi, err := os.Stat(marker)
 		if err != nil { // stores from before markers: start their clock now
-			_ = os.MkdirAll(filepath.Dir(marker), 0o755)
 			_ = os.WriteFile(marker, nil, 0o644)
 			return false
 		}
 		return time.Since(fi.ModTime()) > s.cfg.cacheRetain
 	}
-	for _, base := range []string{filepath.Join(s.cfg.StateDir, "work"), s.cacheDir("scoped")} {
-		entries, _ := os.ReadDir(base)
-		for _, e := range entries {
-			k := e.Name()
-			if !e.IsDir() || inUse[k] || strings.Contains(k, "--") || strings.HasPrefix(k, "session-") {
-				continue
-			}
-			if stale(filepath.Join(base, k, ".used")) {
-				log.Printf("gc: removing stores of repository %s (unused for %s)", k, s.cfg.cacheRetain)
-				// Renamed away under the lock (a new job recreates a fresh one), deleted after.
-				trash := filepath.Join(base, k+"--gc-"+newID(""))
-				if os.Rename(filepath.Join(base, k), trash) == nil {
-					go removeAll(trash)
-				}
-			}
+	discard := func(p string) {
+		_ = os.MkdirAll(trash, 0o700)
+		_ = os.Rename(p, filepath.Join(trash, newID("t-")))
+	}
+	work := filepath.Join(s.cfg.StateDir, "work")
+	entries, _ := os.ReadDir(work)
+	for _, e := range entries { // a repository store is a work dir holding shared.git
+		k := e.Name()
+		if _, err := os.Stat(filepath.Join(work, k, "shared.git")); err != nil || inUse[k] {
+			continue
 		}
+		if stale(filepath.Join(work, k, ".used")) {
+			log.Printf("gc: removing git store of %s (unused for %s)", k, s.cfg.cacheRetain)
+			discard(filepath.Join(work, k))
+		}
+	}
+	entries, _ = os.ReadDir(s.cacheDir("scoped"))
+	for _, e := range entries {
+		k := e.Name()
+		if !e.IsDir() || inUse[k] {
+			continue
+		}
+		if stale(s.cacheDir("scoped", k, ".used")) {
+			log.Printf("gc: removing dependency caches of %s (unused for %s)", k, s.cfg.cacheRetain)
+			discard(s.cacheDir("scoped", k))
+		}
+	}
+	if pending, _ := os.ReadDir(trash); len(pending) > 0 {
+		go func() {
+			for _, e := range pending {
+				_ = removeAll(filepath.Join(trash, e.Name()))
+			}
+		}()
 	}
 }
