@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -170,10 +171,16 @@ func TestMetricsSaveKeepsThePartialMinute(t *testing.T) {
 	if got := s2.metrics.minute; len(got) != 2 || got[1].T != t0 || got[1].CPUBusy != 3 {
 		t.Fatalf("loaded %+v", got)
 	}
-	// The rest of that minute, sampled after the restart, merges into the same point.
+	// The rest of that minute, sampled after the restart, merges into the same point, weighted
+	// by samples: two before (average 3), one after (5).
 	s2.metrics.minute = appendMinute(s2.metrics.minute, api.MetricPoint{T: t0, CPUBusy: 5})
-	if got := s2.metrics.minute; len(got) != 2 || got[1].CPUBusy != 4 {
+	if got := s2.metrics.minute; len(got) != 2 || got[1].N != 3 || math.Abs(got[1].CPUBusy-11.0/3) > 1e-9 {
 		t.Fatalf("merged %+v", got)
+	}
+	// A long-range series during that minute has one point for it.
+	s2.metrics.pending = []api.MetricPoint{{T: t0 + 30, CPUBusy: 5}}
+	if pts := s2.series(6 * time.Hour).Points; len(pts) != 2 || pts[1].T != t0 {
+		t.Fatalf("series %+v", pts)
 	}
 }
 
@@ -204,5 +211,54 @@ func TestSessionObserveDoesNotAttach(t *testing.T) {
 	mux.ServeHTTP(w, httptest.NewRequest("GET", "/v1/sessions/s-1/observe/secrets", nil))
 	if w.Code != 404 {
 		t.Errorf("unknown stream: %d", w.Code)
+	}
+}
+
+func TestLedgerReplayStaysInItsWindow(t *testing.T) {
+	s := &Server{cfg: &Config{StateDir: t.TempDir(), ledgerRetain: 24 * time.Hour}}
+	first := time.Now().Add(-10 * time.Minute)
+	replay := time.Now()
+	s.appendLedger(api.LedgerEntry{ID: "j-1", Kind: "job", CreatedAt: first}, &first)
+	s.appendLedger(api.LedgerEntry{ID: "j-1", Kind: "job", CreatedAt: first}, &replay)
+	// A window that starts between the two must not count the replay.
+	if got, _, _ := s.readLedger(time.Now().Add(-5 * time.Minute)); len(got) != 0 {
+		t.Fatalf("replay counted: %+v", got)
+	}
+
+	// GC drops a replay along with its expired first entry.
+	old := time.Now().Add(-48 * time.Hour)
+	s2 := &Server{cfg: &Config{StateDir: t.TempDir(), ledgerRetain: 24 * time.Hour}}
+	s2.appendLedger(api.LedgerEntry{ID: "j-old", Kind: "job", CreatedAt: old}, &old)
+	s2.appendLedger(api.LedgerEntry{ID: "j-old", Kind: "job", CreatedAt: old}, &replay)
+	s2.appendLedger(api.LedgerEntry{ID: "j-new", Kind: "job", CreatedAt: replay}, &replay)
+	s2.gcLedger()
+	b, _ := os.ReadFile(s2.ledgerPath())
+	if strings.Contains(string(b), "j-old") || !strings.Contains(string(b), "j-new") {
+		t.Fatalf("gc kept %s", b)
+	}
+}
+
+func TestTailStartsAtALine(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "log")
+	if err := os.WriteFile(p, []byte("aaaa\nbbbb\ncccc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for tail, want := range map[string]int64{
+		"10": 5,  // starts right after a newline: nothing dropped
+		"8":  10, // mid-line: moves to the next line
+		"99": 0,  // the whole file
+		"":   3,  // no tail: the offset asked for
+	} {
+		r := httptest.NewRequest("GET", "/?tail="+tail, nil)
+		if got := tailOffset(r, p, 3); got != want {
+			t.Errorf("tail=%s: offset %d, want %d", tail, got, want)
+		}
+	}
+	// One line longer than the search: stay mid-line rather than skip it all.
+	if err := os.WriteFile(p, []byte(strings.Repeat("x", 200<<10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := tailOffset(httptest.NewRequest("GET", "/?tail=1000", nil), p, 0); got != 200<<10-1000 {
+		t.Errorf("huge line: offset %d", got)
 	}
 }

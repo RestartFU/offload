@@ -57,6 +57,7 @@ type MetricPoint struct {
 	Running  float64 `json:"running"`
 	Queued   float64 `json:"queued"`
 	Sessions float64 `json:"sessions"`
+	N        int     `json:"n,omitempty"` // samples averaged into this point (0 means 1)
 }
 
 // Series is the body of GET /v1/metrics/series?range=1h: points Step seconds apart, oldest first.

@@ -2,6 +2,8 @@ package dashboard
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/url"
 	"sort"
 	"strconv"
@@ -27,7 +29,7 @@ type fleet struct {
 	cfg *client.Config
 
 	mu       sync.Mutex
-	runners  map[string]*runnerState // by URL: two runners may report the same name
+	runners  map[string]*runnerState // by runner ID (URL for runners too old to have one)
 	lastSeen time.Time               // last time a page asked for the fleet
 	found    time.Time               // last discovery
 	scanning bool
@@ -39,6 +41,7 @@ type runnerState struct {
 	Name     string        `json:"name"` // unique here: a runner's own name, or name (address) for a second one
 	URL      string        `json:"url"`
 	Online   bool          `json:"online"`
+	Current  bool          `json:"current"` // online, on our protocol, with metrics, ledger and the log viewer
 	Error    string        `json:"error,omitempty"`
 	LastSeen time.Time     `json:"last_seen"`
 	Status   *api.Status   `json:"status,omitempty"`
@@ -111,10 +114,21 @@ func (f *fleet) discover(ctx context.Context) {
 	}
 }
 
-// addLocked adds a runner found by discovery, or points a known one at its fresh client.
+// addLocked adds a runner found by discovery, or points a known one at its fresh client. A
+// runner reachable at two addresses (pinned in client.toml and found on the tailnet) is one row:
+// discovery lists pinned hosts first, and the first address found is kept.
 func (f *fleet) addLocked(h *client.Host) {
-	if r := f.runners[h.URL]; r != nil {
-		r.host = h
+	key := h.URL
+	if h.Status != nil && h.Status.ID != "" {
+		key = h.Status.ID
+		if old := f.runners[h.URL]; old != nil && old.URL == h.URL { // seen before it had an ID
+			delete(f.runners, h.URL)
+		}
+	}
+	if r := f.runners[key]; r != nil {
+		if r.URL == h.URL {
+			r.host = h
+		}
 		return
 	}
 	// Names identify runners in the page and its requests, so they must be unique: a second
@@ -130,7 +144,7 @@ func (f *fleet) addLocked(h *client.Host) {
 			name += " " + strconv.Itoa(i)
 		}
 	}
-	f.runners[h.URL] = &runnerState{host: h, Name: name, URL: h.URL, Status: h.Status, Online: true, LastSeen: time.Now(),
+	f.runners[key] = &runnerState{host: h, Name: name, URL: h.URL, Status: h.Status, Online: true, LastSeen: time.Now(),
 		Jobs: []api.Job{}, Sessions: []api.Session{}}
 }
 
@@ -173,29 +187,43 @@ func (f *fleet) pollOne(ctx context.Context, r *runnerState) {
 		jobs     []api.Job
 		sessions []api.Session
 		wg       sync.WaitGroup
-		errs     [4]error
+		errs     [2]error
 	)
-	wg.Add(3)
-	go func() { defer wg.Done(); errs[0] = h.Do(ctx, "GET", "/v1/status", nil, &st) }()
-	go func() { defer wg.Done(); errs[1] = h.Do(ctx, "GET", "/v1/jobs", nil, &jobs) }()
-	go func() { defer wg.Done(); errs[2] = h.Do(ctx, "GET", "/v1/sessions", nil, &sessions) }()
-	wg.Wait()
-	if errs[0] == nil && st.Metrics {
-		var m api.Metrics
-		if err := h.Do(ctx, "GET", "/v1/metrics", nil, &m); err == nil {
-			met = &m
+	if err := h.Do(ctx, "GET", "/v1/status", nil, &st); err != nil {
+		f.mu.Lock()
+		r.Online, r.Error = false, err.Error()
+		f.mu.Unlock()
+		return
+	}
+	// A runner on another protocol answers status but refuses the rest: show it, with why.
+	var werr error
+	if st.Proto != api.Proto {
+		werr = fmt.Errorf("it speaks protocol %d and this machine %d, so its jobs and sessions can't be shown: run offload host upgrade", st.Proto, api.Proto)
+	} else {
+		wg.Add(2)
+		go func() { defer wg.Done(); errs[0] = h.Do(ctx, "GET", "/v1/jobs", nil, &jobs) }()
+		go func() { defer wg.Done(); errs[1] = h.Do(ctx, "GET", "/v1/sessions", nil, &sessions) }()
+		if st.Metrics {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var m api.Metrics
+				if h.Do(ctx, "GET", "/v1/metrics", nil, &m) == nil {
+					met = &m
+				}
+			}()
 		}
+		wg.Wait()
+		werr = errors.Join(errs[0], errs[1])
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, err := range errs {
-		if err != nil {
-			r.Online, r.Error = false, err.Error()
-			return
-		}
+	r.Online, r.LastSeen, r.Status, r.Metrics = true, time.Now(), &st, met
+	if werr != nil {
+		r.Error, r.Jobs, r.Sessions = werr.Error(), []api.Job{}, []api.Session{}
+		return
 	}
-	r.Online, r.Error, r.LastSeen = true, "", time.Now()
-	r.Status, r.Metrics = &st, met
+	r.Error = ""
 	if jobs == nil {
 		jobs = []api.Job{}
 	}
@@ -219,6 +247,7 @@ func (f *fleet) snapshot(version string) fleetView {
 	for _, r := range f.runners {
 		c := *r
 		c.host = nil
+		c.Current = r.currentLocked()
 		v.Runners = append(v.Runners, c)
 	}
 	sort.Slice(v.Runners, func(a, b int) bool { return v.Runners[a].Name < v.Runners[b].Name })
@@ -230,15 +259,20 @@ func (f *fleet) host(name string) *client.Host {
 	return h
 }
 
-// runner returns a runner's client and whether it is new enough for the dashboard's log
-// viewer: observe-only session streams and tailing came with usage metrics.
+// runner returns a runner's client and whether it is current enough for the log viewer.
 func (f *fleet) runner(name string) (h *client.Host, current bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if r := f.byNameLocked(name); r != nil {
-		return r.host, r.Status != nil && r.Status.Metrics
+		return r.host, r.currentLocked()
 	}
 	return nil, false
+}
+
+// currentLocked: the runner answers, on our protocol, and is new enough for metrics, the ledger
+// and observe-only log streams (they came together).
+func (r *runnerState) currentLocked() bool {
+	return r.Online && r.Status != nil && r.Status.Metrics && r.Status.Proto == api.Proto
 }
 
 // ledgerHosts lists online runners that keep a ledger.
@@ -247,7 +281,7 @@ func (f *fleet) ledgerHosts() map[string]*client.Host {
 	defer f.mu.Unlock()
 	out := map[string]*client.Host{}
 	for _, r := range f.runners {
-		if r.Online && r.Status != nil && r.Status.Metrics {
+		if r.currentLocked() {
 			out[r.Name] = r.host
 		}
 	}

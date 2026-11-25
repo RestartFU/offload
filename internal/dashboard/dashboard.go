@@ -356,42 +356,64 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if flusher != nil {
 		flusher.Flush()
 	}
-	// The runner ends a follow every few minutes (each reconnect is authorized again), so keep
-	// reconnecting from where it stopped until the workload is over, then read the rest.
-	for follow := true; ; {
-		n, err := copyFlush(w, flusher, resp.Body)
+	// The runner ends a follow every few minutes (each reconnect is authorized again), and a
+	// connection can drop: reconnect from where it stopped until the workload is over, then read
+	// the rest. Give up, saying why, on an answer retrying can't change or after a few minutes.
+	follow, failures := true, 0
+	for {
+		n, readErr, writeErr := copyFlush(w, flusher, resp.Body)
 		resp.Body.Close()
 		off += n
-		if err != nil || !follow || ctx.Err() != nil {
-			return
+		if writeErr != nil || ctx.Err() != nil {
+			return // the viewer went away
 		}
-		var st struct {
-			State string `json:"state"`
+		if readErr == nil && !follow {
+			return // read to the end of a finished workload
 		}
-		if err := h.Do(ctx, "GET", state, nil, &st); err != nil {
-			return
+		if n > 0 {
+			failures = 0
 		}
-		follow = !api.Terminal(st.State)
-		path := base + "&offset=" + strconv.FormatInt(off, 10)
-		if follow {
-			path += "&follow=1"
-		}
-		if resp, err = h.Request(ctx, "GET", path, nil); err != nil {
-			return
+		for {
+			var st struct {
+				State string `json:"state"`
+			}
+			err := h.Do(ctx, "GET", state, nil, &st)
+			if err == nil {
+				follow = !api.Terminal(st.State)
+				path := base + "&offset=" + strconv.FormatInt(off, 10)
+				if follow {
+					path += "&follow=1"
+				}
+				if resp, err = h.Request(ctx, "GET", path, nil); err == nil {
+					break
+				}
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			var ae *client.APIError
+			if failures++; (errors.As(err, &ae) && ae.Code < 500) || failures > 60 {
+				fmt.Fprintf(w, "\n[offload dashboard] stopped following this log: %v\n", err)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
 		}
 	}
 }
 
-// copyFlush copies src to w, flushing after every read so output shows as it arrives. Its error
+// copyFlush copies src to w, flushing after every read so output shows as it arrives. readErr
 // is nil at the end of src.
-func copyFlush(w io.Writer, flusher http.Flusher, src io.Reader) (int64, error) {
-	var n int64
+func copyFlush(w io.Writer, flusher http.Flusher, src io.Reader) (n int64, readErr, writeErr error) {
 	buf := make([]byte, 32<<10)
 	for {
 		k, err := src.Read(buf)
 		if k > 0 {
 			if _, werr := w.Write(buf[:k]); werr != nil {
-				return n, werr
+				return n, nil, werr
 			}
 			n += int64(k)
 			if flusher != nil {
@@ -399,9 +421,9 @@ func copyFlush(w io.Writer, flusher http.Flusher, src io.Reader) (int64, error) 
 			}
 		}
 		if errors.Is(err, io.EOF) {
-			return n, nil
+			return n, nil, nil
 		} else if err != nil {
-			return n, err
+			return n, err, nil
 		}
 	}
 }

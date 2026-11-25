@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RestartFU/offload/internal/api"
 	"github.com/RestartFU/offload/internal/client"
 )
 
@@ -162,5 +163,18 @@ func TestRunRefusesNonLoopback(t *testing.T) {
 	err := Run(t.Context(), Options{Addr: "0.0.0.0:0"})
 	if err == nil || !strings.Contains(err.Error(), "loopback") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestFleetOneRowPerRunnerID(t *testing.T) {
+	f := newFleet(nil)
+	// Seen first without an ID (an older runner), then upgraded: the row moves to its ID.
+	f.addLocked(&client.Host{Name: "build", URL: "http://build.example:7420", Status: &api.Status{}})
+	f.addLocked(&client.Host{Name: "build", URL: "http://build.example:7420", Status: &api.Status{ID: "r1"}})
+	// The same runner found again at its tailnet address: not a second row.
+	f.addLocked(&client.Host{Name: "build", URL: "http://100.64.0.1:7420", Status: &api.Status{ID: "r1"}})
+	v := f.snapshot("")
+	if len(v.Runners) != 1 || v.Runners[0].URL != "http://build.example:7420" || v.Runners[0].Name != "build" {
+		t.Fatalf("runners: %+v", v.Runners)
 	}
 }

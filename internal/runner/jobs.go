@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -1231,10 +1232,24 @@ func (s *Server) handleWriteBack(w http.ResponseWriter, r *http.Request) {
 func tailOffset(r *http.Request, path string, offset int64) int64 {
 	var tail int64
 	fmt.Sscan(r.URL.Query().Get("tail"), &tail)
-	if tail > 0 {
-		if fi, err := os.Stat(path); err == nil {
-			offset = max(0, fi.Size()-tail)
-		}
+	if tail <= 0 {
+		return offset
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return offset
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Size() <= tail {
+		return 0
+	}
+	offset = fi.Size() - tail
+	// Start at the next line, unless that is far off (one huge line): then mid-line it is.
+	buf := make([]byte, 64<<10)
+	n, _ := f.ReadAt(buf, offset-1)
+	if i := bytes.IndexByte(buf[:n], '\n'); i >= 0 {
+		offset += int64(i)
 	}
 	return offset
 }

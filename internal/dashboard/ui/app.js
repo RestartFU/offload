@@ -183,6 +183,9 @@ async function pollFleet() {
 
 function recordUsage() {
   const now = Date.now();
+  const listed = new Set();
+  for (const r of state.fleet.runners) for (const w of [...r.jobs, ...r.sessions]) listed.add(r.name + "/" + w.id);
+  for (const k of state.usage.keys()) if (!listed.has(k)) state.usage.delete(k);
   for (const r of state.fleet.runners) {
     for (const w of r.metrics?.workloads || []) {
       const k = r.name + "/" + w.id;
@@ -194,7 +197,7 @@ function recordUsage() {
   }
 }
 
-const metricRunners = () => (state.fleet?.runners || []).filter((r) => r.online && r.status?.metrics && (!state.runner || r.name === state.runner));
+const metricRunners = () => (state.fleet?.runners || []).filter((r) => r.current && (!state.runner || r.name === state.runner));
 
 // gen is the schedule that asked (see scheduleData): an answer for an older one is dropped.
 async function loadSeries(gen) {
@@ -278,6 +281,7 @@ function alertsFor(runners, version) {
     if (!r.online) { out.push(["critical", [h("b", {}, r.name), " is not answering", r.last_seen ? " (last seen " + ago(r.last_seen) + ")" : "", r.error ? ": " + r.error : ""]]); continue; }
     const st = r.status;
     if (!st) continue;
+    if (r.error) out.push(["warning", [h("b", {}, r.name), ": ", r.error]]);
     if (!st.accepting) out.push(["warning", [h("b", {}, r.name), " is not accepting work: ", st.reason || "unknown reason"]]);
     if (st.mem_available < st.mem_reserve * 1.25) out.push(["serious", [h("b", {}, r.name), ": host memory is close to the reserve (", fmtBytes(st.mem_available), " available, reserve ", fmtBytes(st.mem_reserve), ")"]]);
     for (const d of r.metrics?.disk || []) {
@@ -518,7 +522,7 @@ function renderCharts() {
   const capMem = sum(st, (x) => x.capacity.mem), memTotal = sum(runners, (r) => r.metrics?.mem_total);
   const sub = $("#ov-charts-sub");
   if (sub) sub.textContent = state.runner ? state.runner : runners.length > 1 ? `All ${runners.length} runners, added together` : "";
-  const loading = state.seriesLoading && state.seriesFor !== state.range + "|" + state.runner;
+  const loading = state.seriesFor !== state.range + "|" + state.runner; // never another filter's data
   const cards = [
     chartCard("CPU", "Cores", data, SERIES.cpu, { ref: capCPU, refLabel: `capacity ${fmtCores(capCPU)}`, max: Math.max(hostCPUs, capCPU), fmt: fmtCores, unit: " cores" }, loading),
     chartCard("Memory", "Bytes", data, SERIES.mem, { ref: capMem, refLabel: `capacity ${fmtBytes(capMem)}`, max: Math.max(memTotal, capMem), fmt: fmtBytes, unit: "" }, loading),
@@ -985,7 +989,7 @@ async function startLogs() {
     v.status.textContent = isActive(v.w) ? "Streaming" : "Complete";
     const reader = r.body.getReader();
     const dec = new TextDecoder();
-    let size = 0, preamble = "", partial = false, held = "";
+    let size = 0, preamble = "";
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
@@ -996,16 +1000,8 @@ async function startLogs() {
         if (nl < 0) continue;
         const off = JSON.parse(preamble.slice(0, nl)).offset || 0;
         if (off > 0) v.pre.append(h("span", { class: "gap" }, `… ${fmtBytes(off)} of earlier output not shown\n`));
-        text = preamble.slice(nl + 1);
+        text = preamble.slice(nl + 1); // the runner starts a tail at a line boundary
         preamble = null;
-        partial = off > 0; // the tail starts mid-line: drop up to the first newline
-      }
-      if (partial) { // skip the cut-off line, unless no line ends soon (one huge line): then show it
-        held += text;
-        const nl = held.indexOf("\n");
-        if (nl < 0 && held.length < 64 * 1024) continue;
-        text = nl < 0 ? held : held.slice(nl + 1);
-        partial = false; held = "";
       }
       text = stripAnsi(text);
       size += text.length;
@@ -1013,7 +1009,6 @@ async function startLogs() {
       while (size > 2 * 1024 * 1024 && v.pre.childNodes.length > 1) { size -= v.pre.firstChild.textContent.length; v.pre.firstChild.remove(); }
       if (v.follow) v.pre.scrollTop = v.pre.scrollHeight;
     }
-    if (held && logView === v) v.pre.append(document.createTextNode(stripAnsi(held))); // it never reached a line end
     if (logView === v && v.abort === ac) v.status.textContent = "Ended";
   } catch (e) {
     if (e.name !== "AbortError" && logView === v) v.status.textContent = "Disconnected: " + e.message;

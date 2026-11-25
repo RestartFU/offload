@@ -88,14 +88,14 @@ func (s *Server) sampleLoop(ctx context.Context) {
 	}()
 	tick := time.NewTicker(api.MetricsStep)
 	defer tick.Stop()
-	s.sample() // primes the CPU counters; the first busy values are since boot
+	s.sample(ctx) // primes the CPU counters; the first busy values are since boot
 	for {
 		select {
 		case <-ctx.Done():
 			s.saveMetrics()
 			return
 		case <-tick.C:
-			if s.sample() {
+			if s.sample(ctx) {
 				s.saveMetrics()
 			}
 		}
@@ -103,7 +103,7 @@ func (s *Server) sampleLoop(ctx context.Context) {
 }
 
 // sample takes one sample. It reports whether the minute averages are due to be saved.
-func (s *Server) sample() (save bool) {
+func (s *Server) sample(ctx context.Context) (save bool) {
 	now := time.Now()
 	// Snapshot the scheduler's view under s.mu, then read /proc and cgroups without it.
 	s.mu.Lock()
@@ -161,7 +161,10 @@ func (s *Server) sample() (save bool) {
 	seen := map[string]bool{}
 	cpuSecs := map[string]float64{}
 	for _, r := range refs {
-		dir := s.unitCgroupDir(r.unit)
+		if ctx.Err() != nil {
+			break // shutting down: don't hold up the final save on systemctl
+		}
+		dir := s.unitCgroupDir(ctx, r.unit)
 		seen[r.unit] = true
 		w := api.WorkloadUsage{ID: r.id, Kind: r.kind, Mem: cgroupFileInt(dir, "memory.current"), MemPeak: cgroupFileInt(dir, "memory.peak")}
 		if usec, ok := cgroupCPUUsec(dir); ok {
@@ -224,7 +227,7 @@ func (s *Server) sample() (save bool) {
 }
 
 // appendMinute adds a minute's average. The same minute can come twice: the part saved before a
-// restart and the rest sampled after it. They are averaged into one point.
+// restart and the rest sampled after it. They are merged into one point, weighted by samples.
 func appendMinute(pts []api.MetricPoint, p api.MetricPoint) []api.MetricPoint {
 	if n := len(pts); n > 0 && pts[n-1].T == p.T {
 		pts[n-1] = average([]api.MetricPoint{pts[n-1], p}, p.T)
@@ -255,26 +258,27 @@ func (s *Server) takeCPUSeconds(id string) float64 {
 	return v
 }
 
-// average folds points into one, stamped t.
+// average folds points into one, stamped t, weighting each by the samples it stands for.
 func average(pts []api.MetricPoint, t int64) api.MetricPoint {
 	out := api.MetricPoint{T: t}
-	var memUsed, memWork, memAlloc int64
+	var memUsed, memWork, memAlloc float64
 	for _, p := range pts {
-		out.CPUBusy += p.CPUBusy
-		out.CPUUsed += p.CPUUsed
-		out.CPUAlloc += p.CPUAlloc
-		memUsed += p.MemUsed
-		memWork += p.MemWork
-		memAlloc += p.MemAlloc
-		out.Running += p.Running
-		out.Queued += p.Queued
-		out.Sessions += p.Sessions
+		w := float64(max(p.N, 1))
+		out.N += max(p.N, 1)
+		out.CPUBusy += w * p.CPUBusy
+		out.CPUUsed += w * p.CPUUsed
+		out.CPUAlloc += w * p.CPUAlloc
+		memUsed += w * float64(p.MemUsed)
+		memWork += w * float64(p.MemWork)
+		memAlloc += w * float64(p.MemAlloc)
+		out.Running += w * p.Running
+		out.Queued += w * p.Queued
+		out.Sessions += w * p.Sessions
 	}
-	n := float64(len(pts))
+	n := float64(out.N)
 	out.CPUBusy, out.CPUUsed, out.CPUAlloc = out.CPUBusy/n, out.CPUUsed/n, out.CPUAlloc/n
 	out.Running, out.Queued, out.Sessions = out.Running/n, out.Queued/n, out.Sessions/n
-	k := int64(len(pts))
-	out.MemUsed, out.MemWork, out.MemAlloc = memUsed/k, memWork/k, memAlloc/k
+	out.MemUsed, out.MemWork, out.MemAlloc = int64(memUsed/n), int64(memWork/n), int64(memAlloc/n)
 	return out
 }
 
@@ -291,7 +295,7 @@ func (s *Server) series(span time.Duration) api.Series {
 	if span <= time.Hour {
 		src, step = m.raw, int(api.MetricsStep/time.Second)
 	} else if len(m.pending) > 0 {
-		src = append(append([]api.MetricPoint(nil), src...), average(m.pending, m.pending[0].T/60*60))
+		src = appendMinute(append([]api.MetricPoint(nil), src...), average(m.pending, m.pending[0].T/60*60))
 	}
 	var pts []api.MetricPoint
 	for _, p := range src {
@@ -412,7 +416,7 @@ func sliceCgroupPath(slice string) string {
 
 // unitCgroupDir finds a unit's cgroup directory: where its slice says it is, else wherever
 // systemd reports it. Results are cached while the unit lives. Sampler goroutine only.
-func (s *Server) unitCgroupDir(unit string) string {
+func (s *Server) unitCgroupDir(ctx context.Context, unit string) string {
 	m := &s.metrics
 	if d, ok := m.cgPaths[unit]; ok {
 		return d
@@ -424,7 +428,7 @@ func (s *Server) unitCgroupDir(unit string) string {
 		}
 	}
 	if dir == "" {
-		if out, err := systemctl(context.Background(), "show", "-p", "ControlGroup", "--value", unit); err == nil && out != "" {
+		if out, err := systemctl(ctx, "show", "-p", "ControlGroup", "--value", unit); err == nil && out != "" {
 			dir = filepath.Join("/sys/fs/cgroup", out)
 		}
 	}

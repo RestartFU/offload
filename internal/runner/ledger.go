@@ -49,15 +49,15 @@ func (s *Server) recordJobLocked(j *job) {
 
 // recordSessionLocked appends a finished session to the ledger.
 func (s *Server) recordSessionLocked(se *session) {
+	if cpu := s.takeCPUSeconds(se.ID); se.CPUSeconds == 0 {
+		se.CPUSeconds = cpu // from the last sample: an older wrapper, or no exit record
+	}
 	started := se.CreatedAt
 	e := api.LedgerEntry{
 		ID: se.ID, Kind: "session", Command: se.Profile, Profile: se.Profile, Client: se.Client,
 		Caller: se.Caller, Runtime: se.Runtime, State: se.State, ExitCode: se.ExitCode, Reason: se.Reason,
 		OOM: isOOMReason(se.Reason), CreatedAt: se.CreatedAt, StartedAt: &started, Resources: se.Resources,
-		PeakMem: se.peakMem, CPUSeconds: se.cpuSecs,
-	}
-	if cpu := s.takeCPUSeconds(se.ID); e.CPUSeconds == 0 {
-		e.CPUSeconds = cpu // from the last sample: an older wrapper, or no exit record
+		PeakMem: se.PeakMem, CPUSeconds: se.CPUSeconds,
 	}
 	s.appendLedger(e, se.FinishedAt)
 }
@@ -144,23 +144,19 @@ func (s *Server) readLedger(since time.Time) (out []api.LedgerEntry, truncated b
 		return nil, false, err
 	}
 	defer f.Close()
-	at := map[string]int{} // id -> index in out
+	seen := map[string]bool{} // every ID, also before since: a replay must not count in a later window
 	br := bufio.NewReaderSize(f, 64<<10)
 	for {
 		line, rerr := readLine(br)
 		var e api.LedgerEntry
-		if len(line) > 0 && json.Unmarshal(line, &e) == nil && !e.FinishedAt.Before(since) {
-			if _, ok := at[e.ID]; !ok {
-				at[e.ID] = len(out)
+		if len(line) > 0 && json.Unmarshal(line, &e) == nil && !seen[e.ID] {
+			seen[e.ID] = true
+			if !e.FinishedAt.Before(since) {
 				out = append(out, e)
 			}
 			if len(out) >= 2*ledgerMaxRead { // keep memory bounded: drop the oldest half
 				out = append(out[:0:0], out[len(out)-ledgerMaxRead:]...)
 				truncated = true
-				clear(at)
-				for i, e := range out {
-					at[e.ID] = i
-				}
 			}
 		}
 		if errors.Is(rerr, io.EOF) {
@@ -238,14 +234,21 @@ func (s *Server) gcLedger() {
 	}()
 	w := bufio.NewWriterSize(tmp, 64<<10)
 	br := bufio.NewReaderSize(io.LimitReader(f, size), 64<<10)
+	seen := map[string]bool{} // a replay goes with its first entry, kept or not
 	for {
 		line, rerr := readLine(br)
-		if len(line) > 0 && json.Unmarshal(line, &e) == nil && !e.FinishedAt.Before(cutoff) {
-			w.Write(line)
-			w.WriteByte('\n')
+		if len(line) > 0 && json.Unmarshal(line, &e) == nil && !seen[e.ID] {
+			seen[e.ID] = true
+			if !e.FinishedAt.Before(cutoff) {
+				w.Write(line)
+				w.WriteByte('\n')
+			}
 		}
-		if rerr != nil {
+		if errors.Is(rerr, io.EOF) {
 			break
+		} else if rerr != nil {
+			log.Printf("ledger gc: %v", rerr) // keep the file as it is rather than swap in part of it
+			return
 		}
 	}
 	if err := w.Flush(); err != nil {

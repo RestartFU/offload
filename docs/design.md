@@ -169,8 +169,8 @@ between two samples.
 `ledger.jsonl` keeps one line per finished job or session. It outlives `storage.jobs.retain`,
 so statistics can cover weeks. It is append-only, and appends hold a ledger lock that is a leaf
 in the lock order. A crash between the append and saving the job's terminal state finishes the
-job again after the restart, with the restart's time, so readers keep the *first* entry for
-each ID. A torn last line from a crash would swallow the next append, so an append starts a
+job again after the restart, with the restart's time, so readers and GC keep the *first*
+entry for each ID, even when it falls outside the range asked for. A torn last line from a crash would swallow the next append, so an append starts a
 fresh line when the file doesn't end in one. GC runs off the scheduler loop.
 
 The job's `caller` comes from how `auth` admitted the request: `local` (the socket), `token`
@@ -202,7 +202,8 @@ alive. It is a separate route rather than a flag so that an older runner refuses
 instead of treating the viewer as a client.
 
 Runner follows end every few minutes, so the dashboard reconnects from its offset like the CLI
-does. Runners are keyed by URL. A second runner reporting a taken name is shown with its address
+does. Runners are keyed by their status ID, so one reachable at two addresses (pinned and
+discovered) is counted once. A second runner reporting a taken name is shown with its address
 added, because names identify runners in the page's requests.
 
 ## Keeping the host alive

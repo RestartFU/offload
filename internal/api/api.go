@@ -263,6 +263,8 @@ type Session struct {
 	ExitCode      *int       `json:"exit_code,omitempty"`
 	Reason        string     `json:"reason,omitempty"`
 	DataSets      []string   `json:"data_sets,omitempty"` // data sets it has mounted (never changed under it)
+	PeakMem       int64      `json:"peak_mem,omitempty"`  // once finished: cgroup memory.peak
+	CPUSeconds    float64    `json:"cpu_seconds,omitempty"`
 }
 
 // ProfileInfo summarizes a runner profile in /v1/status.

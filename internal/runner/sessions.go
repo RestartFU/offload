@@ -30,8 +30,6 @@ type session struct {
 	dir      string
 	cpus     []int
 	inactive int
-	peakMem  int64   // from the exit record, for the ledger
-	cpuSecs  float64 // likewise
 
 	relay *relay // client networking requests, when the session uses network = "client"
 
@@ -657,7 +655,7 @@ func (s *Server) checkSessions() {
 		case err == nil:
 			code := rec.Code
 			reason := se.Reason
-			se.peakMem, se.cpuSecs = rec.PeakMem, float64(rec.CPUUsec)/1e6
+			se.PeakMem, se.CPUSeconds = rec.PeakMem, float64(rec.CPUUsec)/1e6
 			if rec.OOM {
 				reason = fmt.Sprintf("out of memory (limit %s)", units.FormatSize(se.Resources.Mem))
 			}
