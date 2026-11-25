@@ -580,6 +580,9 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 		if r.CPU == 0 {
 			r.CPU = st.Defaults.CPU
 		}
+		if want.CPU == 0 && want.CPUMax > 0 && r.CPU > want.CPUMax {
+			r.CPU = want.CPUMax // as the runner will: an inherited guarantee never exceeds --cpu-max
+		}
 		if r.Mem == 0 {
 			r.Mem = st.Defaults.Mem
 		}
@@ -724,6 +727,17 @@ func rememberJob(id string, h *Host) {
 
 // locateJob finds the runner that holds a job id ("j-…" or "runner:j-…").
 func locateJob(ctx context.Context, hosts []*Host, ref string) (*Host, string, error) {
+	h, id, err := locateJobIn(ctx, hosts, ref)
+	if err != nil { // the runner may be back since discovery was cached: look again, once
+		forgetHosts()
+		if cfg, cerr := LoadConfig(); cerr == nil {
+			return locateJobIn(ctx, Discover(ctx, cfg), ref)
+		}
+	}
+	return h, id, err
+}
+
+func locateJobIn(ctx context.Context, hosts []*Host, ref string) (*Host, string, error) {
 	name, id, ok := strings.Cut(ref, ":")
 	if ok {
 		h, err := FindHost(hosts, name)

@@ -164,6 +164,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			rt = "container"
 		}
 	}
+	if rt == "host" && len(prof.Volumes) > 0 {
+		out.err(400, "this session mounts volumes, which only container sessions get; run it without --host")
+		return
+	}
 	if rt == "container" && !s.containersAvailable() {
 		out.err(400, "containers are not available on this runner (install podman)")
 		return

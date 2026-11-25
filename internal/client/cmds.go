@@ -121,6 +121,7 @@ func truncate(s string, n int) string {
 
 // Attach follows a job's output to the end and exits with its code. Ctrl-C detaches only.
 func Attach(ref string) (int, error) {
+	signal.Ignore(syscall.SIGPIPE) // a closed output ends following with a message, as in run
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	hosts, err := discover(ctx)

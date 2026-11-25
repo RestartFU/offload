@@ -1004,6 +1004,9 @@ func (s *Server) checkRunning() {
 			code := rec.Code
 			j.Signal, j.HasArtifact, j.WriteBack, j.PeakMem = rec.Signal, rec.Artifact, rec.WriteBack, rec.PeakMem
 			j.ArtifactsMissing, j.WriteBackError = rec.ArtifactsMissing, rec.WriteBackError
+			if state == api.StateCancelled {
+				j.WriteBack = nil // a cancelled job's half-done edits are never written back
+			}
 			s.learn(j, rec)
 			s.finishLocked(j, state, &code, reason)
 		case active:

@@ -677,7 +677,7 @@ func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, 
 		}
 		return nil
 	}
-	if j.WriteBack == nil { // finished with nothing to write back (or cancelled): just forget it
+	if j.WriteBack == nil || j.State == api.StateCancelled { // nothing to write back, or cancelled: forget it
 		if err := os.Remove(baselinePath(j.ID)); err != nil {
 			return err
 		}
