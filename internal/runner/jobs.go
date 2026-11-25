@@ -224,7 +224,11 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		j.Spec.SecretNames = append(j.Spec.SecretNames, k)
 	}
 	sort.Strings(j.Spec.SecretNames)
-	if len(spec.Relay) > 0 {
+	if spec.Network == "client" && rt != "container" {
+		writeErr(w, 400, "--network client needs the container runtime on the runner")
+		return
+	}
+	if len(spec.Relay) > 0 || spec.Network == "client" {
 		j.relay = newRelay()
 		if !spec.Detached {
 			j.relay.lastPoll = time.Now() // the client starts polling right after creating the job

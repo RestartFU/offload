@@ -63,6 +63,11 @@ type JobSpec struct {
 	Environment *EnvDef `json:"environment,omitempty"`
 	// Runtime forces "host" or "container"; empty lets the runner decide (containers if available).
 	Runtime string `json:"runtime,omitempty"`
+	// Network "client" routes the job's connections through the attached client (its egress IP,
+	// DNS, LAN, tailnet; 10.233.0.1 is the client's localhost). Empty means the runner's network.
+	Network string `json:"network,omitempty"`
+	// DNSSearch is the client's DNS search list (e.g. its tailnet domain), used with Network "client".
+	DNSSearch []string `json:"dns_search,omitempty"`
 	// Platform requires a runner OS/arch such as "linux/arm64"; empty means any.
 	Platform string `json:"platform,omitempty"`
 	// GitConfig is git configuration mirrored from the client (URL rewrites, identity), applied
@@ -174,6 +179,8 @@ type SessionDef struct {
 	Volumes       map[string]string `json:"volumes,omitempty"`
 	Devices       []string          `json:"devices,omitempty"`
 	NestedSandbox bool              `json:"nested_sandbox,omitempty"` // allow bubblewrap/flatpak inside
+	Network       string            `json:"network,omitempty"`        // "client": as in JobSpec.Network
+	DNSSearch     []string          `json:"dns_search,omitempty"`
 }
 
 // DataPlan is the body of POST /v1/data/{name}: a data set's manifest. The runner answers with
@@ -223,7 +230,8 @@ type Status struct {
 	Running      int                    `json:"running"`
 	Queued       int                    `json:"queued"`
 	Sessions     int                    `json:"sessions"`
-	WarmKeys     []string               `json:"warm_keys"` // workspace keys with a persistent slot
+	WarmKeys     []string               `json:"warm_keys"`           // workspace keys with a persistent slot
+	DataSets     []string               `json:"data_sets,omitempty"` // data sets synced to this runner
 	Profiles     map[string]ProfileInfo `json:"profiles"`
 	Persistent   bool                   `json:"persistent"`
 	OS           string                 `json:"os"`

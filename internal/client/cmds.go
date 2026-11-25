@@ -25,6 +25,7 @@ func discover(ctx context.Context) ([]*Host, error) {
 
 // Hosts prints every reachable runner and its load.
 func Hosts() error {
+	forgetHosts() // always rescan: this is how new runners show up
 	hosts, err := discover(context.Background())
 	if err != nil {
 		return err

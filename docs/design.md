@@ -104,6 +104,20 @@ socket. The client shim posts stdin lines with sequence numbers, which makes ret
 idempotent, and streams stdout from a byte offset, which makes reconnects lossless. A session
 with no attached client for `session_grace` is stopped.
 
+## Client networking
+
+A job or session with network "client" runs with `--network=none --device /dev/net/tun
+--cap-add NET_ADMIN`. `runner inner --net-client` creates tun0 (10.233.0.2/32, default route
+via netlink, since the kernel adds no prefix route for a /0 address), writes resolv.conf (nameserver
+10.233.0.1, the client's search list) and runs gVisor's stack on the TUN fd with TCP and UDP
+forwarders. Each new connection is `POST /v1/{jobs|sessions}/{id}/dial` on the runner's local
+socket. The runner queues a "dial" callback on the relay. The client dials the destination
+itself (10.233.0.1:53 maps to its resolver, 10.233.0.1:* to its localhost), opens
+`POST /v1/streams/{sid}`, and answers "ok". Both legs are HTTP/1.1 upgrades, and the runner splices
+them. UDP flows travel as length-prefixed frames and close after two idle minutes. IPv6 isn't
+routed yet; resolvers fall back to IPv4. Sessions prefer runners that already hold their data
+sets (`data_sets` in /v1/status).
+
 ## Minecraft (examples/minecraft)
 
 The launcher fork's flatpak runs inside the container: `nested_sandbox` unmasks /proc, drops the
@@ -121,8 +135,6 @@ the session needs no laptop-side help.
 
 ## Not built yet
 
-- A client network mode (connections dialed by the attached client) and socket/port forwarding,
-  so a session can run "as if on the laptop" (egress IP, DNS, LAN, localhost services).
 - Sharing built images between runners (a tailnet registry) once there is a second runner.
 - devcontainer "features".
 - Kubernetes backend: a runner deployed in-cluster that creates Pods and Jobs with its own

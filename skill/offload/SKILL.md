@@ -46,6 +46,9 @@ What comes back:
   they also changed locally during the job (then they're reported, not overwritten).
 - Anything else only with `--get PATH`.
 
+Needs the laptop's network (a service on its localhost, its LAN, its IP)? Add `--network client`:
+the job's connections then go out from this machine, and `laptop:PORT` reaches its localhost.
+
 Long jobs: run the Bash call in the background, or `offload run -d -- …` and later
 `offload attach <runner:id>`. Killing `offload run` cancels the job; Ctrl-C on `attach` detaches.
 A script that calls `offload run` inside a job runs that command in place.

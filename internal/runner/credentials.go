@@ -240,23 +240,50 @@ func (s *Server) listensUnix() bool {
 	return false
 }
 
-func (s *Server) jobRelay(w http.ResponseWriter, r *http.Request) (*job, *relay) {
+// relayOwner is the job or session a relay request is about.
+type relayOwner struct {
+	id   string
+	rl   *relay
+	done func() bool
+	note func(string)
+}
+
+// relayOf finds the relay of /v1/jobs/{id}/… or /v1/sessions/{id}/….
+func (s *Server) relayOf(w http.ResponseWriter, r *http.Request) *relayOwner {
+	id := r.PathValue("id")
 	s.mu.Lock()
-	j := s.jobs[r.PathValue("id")]
-	s.mu.Unlock()
-	if j == nil || j.relay == nil {
-		writeErr(w, 404, "no such job or no credential relay")
-		return nil, nil
+	defer s.mu.Unlock()
+	if strings.HasPrefix(r.URL.Path, "/v1/sessions/") {
+		if se := s.sessions[id]; se != nil && se.relay != nil {
+			return &relayOwner{id: id, rl: se.relay,
+				done: func() bool { s.mu.Lock(); defer s.mu.Unlock(); return api.Terminal(se.State) },
+				note: func(msg string) { appendNote(filepath.Join(se.dir, "stderr.log"), msg) }}
+		}
+	} else if j := s.jobs[id]; j != nil && j.relay != nil {
+		return &relayOwner{id: id, rl: j.relay,
+			done: func() bool { s.mu.Lock(); defer s.mu.Unlock(); return api.Terminal(j.State) },
+			note: func(msg string) { s.note(j, msg) }}
 	}
-	return j, j.relay
+	writeErr(w, 404, "no such job or session, or it has no relay")
+	return nil
+}
+
+func appendNote(path, msg string) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(f, "offload: %s\n", msg)
+	f.Close()
 }
 
 // handleCallbacks long-polls for the next credential request (client side of the relay).
 func (s *Server) handleCallbacks(w http.ResponseWriter, r *http.Request) {
-	j, rl := s.jobRelay(w, r)
-	if rl == nil {
+	o := s.relayOf(w, r)
+	if o == nil {
 		return
 	}
+	rl := o.rl
 	rl.mu.Lock()
 	rl.polling++
 	rl.mu.Unlock()
@@ -277,10 +304,7 @@ func (s *Server) handleCallbacks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rl.mu.Unlock()
-		s.mu.Lock()
-		done := api.Terminal(j.State)
-		s.mu.Unlock()
-		if done {
+		if o.done() {
 			w.WriteHeader(http.StatusGone)
 			return
 		}
@@ -297,10 +321,11 @@ func (s *Server) handleCallbacks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCallbackReply(w http.ResponseWriter, r *http.Request) {
-	_, rl := s.jobRelay(w, r)
-	if rl == nil {
+	o := s.relayOf(w, r)
+	if o == nil {
 		return
 	}
+	rl := o.rl
 	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {
 		writeErr(w, 400, err.Error())
@@ -324,10 +349,11 @@ func (s *Server) handleCredential(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "local socket only")
 		return
 	}
-	j, rl := s.jobRelay(w, r)
-	if rl == nil {
+	o := s.relayOf(w, r)
+	if o == nil {
 		return
 	}
+	rl := o.rl
 	in, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
 	if err != nil {
 		writeErr(w, 400, err.Error())
@@ -335,8 +361,8 @@ func (s *Server) handleCredential(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := rl.ask("git-credential", in, time.Minute)
 	if err != nil {
-		s.note(j, "git credentials: "+err.Error())
-		log.Printf("job %s: git credential: %v", j.ID, err)
+		o.note("git credentials: " + err.Error())
+		log.Printf("%s: git credential: %v", o.id, err)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}

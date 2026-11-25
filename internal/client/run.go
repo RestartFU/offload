@@ -38,6 +38,7 @@ type RunOptions struct {
 	Environment string   // named environment (~/.config/offload/envs/NAME)
 	Host        bool     // run on the runner host instead of a container
 	Platform    string   // require e.g. linux/arm64
+	Network     string   // "client": the job's connections go out from this machine
 	Fresh       bool
 	Ephemeral   bool
 	Detach      bool
@@ -104,6 +105,10 @@ func Run(o RunOptions) (int, error) {
 		spec.Runtime, spec.Environment = "host", nil
 	}
 	spec.Platform = o.Platform
+	spec.Network = o.Network
+	if spec.Network == "client" {
+		spec.DNSSearch = dnsSearch()
+	}
 	if !o.NoCreds {
 		spec.Relay = cfg.relays()
 		cwd, _ := os.Getwd()
@@ -288,10 +293,10 @@ func cancelJob(h *Host, id string) {
 func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bool, cfg *Config) (int, *api.Job, error) {
 	var j api.Job
 	err := h.do(ctx, "GET", "/v1/jobs/"+id, nil, &j)
-	if err == nil && len(j.Spec.Relay) > 0 && cfg != nil {
+	if err == nil && (len(j.Spec.Relay) > 0 || j.Spec.Network == "client") && cfg != nil {
 		cbctx, stopCallbacks := context.WithCancel(ctx)
 		defer stopCallbacks()
-		go serveCallbacks(cbctx, h, id, cfg, quiet)
+		go serveCallbacks(cbctx, h, "/v1/jobs/"+id, cfg, quiet)
 	}
 	if err == nil && j.State == api.StateQueued {
 		why := strings.TrimPrefix(j.Reason, "waiting: ")

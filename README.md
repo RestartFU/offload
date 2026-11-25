@@ -51,6 +51,12 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
   (`[data.NAME]` in `client.toml`, with include/exclude/newest rules) are synced incrementally
   before each start. Files the runner changed are kept unless they also changed locally. Nothing
   is set up on the runner by hand. See `examples/minecraft/`.
+- **As if on the laptop.** `--network client` (jobs) or `network = "client"` (sessions) gives
+  the container its own network namespace with only a TUN device. A user-space TCP/IP stack
+  (gVisor) inside hands every TCP connection and UDP flow to the attached client, which opens it
+  from the laptop. The job gets the laptop's egress IP, DNS (including short tailnet names), LAN
+  and tailnet, and `laptop` / `10.233.0.1` is the laptop's own `localhost`. It's opt-in, because
+  every byte crosses the laptop and stops when it sleeps.
 - **Any Linux runner.** The environment is the same on every distro. Runners report OS/arch,
   and the client prefers one matching the laptop (`--platform linux/arm64` forces one).
   Windows hosts can be runners through WSL2; macOS hosts through a Linux VM.

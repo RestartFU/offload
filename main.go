@@ -62,6 +62,8 @@ Client:
       --environment N  use ~/.config/offload/envs/N instead of the repo's environment
       --host           run directly on the runner host instead of in a container
       --platform P     require a runner platform, e.g. linux/arm64
+      --network client the job's connections go out from this machine (its IP, DNS, LAN,
+                       tailnet; "laptop" / 10.233.0.1 inside the job is this machine's localhost)
       --fresh          start from an empty workspace (cold build)
       --ephemeral      drop the workspace afterwards
       --detach, -d     print the job id and return
@@ -213,6 +215,7 @@ func cmdRun(args []string) (int, error) {
 	fs.StringVar(&o.Environment, "environment", "", "named environment")
 	fs.BoolVar(&o.Host, "host", false, "run on the runner host, not in a container")
 	fs.StringVar(&o.Platform, "platform", "", "require os/arch, e.g. linux/arm64")
+	fs.StringVar(&o.Network, "network", "", "client: connect out from this machine")
 	fs.BoolVar(&o.NoSync, "no-sync", false, "")
 	fs.BoolVar(&o.NoWriteBack, "no-write-back", false, "")
 	fs.BoolVar(&o.NoGit, "no-git", false, "")
@@ -360,12 +363,13 @@ func cmdRunner(args []string) (int, error) {
 		fs := flag.NewFlagSet("inner", flag.ExitOnError)
 		secrets := fs.String("secrets", "", "")
 		stdin := fs.Bool("stdin", false, "")
+		clientNet := fs.Bool("net-client", false, "")
 		fl, rest := splitArgs(args[1:])
 		_ = fs.Parse(fl)
 		if len(rest) == 0 {
 			die("internal: runner inner [--secrets DIR] [--stdin] -- CMD")
 		}
-		return runner.RunInner(*secrets, *stdin, rest), nil
+		return runner.RunInner(*secrets, *stdin, *clientNet, rest), nil
 	case "credential":
 		op := ""
 		if len(args) > 1 {

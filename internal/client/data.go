@@ -48,6 +48,7 @@ type SessionConfig struct {
 	Volumes       map[string]string `toml:"volumes"` // runner-side persistent volume -> path
 	Devices       []string          `toml:"devices"`
 	NestedSandbox bool              `toml:"nested_sandbox"`
+	Network       string            `toml:"network"` // "client": connections go out from this machine
 	Resources     struct {
 		CPU    float64 `toml:"cpu"`
 		CPUMax float64 `toml:"cpu_max"`
@@ -191,6 +192,32 @@ func dataFiles(cfg DataSetConfig) (string, []string, error) {
 		return nil
 	})
 	return root, files, err
+}
+
+// preferData narrows hosts to those already holding every data set a session needs (their first
+// start is fast: no multi-gigabyte sync, environment build or toolchain install), if any do.
+func preferData(hosts []*Host, data map[string]string) []*Host {
+	if len(data) == 0 {
+		return hosts
+	}
+	var warm []*Host
+	for _, h := range hosts {
+		have := map[string]bool{}
+		for _, d := range h.Status.DataSets {
+			have[d] = true
+		}
+		ok := true
+		for name := range data {
+			ok = ok && have[name]
+		}
+		if ok {
+			warm = append(warm, h)
+		}
+	}
+	if len(warm) == 0 {
+		return hosts
+	}
+	return warm
 }
 
 // SyncData brings a data set up to date on a runner, sending only changed files.

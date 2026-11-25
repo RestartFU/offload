@@ -338,6 +338,8 @@ type runSpec struct {
 	Env                                 map[string]string
 	Interactive                         bool // keep stdin (sessions)
 	NestedSandbox                       bool // flatpak/bubblewrap inside: unmask /proc, no seccomp filter
+	ClientNet                           bool // network through the client (own netns + TUN + user-space stack)
+	DNSSearch                           []string
 	Argv                                []string
 }
 
@@ -345,13 +347,26 @@ type runSpec struct {
 // mounted static offload binary is the entrypoint and loads secrets inside.
 func (s *Server) podmanRun(r runSpec) []string {
 	a := []string{"podman", "run", "--rm", "--name", r.Name,
-		"--cgroups=split", "--network=host", "--security-opt", "label=disable",
+		"--cgroups=split", "--security-opt", "label=disable",
 		"--pids-limit=-1", "--init", "--pull=never",
 		fmt.Sprintf("--memory=%d", r.Mem), "--memory-swap=" + fmt.Sprint(r.Mem),
 		"-w", r.Workdir,
 	}
 	if r.Interactive {
 		a = append(a, "-i")
+	}
+	if r.ClientNet {
+		// Its own network namespace with only a TUN device; DNS and "laptop" point at the client.
+		// (runner inner writes resolv.conf and hosts; podman refuses --dns with --network=none)
+		a = append(a, "--network=none", "--device", "/dev/net/tun", "--cap-add", "NET_ADMIN")
+		if r.Env != nil {
+			r.Env["OFFLOAD_RUNNER_SOCK"] = unixSocketPath()
+			if len(r.DNSSearch) > 0 {
+				r.Env["OFFLOAD_DNS_SEARCH"] = strings.Join(r.DNSSearch, " ")
+			}
+		}
+	} else {
+		a = append(a, "--network=host")
 	}
 	if r.CPUs != "" {
 		a = append(a, "--cpuset-cpus="+r.CPUs)
@@ -393,6 +408,9 @@ func (s *Server) podmanRun(r runSpec) []string {
 	if r.Interactive {
 		a = append(a, "--stdin")
 	}
+	if r.ClientNet {
+		a = append(a, "--net-client")
+	}
 	a = append(a, "--")
 	return append(a, r.Argv...)
 }
@@ -407,6 +425,7 @@ func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets s
 	if j.Spec.Environment != nil {
 		r.Devices = j.Spec.Environment.Devices
 	}
+	r.ClientNet, r.DNSSearch = j.Spec.Network == "client", j.Spec.DNSSearch
 	return s.podmanRun(r)
 }
 
@@ -458,9 +477,15 @@ func (s *Server) containerEnv(prof *Profile, ncpu int, j *job) map[string]string
 
 // RunInner is "offload runner inner", the entrypoint inside a job's container: load secrets from
 // the tmpfs mount (never passed to podman, which would store them on disk), then run the job.
-func RunInner(secrets string, stdin bool, argv []string) int {
+func RunInner(secrets string, stdin, clientNet bool, argv []string) int {
 	if secrets != "" {
 		loadSecrets(secrets)
+	}
+	if clientNet {
+		if err := startClientNet(); err != nil {
+			fmt.Fprintf(os.Stderr, "offload: client network: %v\n", err)
+			return 1
+		}
 	}
 	var in io.Reader
 	if stdin {

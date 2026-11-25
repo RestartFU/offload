@@ -105,6 +105,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/jobs/{id}/callbacks", s.handleCallbacks)
 	mux.HandleFunc("POST /v1/jobs/{id}/callbacks/{cid}", s.handleCallbackReply)
 	mux.HandleFunc("POST /v1/jobs/{id}/credential", s.handleCredential)
+	mux.HandleFunc("POST /v1/jobs/{id}/dial", s.handleDial)
+	mux.HandleFunc("GET /v1/sessions/{id}/callbacks", s.handleCallbacks)
+	mux.HandleFunc("POST /v1/sessions/{id}/callbacks/{cid}", s.handleCallbackReply)
+	mux.HandleFunc("POST /v1/sessions/{id}/dial", s.handleDial)
+	mux.HandleFunc("POST /v1/streams/{sid}", s.handleStream)
 	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /v1/sessions", s.handleCreateSession)
 	mux.HandleFunc("GET /v1/sessions/{id}", s.handleGetSession)
@@ -356,6 +361,11 @@ func (s *Server) status() api.Status {
 		st.WarmKeys = append(st.WarmKeys, k) // container slots are "<workspace>--<variant>"
 	}
 	sort.Strings(st.WarmKeys)
+	if recs, err := filepath.Glob(filepath.Join(s.cfg.StateDir, "data", "*.json")); err == nil {
+		for _, r := range recs {
+			st.DataSets = append(st.DataSets, strings.TrimSuffix(filepath.Base(r), ".json"))
+		}
+	}
 	for name, p := range s.cfg.loadProfiles() {
 		st.Profiles[name] = api.ProfileInfo{Kind: p.Kind, Match: p.Match, Description: p.Description, Resources: p.resources()}
 	}

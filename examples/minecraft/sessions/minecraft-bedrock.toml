@@ -7,6 +7,7 @@ environment = "minecraft"           # ~/.config/offload/envs/minecraft/Container
 command = ["minecraft-mcp"]
 prepare = ["minecraft-prepare", "--update"]
 nested_sandbox = true                # flatpak's bubblewrap runs inside the container
+network = "client"                   # play from this machine's network (IP, DNS, LAN, localhost proxies)
 
 [data]                               # data sets from client.toml, synced before every start
 minecraft = "/root/.var/app/io.mrarm.mcpelauncher/data/mcpelauncher"

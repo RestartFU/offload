@@ -56,7 +56,10 @@ func MCP(o MCPOptions) error {
 			cmd = sc.Prepare
 		}
 		spec.Def = &api.SessionDef{Command: cmd, Env: sc.Env, Data: sc.Data, Volumes: sc.Volumes,
-			Devices: sc.Devices, NestedSandbox: sc.NestedSandbox}
+			Devices: sc.Devices, NestedSandbox: sc.NestedSandbox, Network: sc.Network}
+		if sc.Network == "client" {
+			spec.Def.DNSSearch = dnsSearch()
+		}
 		if o.Environment == "" {
 			o.Environment = sc.Environment
 		}
@@ -86,7 +89,7 @@ func MCP(o MCPOptions) error {
 	if on != "" {
 		h, err = FindHost(hosts, on)
 	} else if sc != nil {
-		h, err = PickFor(hosts, api.JobSpec{Resources: res, Environment: spec.Environment}, "")
+		h, err = PickFor(preferData(hosts, sc.Data), api.JobSpec{Resources: res, Environment: spec.Environment}, "")
 	} else {
 		h, err = Pick(hosts, res, profile, "", "session")
 	}
@@ -131,6 +134,9 @@ func MCP(o MCPOptions) error {
 		break
 	}
 	fmt.Fprintf(os.Stderr, "offload: session %s:%s (%s)\n", h.Name, se.ID, profile)
+	if spec.Def != nil && spec.Def.Network == "client" {
+		go serveCallbacks(ctx, h, "/v1/sessions/"+se.ID, cfg, true)
+	}
 	defer func() {
 		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

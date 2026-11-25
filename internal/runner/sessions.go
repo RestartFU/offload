@@ -29,6 +29,8 @@ type session struct {
 	cpus     []int
 	inactive int
 
+	relay *relay // client networking requests, when the session uses network = "client"
+
 	inMu    sync.Mutex // serializes stdin writes
 	conn    net.Conn
 	lastSeq int64
@@ -88,7 +90,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		prof = &Profile{Name: spec.Profile, Kind: "session", Command: spec.Def.Command, Env: spec.Def.Env,
-			Devices: spec.Def.Devices, Runtime: "container", NestedSandbox: spec.Def.NestedSandbox}
+			Devices: spec.Def.Devices, Runtime: "container", NestedSandbox: spec.Def.NestedSandbox, Network: spec.Def.Network}
 		for name, ctr := range spec.Def.Data {
 			if !validKey(name) {
 				writeErr(w, 400, "invalid data set name "+strconv.Quote(name))
@@ -174,6 +176,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		ID: newID("s-"), Runner: s.cfg.Name, Profile: spec.Profile, State: api.StateRunning,
 		Resources: res, CreatedAt: now, LastSeen: now, Runtime: rt, Image: image,
 	}}
+	if prof.Network == "client" {
+		if rt != "container" {
+			writeErr(w, 400, "network = \"client\" needs the container runtime")
+			return
+		}
+		se.relay = newRelay()
+		se.relay.lastPoll = now // the client starts polling right after creating the session
+	}
 	se.dir = filepath.Join(s.cfg.StateDir, "sessions", se.ID)
 	if err := os.MkdirAll(filepath.Join(se.dir, "tmp"), 0o700); err != nil {
 		writeErr(w, 500, err.Error())
@@ -202,6 +212,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	command := prof.Command
+	var dnsSearch []string
+	if spec.Def != nil {
+		dnsSearch = spec.Def.DNSSearch
+	}
 	unitEnv := env
 	if rt == "container" {
 		cenv := parallelEnv(ncpu)
@@ -234,7 +248,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			volumes = append(volumes, host+":"+ctr)
 		}
 		command = s.podmanRun(runSpec{Name: "offload-" + se.ID, Image: image, Workdir: se.dir, CPUs: allowed,
-			Secrets: secrets, Mem: res.Mem, Env: cenv, Interactive: true, Argv: prof.Command,
+			Secrets: secrets, Mem: res.Mem, Env: cenv, Interactive: true, Argv: prof.Command, ClientNet: prof.Network == "client", DNSSearch: dnsSearch,
 			Same: []string{se.dir}, Volumes: volumes, Devices: devices, NestedSandbox: prof.NestedSandbox})
 		unitEnv = map[string]string{}
 		s.touchImage(image)

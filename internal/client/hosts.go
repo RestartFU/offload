@@ -136,7 +136,7 @@ type cachedHost struct {
 	URL  string `json:"url"`
 }
 
-const hostCacheTTL = 15 * time.Minute
+const hostCacheTTL = 2 * time.Minute
 
 func hostCachePath() string {
 	dir, _ := os.UserCacheDir()

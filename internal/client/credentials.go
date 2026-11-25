@@ -234,7 +234,8 @@ func resolveSecrets(cfg *Config, sets, args []string, withAuto, quiet bool) (map
 
 // serveCallbacks answers the job's credential requests from this machine until ctx ends or the
 // job finishes. Each kind of use is announced once on stderr, so the caller knows it happened.
-func serveCallbacks(ctx context.Context, h *Host, id string, cfg *Config, quiet bool) {
+// base is "/v1/jobs/<id>" or "/v1/sessions/<id>".
+func serveCallbacks(ctx context.Context, h *Host, base string, cfg *Config, quiet bool) {
 	var once sync.Map
 	announce := func(key, msg string) {
 		if _, loaded := once.LoadOrStore(key, true); !loaded {
@@ -247,7 +248,7 @@ func serveCallbacks(ctx context.Context, h *Host, id string, cfg *Config, quiet 
 			Kind string `json:"kind"`
 			Data []byte `json:"data"`
 		}
-		resp, err := h.request(ctx, "GET", "/v1/jobs/"+id+"/callbacks", nil)
+		resp, err := h.request(ctx, "GET", base+"/callbacks", nil)
 		if err != nil {
 			var ae *APIError
 			if errors.As(err, &ae) && (ae.Code == 404 || ae.Code == 410) {
@@ -276,6 +277,9 @@ func serveCallbacks(ctx context.Context, h *Host, id string, cfg *Config, quiet 
 		go func() {
 			var answer []byte
 			switch cb.Kind {
+			case "dial":
+				answer = []byte(serveDial(ctx, h, cb.Data))
+				announce("net", "the job's network goes through this machine")
 			case "ssh-agent":
 				answer = agentRequest(cb.Data)
 				announce("ssh", "the job is using this machine's ssh-agent")
@@ -290,7 +294,7 @@ func serveCallbacks(ctx context.Context, h *Host, id string, cfg *Config, quiet 
 					announce("git-deny:"+host, "refused git credentials for "+host+" (not in credentials.git_hosts)")
 				}
 			}
-			_ = h.do(ctx, "POST", "/v1/jobs/"+id+"/callbacks/"+cb.ID, bytes.NewReader(answer), nil)
+			_ = h.do(ctx, "POST", base+"/callbacks/"+cb.ID, bytes.NewReader(answer), nil)
 		}()
 	}
 }
