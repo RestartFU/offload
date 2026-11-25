@@ -152,6 +152,9 @@ A local web page covering every runner:
   CPU time, warm-file rate, and per command its run times and how much of its guaranteed CPU it
   really uses.
 
+It follows the system's light or dark setting; the switch at the top right picks one instead,
+remembered by the browser.
+
 The dashboard listens on loopback only and talks to runners with this machine's identity. The
 link it prints carries a per-run key, so other local users can't use it. Runners sample usage
 every 5 seconds and keep a week of it. They also keep a ledger of finished jobs
