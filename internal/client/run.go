@@ -88,12 +88,12 @@ func runInPlace(argv []string, env map[string]string) (int, error) {
 // memory limit from earlier runs, and an out-of-memory kill is retried once with twice the memory.
 // Ctrl-C (or SIGTERM) cancels the remote job.
 func Run(o RunOptions) (int, error) {
+	if inJob() && o.On == "" {
+		return runInPlace(o.Argv, o.Env) // the command keeps normal SIGPIPE behavior
+	}
 	// A closed output (piped into `head`) must surface as a write error, which ends following
 	// with the job's reference, instead of killing offload mid-write.
 	signal.Ignore(syscall.SIGPIPE)
-	if inJob() && o.On == "" {
-		return runInPlace(o.Argv, o.Env)
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 	cfg, err := LoadConfig()
@@ -177,7 +177,7 @@ func Run(o RunOptions) (int, error) {
 			}
 			return 1, err
 		}
-		ref := h.Name + ":" + j.ID
+		ref := RefName(Discover(ctx, cfg), h) + ":" + j.ID
 		if o.Detach {
 			fmt.Println(ref)
 			return 0, nil
@@ -461,7 +461,7 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 			n, cerr := io.Copy(rw, resp.Body)
 			if rw.err != nil { // our own output failed (disk full, closed pipe): not a network matter
 				resp.Body.Close()
-				return fmt.Errorf("writing the job's %s: %w (it keeps running: offload attach %s:%s)", stream, rw.err, h.Name, id)
+				return fmt.Errorf("writing the job's %s: %w (it keeps running: offload attach %s)", stream, rw.err, id)
 			}
 			resp.Body.Close()
 			offset += n
@@ -481,7 +481,7 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 			return fmt.Errorf("%s: %s", h.Name, ae.Msg)
 		}
 		if errors.As(err, &ae) && ae.Code == 403 { // pairing reset: retrying can't help
-			return fmt.Errorf("%s: %s; pair again (offload host pair %s --code CODE), then offload attach %s:%s", h.Name, ae.Msg, h.Name, h.Name, id)
+			return fmt.Errorf("%s: %s; pair again (offload host pair %s --code CODE), then offload attach %s", h.Name, ae.Msg, h.Name, id)
 		}
 		if err == nil {
 			var j api.Job
@@ -498,7 +498,7 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 			logf(quiet, "lost connection to %s (%v); reattaching", h.Name, err)
 		}
 		if failures > 360 { // ~30 minutes
-			return fmt.Errorf("gave up reattaching to %s:%s; try: offload attach %s:%s", h.Name, id, h.Name, id)
+			return fmt.Errorf("gave up reattaching to %s:%s; try: offload attach %s", h.Name, id, id)
 		}
 		select {
 		case <-ctx.Done():
@@ -712,7 +712,7 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 		if errors.As(err, &ce) { // nothing to retry: the edits never left the runner
 			wbErr = fmt.Errorf("write-back: %w", err)
 		} else {
-			wbErr = fmt.Errorf("write-back: %w (run `offload attach %s:%s` to retry)", err, h.Name, j.ID)
+			wbErr = fmt.Errorf("write-back: %w (run `offload attach %s` to retry)", err, j.ID)
 		}
 	}
 	// What write-back installed is the job's own result, not a local change: artifacts may

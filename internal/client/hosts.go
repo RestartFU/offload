@@ -636,6 +636,18 @@ func checkProto(h *Host) error {
 	return nil
 }
 
+// RefName is how to name h in a job reference so FindHost finds h again: its name if that is
+// unambiguous, its runner ID otherwise.
+func RefName(hosts []*Host, h *Host) string {
+	if f, err := FindHost(hosts, h.Name); err == nil && f.URL == h.URL {
+		return h.Name
+	}
+	if h.Status != nil && h.Status.ID != "" {
+		return h.Status.ID
+	}
+	return h.Name
+}
+
 func FindHost(hosts []*Host, name string) (*Host, error) {
 	// A name from client.toml is the user's own: it wins, if it's unique.
 	var named []*Host
@@ -655,7 +667,8 @@ func FindHost(hosts []*Host, name string) (*Host, error) {
 		if h.Status == nil {
 			continue
 		}
-		if !strings.EqualFold(h.Name, name) && !strings.EqualFold(h.Status.Name, name) && !strings.EqualFold(h.Status.Hostname, name) {
+		if !strings.EqualFold(h.Name, name) && !strings.EqualFold(h.Status.Name, name) && !strings.EqualFold(h.Status.Hostname, name) &&
+			!(h.Status.ID != "" && strings.EqualFold(h.Status.ID, name)) {
 			continue
 		}
 		k := h.Status.ID
@@ -722,7 +735,7 @@ func locateJob(ctx context.Context, hosts []*Host, ref string) (*Host, string, e
 		_ = json.Unmarshal(b, &m)
 		if r, ok := m[id]; ok {
 			for _, h := range hosts {
-				if h.Name == r.Host {
+				if h.URL == r.URL { // the address it ran at, not a name another runner may now carry
 					return h, id, nil
 				}
 			}

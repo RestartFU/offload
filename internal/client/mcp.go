@@ -70,6 +70,9 @@ func MCP(o MCPOptions) error {
 		}
 		if spec.Resources.CPU == 0 {
 			spec.Resources.CPU = sc.Resources.CPU
+			if max := spec.Resources.CPUMax; max > 0 && spec.Resources.CPU > max {
+				spec.Resources.CPU = max // the definition's default yields to an explicit --cpu-max
+			}
 		}
 		if spec.Resources.CPUMax == 0 {
 			spec.Resources.CPUMax = sc.Resources.CPUMax
@@ -81,8 +84,8 @@ func MCP(o MCPOptions) error {
 	} else if o.Prepare {
 		return fmt.Errorf("--prepare needs a session definition in %s", filepath.Join(configDir(), "sessions", profile+".toml"))
 	}
-	if o.Host && sc != nil && len(sc.Data) > 0 {
-		return fmt.Errorf("session %s mounts data sets, which only container sessions get; run it without --host", profile)
+	if o.Host && sc != nil && (len(sc.Data) > 0 || len(sc.Volumes) > 0) {
+		return fmt.Errorf("session %s mounts data sets or volumes, which only container sessions get; run it without --host", profile)
 	}
 	if o.Host { // runs on the runner itself: no environment to load at all
 		spec.Runtime, spec.Environment = "host", nil
@@ -377,6 +380,9 @@ func prepareResult(ctx context.Context, h *Host, id string, prepare bool) error 
 	}
 	if se.StopRequested { // stopped from elsewhere: whatever it exited with, it didn't finish
 		return fmt.Errorf("%s was stopped (%s)", what, se.Reason)
+	}
+	if strings.HasPrefix(se.Reason, "out of memory") { // part of it was killed, whatever it exited
+		return fmt.Errorf("%s ran out of memory (%s)", what, se.Reason)
 	}
 	if se.ExitCode == nil {
 		return fmt.Errorf("%s ended without an exit status (%s)", what, se.Reason)

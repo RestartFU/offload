@@ -453,6 +453,7 @@ func pruneNonGit(sl *slot, manifest []api.FileEntry) {
 		return
 	}
 	defer root.Close()
+	var dirs []string
 	_ = fs.WalkDir(root.FS(), ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || p == "." {
 			return nil
@@ -461,6 +462,7 @@ func pruneNonGit(sl *slot, manifest []api.FileEntry) {
 			if api.SkipDir(d.Name()) {
 				return fs.SkipDir
 			}
+			dirs = append(dirs, p)
 			return nil
 		}
 		if !sent[p] {
@@ -468,6 +470,11 @@ func pruneNonGit(sl *slot, manifest []api.FileEntry) {
 		}
 		return nil
 	})
+	// Then directories left empty (an emptied vendor/ still switches Go to vendor mode), deepest
+	// first; Remove only takes empty ones, so anything holding build output stays.
+	for i := len(dirs) - 1; i >= 0; i-- {
+		_ = root.Remove(dirs[i])
+	}
 }
 
 // note appends an offload message to the job's stderr, so the caller sees it in order.
@@ -576,7 +583,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	if err == nil && j.Spec.GitTree {
 		s.pruneUntracked(gitCtx, sl, manifest, j.Spec.IgnoreRules, j.Spec.IgnoreGlobal)
-	} else if err == nil && len(manifest) > 0 {
+	} else if err == nil {
 		pruneNonGit(sl, manifest)
 	}
 	s.mu.Lock()
