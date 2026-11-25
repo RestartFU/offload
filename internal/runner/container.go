@@ -145,8 +145,11 @@ func (s *Server) ensureImageLocked(j *job) bool {
 // build builds an image (and the base first, when needed) in its own unit with its own limits,
 // so a job's small learned memory limit can't starve its environment build.
 func (s *Server) build(b *envBuild, cf string) {
-	dir := filepath.Join(s.cfg.StateDir, "envs", strings.ReplaceAll(strings.TrimPrefix(b.tag, imageRepo+"/"), ":", "-"))
+	// Each attempt has its own directory (Containerfile, context snapshot, log): a retry, or a
+	// build unit that outlived a runner restart, never shares files with another attempt.
+	dir := filepath.Join(s.cfg.StateDir, "envs", strings.ReplaceAll(strings.TrimPrefix(b.tag, imageRepo+"/"), ":", "-"), newID("a-"))
 	_ = os.MkdirAll(dir, 0o755)
+	defer os.RemoveAll(dir)
 	b.logPath = filepath.Join(dir, "build.log")
 	_ = os.WriteFile(b.logPath, nil, 0o644)
 	stop, pumped := make(chan struct{}), make(chan struct{})
@@ -163,7 +166,6 @@ func (s *Server) build(b *envBuild, cf string) {
 			s.releaseSlotLocked(b.slot, b.slot.dropAfterBuild)
 		}
 		s.mu.Unlock()
-		defer os.RemoveAll(ctxDir)
 	}
 	if err == nil && strings.Contains(cf, baseTag()) && b.tag != baseTag() && !imageExists(baseTag()) {
 		err = s.runBuild(baseTag(), baseContainerfile, "", dir, b.logPath)
@@ -250,7 +252,11 @@ func snapshotContext(sl *slot, ctxRel, dst string) error {
 		return err
 	}
 	defer out.Close()
-	for p, ent := range sl.load().Files {
+	rec, err := sl.loadErr()
+	if err != nil {
+		return fmt.Errorf("workspace record: %w", err) // never build from a silently empty context
+	}
+	for p, ent := range rec.Files {
 		rel := p
 		if ctxRel != "." {
 			var ok bool
@@ -573,7 +579,10 @@ func (s *Server) containerEnv(prof *Profile, ncpu int, j *job) map[string]string
 // the tmpfs mount (never passed to podman, which would store them on disk), then run the job.
 func RunInner(secrets string, stdin, clientNet bool, argv []string) int {
 	if secrets != "" {
-		loadSecrets(secrets)
+		if err := loadSecrets(secrets); err != nil {
+			fmt.Fprintf(os.Stderr, "offload: %v\n", err)
+			return 1
+		}
 	}
 	if clientNet {
 		if err := startClientNet(); err != nil {

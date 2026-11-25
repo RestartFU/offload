@@ -114,6 +114,8 @@ type Job struct {
 	// ContextDigest identifies the workspace content a COPY/ADD environment is built from, so
 	// only jobs with identical build contexts share an image.
 	ContextDigest string `json:"context_digest,omitempty"`
+	// Proto is the runner protocol version that started the job (mounts, relays, wrappers).
+	Proto int `json:"proto,omitempty"`
 	// MemFrom says where the memory limit came from: "requested", "learned", "profile", "default".
 	MemFrom string `json:"mem_from,omitempty"`
 	// Needed lists the manifest paths the client must upload. Only set in the create response.
@@ -208,6 +210,7 @@ type Session struct {
 	Runtime    string     `json:"runtime,omitempty"`
 	Image      string     `json:"image,omitempty"`
 	Network    string     `json:"network,omitempty"` // "client": the attached client must serve dial callbacks
+	Proto      int        `json:"proto,omitempty"`   // runner protocol version that started it
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	ExitCode   *int       `json:"exit_code,omitempty"`
 	Reason     string     `json:"reason,omitempty"`

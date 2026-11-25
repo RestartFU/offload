@@ -5,7 +5,6 @@ package streamio
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -106,15 +105,39 @@ type PacketConn interface {
 
 // RelayDatagrams carries one UDP flow between a datagram connection and a stream of frames
 // (2-byte big-endian length, then the payload) until either side ends, or until no datagram has
-// moved in either direction for idle. Both are closed on return.
+// moved in either direction for idle. Either pump ending, or the idle watchdog, closes both, so a
+// write stuck on one side can't keep the flow alive.
 func RelayDatagrams(pkt PacketConn, stream io.ReadWriteCloser, idle time.Duration) {
 	var last atomic.Int64
 	touch := func() { last.Store(time.Now().UnixNano()) }
 	touch()
-	defer pkt.Close()
-	defer stream.Close()
+	var once sync.Once
+	done := make(chan struct{})
+	stop := func() {
+		once.Do(func() {
+			close(done)
+			pkt.Close()
+			stream.Close()
+		})
+	}
+	defer stop()
+	go func() { // idle watchdog
+		t := time.NewTicker(min(idle/4, 15*time.Second))
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, last.Load())) >= idle {
+					stop()
+					return
+				}
+			}
+		}
+	}()
 	go func() { // stream -> datagrams
-		defer pkt.Close()
+		defer stop()
 		r := bufio.NewReader(stream)
 		var hdr [2]byte
 		buf := make([]byte, 65535)
@@ -135,13 +158,8 @@ func RelayDatagrams(pkt PacketConn, stream io.ReadWriteCloser, idle time.Duratio
 	buf := make([]byte, 65535)
 	frame := make([]byte, 2+65535)
 	for { // datagrams -> stream
-		_ = pkt.SetReadDeadline(time.Now().Add(min(idle, 15*time.Second)))
 		n, err := pkt.Read(buf)
 		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(0, last.Load())) < idle {
-				continue // quiet this way, but the flow is alive in the other direction
-			}
 			return
 		}
 		touch()

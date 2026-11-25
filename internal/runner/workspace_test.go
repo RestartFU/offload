@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -198,4 +199,46 @@ func TestSessionFramesDeduplicate(t *testing.T) {
 	}
 	b, _ := os.ReadFile(outFile)
 	t.Fatalf("stdout = %q, want each frame once", b)
+}
+
+func TestContextProblem(t *testing.T) {
+	m := []api.FileEntry{{Path: "ctx/a", Hash: "x"}, {Path: "alias", Link: "ctx"}, {Path: "empty/.keep", Link: "../x"}}
+	if p := contextProblem(m, "ctx"); p != "" {
+		t.Errorf("real dir rejected: %s", p)
+	}
+	if p := contextProblem(m, "alias"); p == "" {
+		t.Error("symlinked context accepted")
+	}
+	if p := contextProblem(m, "nothing"); p == "" {
+		t.Error("empty context accepted")
+	}
+	if p := contextProblem(m, "."); p != "" {
+		t.Errorf("root context rejected: %s", p)
+	}
+}
+
+// Frames must arrive in order: a gap is refused, and a closed stdin is reported, not acknowledged.
+func TestSessionFramesGapAndClosedStdin(t *testing.T) {
+	dir := t.TempDir()
+	sock := fmt.Sprintf("/tmp/oft-%d.sock", time.Now().UnixNano()) // short: unix socket paths are limited
+	go RunPipe(dir, sock, "", []string{"sh", "-c", "exec 0<&-; sleep 2"})
+	var c net.Conn
+	var err error
+	for i := 0; i < 50; i++ {
+		if c, err = net.Dial("unix", sock); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r := bufio.NewReader(c)
+	if !readGreeting(c, r) {
+		t.Fatal("no greeting")
+	}
+	if err := sendFrame(c, r, 2, []byte("x\n")); err == nil || !strings.Contains(err.Error(), "gap") {
+		t.Fatalf("gap accepted: %v", err)
+	}
 }

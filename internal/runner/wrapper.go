@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,27 +43,35 @@ type ExecOptions struct {
 
 // loadSecrets exports the job's secret env vars to the command, then deletes env.json. Secret
 // files stay (env vars point at them) until the runner removes the directory after the job.
-func loadSecrets(dir string) {
+func loadSecrets(dir string) error {
 	p := filepath.Join(dir, "env.json")
 	b, err := os.ReadFile(p)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "offload: secrets: %v\n", err)
-		return
+		return fmt.Errorf("secrets: %w", err)
 	}
 	_ = os.Remove(p)
 	var vars map[string]string
-	if json.Unmarshal(b, &vars) == nil {
-		for k, v := range vars {
-			_ = os.Setenv(k, v)
+	if err := json.Unmarshal(b, &vars); err != nil {
+		return fmt.Errorf("secrets: %w", err)
+	}
+	for k, v := range vars {
+		if err := os.Setenv(k, v); err != nil {
+			return fmt.Errorf("secret %s: %w", k, err)
 		}
 	}
+	return nil
 }
 
 // RunExec is "offload runner exec": run argv, then record its exit status, peak memory and
 // whether the cgroup OOM killer fired, pack requested artifacts, and collect write-back files.
 func RunExec(o ExecOptions) int {
 	if o.Secrets != "" {
-		loadSecrets(o.Secrets)
+		if err := loadSecrets(o.Secrets); err != nil {
+			// Never run the command without the secrets it asked for.
+			fmt.Fprintf(os.Stderr, "offload: %v\n", err)
+			_ = writeFileJSON(filepath.Join(o.JobDir, "exit.json"), exitRecord{Code: 1, Error: err.Error()})
+			return 1
+		}
 	}
 	code, sig, runErr := runChild(o.Argv, nil, os.Stdout)
 	rec := exitRecord{Code: code, Signal: sig, OOM: oomKilled(), PeakMem: cgroupInt("memory.peak")}
@@ -215,7 +224,11 @@ const pipeGreeting = "offload-pipe 2\n"
 // appended to <dir>/stdout. Any number of connections may write to the socket over time.
 func RunPipe(dir, sock, secrets string, argv []string) int {
 	if secrets != "" {
-		loadSecrets(secrets)
+		if err := loadSecrets(secrets); err != nil {
+			_ = writeFileJSON(filepath.Join(dir, "exit.json"), exitRecord{Code: 1, Error: err.Error()})
+			fmt.Fprintf(os.Stderr, "offload: %v\n", err)
+			return 1
+		}
 	}
 	fail := func(err error) int {
 		fmt.Fprintf(os.Stderr, "offload: %v\n", err)
@@ -246,15 +259,20 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 	// the queue is full. lastSeq lives here, in the process that owns stdin.
 	var mu sync.Mutex
 	var lastSeq int64
-	var ended bool // the process exited; frames is closed
+	var ended bool             // the process exited; frames is closed
+	var broken atomic.Bool     // the process closed its stdin
+	var queued atomic.Int64    // bytes waiting in frames
+	const maxQueued = 16 << 20 // backpressure ("busy") beyond this
 	frames := make(chan []byte, 64)
 	go func() {
 		defer pw.Close()
 		for payload := range frames {
+			queued.Add(-int64(len(payload)))
+			if broken.Load() {
+				continue // drain so senders never block; they are told "stdin closed"
+			}
 			if _, err := pw.Write(payload); err != nil {
-				for range frames { // stdin is gone: drain so senders never block
-				}
-				return
+				broken.Store(true)
 			}
 		}
 	}()
@@ -287,12 +305,20 @@ func RunPipe(dir, sock, secrets string, argv []string) int {
 					}
 					reply := "ok\n"
 					mu.Lock()
-					if ended {
+					switch {
+					case ended || broken.Load():
 						reply = "stdin closed\n"
-					} else if seq > lastSeq {
+					case seq <= lastSeq:
+						// a retry of a frame already queued: acknowledge, don't repeat it
+					case seq != lastSeq+1:
+						reply = "gap\n" // a frame was lost: refuse rather than reorder
+					case queued.Load()+int64(len(payload)) > maxQueued:
+						reply = "busy\n"
+					default:
 						select {
 						case frames <- payload:
 							lastSeq = seq
+							queued.Add(int64(len(payload)))
 						default:
 							reply = "busy\n"
 						}

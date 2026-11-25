@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"mime/multipart"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -231,60 +232,76 @@ func SyncData(ctx context.Context, h *Host, name string, cfg DataSetConfig, quie
 	if err != nil {
 		return fmt.Errorf("data set %s: %w", name, err)
 	}
-	var plan struct {
-		Needed  []string `json:"needed"`
-		Changed bool     `json:"changed"` // deletions, symlinks or modes changed: apply even with no files
-	}
-	if err := h.do(ctx, "POST", "/v1/data/"+name, api.DataPlan{Manifest: manifest}, &plan); err != nil {
-		return fmt.Errorf("data set %s: %w", name, err)
-	}
-	if len(plan.Needed) == 0 && !plan.Changed {
-		return nil
-	}
-	var size int64
-	byPath := map[string]bool{}
-	for _, p := range plan.Needed {
-		byPath[p] = true
-	}
-	for _, e := range manifest {
-		if byPath[e.Path] {
-			if fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(e.Path))); err == nil {
-				size += fi.Size()
+	// Plan, then upload against that plan's revision; if another client synced in between,
+	// the runner answers 409 and we plan again.
+	for attempt := 0; ; attempt++ {
+		var plan struct {
+			Needed  []string `json:"needed"`
+			Changed bool     `json:"changed"` // deletions, symlinks or modes changed: apply even with no files
+			Rev     int64    `json:"rev"`
+		}
+		if err := h.do(ctx, "POST", "/v1/data/"+name, api.DataPlan{Manifest: manifest}, &plan); err != nil {
+			return fmt.Errorf("data set %s: %w", name, err)
+		}
+		if len(plan.Needed) == 0 && !plan.Changed {
+			return nil
+		}
+		var size int64
+		byPath := map[string]bool{}
+		for _, p := range plan.Needed {
+			byPath[p] = true
+		}
+		for _, e := range manifest {
+			if byPath[e.Path] {
+				if fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(e.Path))); err == nil {
+					size += fi.Size()
+				}
 			}
 		}
-	}
-	logf(quiet, "syncing data set %s to %s: %d changed files, %s", name, h.Name, len(plan.Needed), units.FormatSize(size))
-	pr, pw := io.Pipe()
-	mw := multipart.NewWriter(pw)
-	go func() {
-		part, err := mw.CreateFormField("manifest")
-		if err == nil {
-			err = encodeJSON(part, api.DataPlan{Manifest: manifest})
+		logf(quiet, "syncing data set %s to %s: %d changed files, %s", name, h.Name, len(plan.Needed), units.FormatSize(size))
+		pr, pw := io.Pipe()
+		mw := multipart.NewWriter(pw)
+		go func() {
+			part, err := mw.CreateFormField("manifest")
+			if err == nil {
+				err = encodeJSON(part, api.DataPlan{Manifest: manifest})
+			}
+			if err == nil {
+				part, err = mw.CreateFormField("rev")
+			}
+			if err == nil {
+				_, err = fmt.Fprint(part, plan.Rev)
+			}
+			if err == nil {
+				part, err = mw.CreateFormFile("files", "files.tar.gz")
+			}
+			if err == nil {
+				err = writeTar(part, root, manifest, plan.Needed)
+			}
+			if err == nil {
+				err = mw.Close()
+			}
+			pw.CloseWithError(err)
+		}()
+		req, err := newRequest(ctx, h, "PUT", "/v1/data/"+name, pr)
+		if err != nil {
+			return err
 		}
-		if err == nil {
-			part, err = mw.CreateFormFile("files", "files.tar.gz")
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		resp, err := h.http.Do(req)
+		if err != nil {
+			return fmt.Errorf("data set %s: %w", name, err)
 		}
-		if err == nil {
-			err = writeTar(part, root, manifest, plan.Needed)
-		}
-		if err == nil {
-			err = mw.Close()
-		}
-		pw.CloseWithError(err)
-	}()
-	req, err := newRequest(ctx, h, "PUT", "/v1/data/"+name, pr)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	resp, err := h.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("data set %s: %w", name, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("data set %s: %s: %s", name, resp.Status, strings.TrimSpace(string(b)))
+		resp.Body.Close()
+		pr.Close()
+		if resp.StatusCode == http.StatusConflict && attempt < 3 {
+			continue
+		}
+		if resp.StatusCode >= 300 {
+			return fmt.Errorf("data set %s: %s: %s", name, resp.Status, strings.TrimSpace(string(b)))
+		}
+		break
 	}
 	logf(quiet, "data set %s synced in %s", name, time.Since(start).Round(100*time.Millisecond))
 	return nil

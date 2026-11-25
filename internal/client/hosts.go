@@ -129,6 +129,15 @@ func localSocket() string {
 // vetted: a redirect is returned as an error, never followed.
 func noRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
+// legacyLocalSocket is where local runners listened before their socket moved to offload-admin.
+func legacyLocalSocket() string {
+	p := filepath.Join(filepath.Dir(filepath.Dir(localSocket())), "offload", "runner.sock")
+	if fi, err := os.Stat(p); err == nil && fi.Mode()&os.ModeSocket != 0 {
+		return p
+	}
+	return ""
+}
+
 func newHost(name, url, token string, prio int) *Host {
 	h := &Host{Name: name, URL: strings.TrimRight(url, "/"), Token: token, Priority: prio}
 	if sock, ok := strings.CutPrefix(url, "unix://"); ok {
@@ -246,6 +255,8 @@ func Discover(ctx context.Context, cfg *Config) []*Host {
 	if cfg.Local == nil || *cfg.Local {
 		if _, err := os.Stat(localSocket()); err == nil {
 			fixed = append(fixed, newHost("local", "unix://"+localSocket(), "", -10))
+		} else if old := legacyLocalSocket(); old != "" {
+			fixed = append(fixed, newHost("local", "unix://"+old, "", -10)) // a runner from before the move, so it can be upgraded
 		}
 	}
 	scan := cfg.Discover == nil || *cfg.Discover

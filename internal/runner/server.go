@@ -41,6 +41,7 @@ type Server struct {
 	features map[string]bool
 	history  map[string]*histEntry
 	wake     chan struct{}
+	legacy   map[string]bool // running jobs started by an older runner version
 	tz       string
 
 	builds      map[string]*envBuild // image tag -> build in progress
@@ -69,6 +70,7 @@ func New(cfg *Config, version string) (*Server, error) {
 		jobs: map[string]*job{}, sessions: map[string]*session{}, slots: map[string][]*slot{},
 		cpuUse: map[int]int{}, wake: make(chan struct{}, 1), whois: map[string]whoisEntry{},
 		builds: map[string]*envBuild{}, buildErrs: map[string]error{}, readyImages: map[string]bool{}, tz: hostTimezone(),
+		legacy: map[string]bool{},
 	}
 	ctrl := delegatedControllers()
 	s.features = map[string]bool{"cpuset": ctrl["cpuset"], "io": ctrl["io"], "memory": ctrl["memory"], "cpu": ctrl["cpu"]}
@@ -310,7 +312,7 @@ func (s *Server) tailnetOK(ctx context.Context, remote string) (string, bool) {
 func (s *Server) loop(ctx context.Context) {
 	tick := time.NewTicker(200 * time.Millisecond) // exit records are a cheap stat; see checkRunning
 	defer tick.Stop()
-	lastGC := time.Time{}
+	lastGC, lastRelays := time.Time{}, time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -321,6 +323,10 @@ func (s *Server) loop(ctx context.Context) {
 		s.checkRunning()
 		s.checkSessions()
 		s.reapUploads()
+		if time.Since(lastRelays) > 5*time.Second {
+			lastRelays = time.Now()
+			s.ensureRelays()
+		}
 		s.admit()
 		if time.Since(lastGC) > 10*time.Minute {
 			lastGC = time.Now()
@@ -383,6 +389,9 @@ func (s *Server) status() api.Status {
 	sort.Strings(st.Features)
 	if st.MemAvailable < s.cfg.memReserve {
 		st.Accepting, st.Reason = false, "host memory below reserve"
+	}
+	if len(s.legacy) > 0 {
+		st.Accepting, st.Reason = false, "draining jobs started by an older runner version"
 	}
 	return st
 }
@@ -514,6 +523,11 @@ func (b idleBody) Read(p []byte) (int, error) {
 func uploadBody(w http.ResponseWriter, r *http.Request, limit int64, stop func() bool) io.Reader {
 	return idleBody{r: http.MaxBytesReader(w, r.Body, limit), rc: http.NewResponseController(w), stop: stop}
 }
+
+// runnerProto versions how workloads are wired (mounts, relay sockets, the stdin wrapper
+// protocol). Workloads started by an older version are drained or stopped after an upgrade rather
+// than run side by side with new ones (their mounts expose more than current ones do).
+const runnerProto = 3
 
 // reply holds a handler's response until s.mu is released, so a client that stops reading can
 // never stall the scheduler while it holds the lock.

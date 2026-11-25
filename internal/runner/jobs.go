@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
-	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -38,6 +37,7 @@ type job struct {
 	inactive    int         // consecutive checks the unit was gone without an exit record
 	checked     time.Time   // last time systemd was asked whether the unit is active
 	cancelled   atomic.Bool // set by DELETE; read by uploads without taking s.mu
+	abortUpload func()      // interrupts the upload being read right now (set while syncing)
 	mounts      []string    // runtime paths (sockets, secrets) this job's container may see
 
 }
@@ -59,6 +59,27 @@ func contextRel(dir string) string {
 		return "."
 	}
 	return dir
+}
+
+// contextProblem explains why ctx can't be a build context (empty if it can): it must be a real
+// directory in the synced tree (not a symlink, nor under one) with at least one synced file.
+func contextProblem(m []api.FileEntry, ctx string) string {
+	if ctx == "." {
+		return ""
+	}
+	files := 0
+	for _, e := range m {
+		if e.Link != "" && (e.Path == ctx || strings.HasPrefix(ctx, e.Path+"/")) {
+			return fmt.Sprintf("%q is a symlink in the repository; point context at the real directory", e.Path)
+		}
+		if strings.HasPrefix(e.Path, ctx+"/") {
+			files++
+		}
+	}
+	if files == 0 {
+		return fmt.Sprintf("%q has no synced files", ctx)
+	}
+	return ""
 }
 
 // contextDigest identifies exactly the files a COPY/ADD build can see: those under ctx.
@@ -126,6 +147,9 @@ func (s *Server) restore() {
 			j.save()
 		case api.StateQueued:
 			j.queuedAt = j.CreatedAt
+			if len(j.Spec.Relay) > 0 || j.Spec.Network == "client" {
+				j.relay = newRelay() // its sockets are created when it starts
+			}
 			if len(j.Spec.SecretNames) > 0 { // secrets were only in memory
 				j.State, j.Reason = api.StateFailed, "runner restarted before the job started; its secrets were dropped"
 				now := time.Now()
@@ -133,18 +157,13 @@ func (s *Server) restore() {
 				j.save()
 			}
 		case api.StateRunning:
+			if j.Proto < runnerProto {
+				s.legacy[j.ID] = true // admission waits until it has drained
+			}
 			if len(j.Spec.Relay) > 0 || j.Spec.Network == "client" {
-				// Re-create the job's relay sockets in its workload dir (still mounted in its
-				// container), so ssh-agent, git credentials and client networking keep working.
+				// Its relay sockets are (re)created in its workload dir, still mounted in its
+				// container, by ensureRelays, which keeps retrying until they bind.
 				j.relay = newRelay()
-				if slices.Contains(j.Spec.Relay, "ssh-agent") {
-					_, _ = j.relay.startAgent(j.ID)
-				}
-				if j.Runtime == "container" && (j.Spec.Network == "client" || slices.Contains(j.Spec.Relay, "git")) {
-					if _, err := s.startControl(j.relay, "jobs", j.ID, j.Spec.Network == "client", slices.Contains(j.Spec.Relay, "git")); err != nil {
-						log.Printf("job %s: control socket after restart: %v", j.ID, err)
-					}
-				}
 			}
 			if j.AllowedCPUs != "" {
 				j.cpus, _ = units.ParseCPUList(j.AllowedCPUs)
@@ -233,6 +252,10 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if spec.Client == "" {
 		spec.Client = r.Header.Get("X-Offload-Caller")
+	}
+	if err := validSecrets(spec.Secrets, spec.SecretFiles); err != nil {
+		out.err(400, err.Error())
+		return
 	}
 	if spec.Platform != "" && spec.Platform != goruntime.GOOS+"/"+goruntime.GOARCH {
 		out.err(400, "this runner is "+goruntime.GOOS+"/"+goruntime.GOARCH+", not "+spec.Platform)
@@ -368,8 +391,16 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	j.Proto = runnerProto
+	if err := j.save(); err != nil {
+		if j.slot != nil {
+			s.releaseSlotLocked(j.slot, false)
+		}
+		_ = os.RemoveAll(j.dir)
+		out.err(500, "can't record the job: "+err.Error())
+		return
+	}
 	s.jobs[j.ID] = j
-	j.save()
 	out.json(j.view())
 	j.Needed, j.GitHave = nil, nil
 	s.kick()
@@ -392,6 +423,8 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 	ok := j != nil && j.State == api.StateUploading && j.Spec.Git != nil && !j.syncing
 	if ok {
 		j.syncing = true
+		rc := http.NewResponseController(w)
+		j.abortUpload = func() { _ = rc.SetReadDeadline(time.Now()) } // DELETE interrupts a read in progress
 	}
 	s.mu.Unlock()
 	if !ok {
@@ -400,7 +433,7 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() {
 		s.mu.Lock()
-		j.syncing = false
+		j.syncing, j.abortUpload = false, nil
 		if j.cancel && j.State == api.StateUploading { // cancelled while the bundle was arriving
 			s.finishLocked(j, api.StateCancelled, nil, "cancelled")
 		}
@@ -444,6 +477,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j.syncing = true
+	rc := http.NewResponseController(w)
+	j.abortUpload = func() { _ = rc.SetReadDeadline(time.Now()) } // DELETE interrupts a read in progress
 	sl, manifest := j.slot, j.Spec.Manifest
 	s.mu.Unlock()
 
@@ -468,7 +503,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	j.syncing = false
+	j.syncing, j.abortUpload = false, nil
 	if j.cancel {
 		s.finishLocked(j, api.StateCancelled, nil, "cancelled")
 		out.err(409, "job was cancelled during upload")
@@ -481,10 +516,20 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	j.State, j.queuedAt = api.StateQueued, time.Now()
 	if e := j.Spec.Environment; e != nil {
-		j.ContextDigest = contextDigest(manifest, contextRel(e.ContextDir))
+		ctx := contextRel(e.ContextDir)
+		if problem := contextProblem(manifest, ctx); problem != "" && usesContext(e.Containerfile) {
+			s.finishLocked(j, api.StateFailed, nil, "environment context: "+problem)
+			out.err(400, "environment context: "+problem)
+			return
+		}
+		j.ContextDigest = contextDigest(manifest, ctx)
 	}
 	j.Spec.Manifest = nil // synced; no need to keep it on disk
-	j.save()
+	if err := j.save(); err != nil {
+		s.finishLocked(j, api.StateFailed, nil, "can't record the synced job: "+err.Error())
+		out.err(500, "can't record the synced job: "+err.Error())
+		return
+	}
 	out.json(j.view())
 	s.kick()
 }
@@ -509,6 +554,14 @@ func (s *Server) reapUploads() {
 func (s *Server) admit() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for id := range s.legacy {
+		if j := s.jobs[id]; j == nil || api.Terminal(j.State) {
+			delete(s.legacy, id)
+		}
+	}
+	if len(s.legacy) > 0 {
+		return // workloads from an older runner version are still draining
+	}
 	var queued []*job
 	for _, j := range s.jobs {
 		if j.State == api.StateQueued && !j.cancel {
@@ -539,6 +592,43 @@ func (s *Server) admit() {
 			s.finishLocked(j, api.StateFailed, nil, "start: "+err.Error())
 		}
 	}
+}
+
+// makeWorkDir creates the job's working directory through real directories only. A previous
+// job may have left a symlink where a directory of the path should be (one with no synced files,
+// so sync never replaced it); the runner's wrapper must never start outside the workspace.
+func (s *Server) makeWorkDir(j *job) error {
+	base := filepath.Join(j.dir, "work")
+	if j.slot != nil {
+		base = j.slot.Dir
+	}
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return err
+	}
+	if j.Spec.Dir == "" || j.Spec.Dir == "." {
+		return nil
+	}
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	parts := strings.Split(j.Spec.Dir, "/")
+	for i := range parts {
+		p := strings.Join(parts[:i+1], "/")
+		fi, err := root.Lstat(p)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			if err := root.Mkdir(p, 0o755); err != nil {
+				return err
+			}
+		case err != nil:
+			return err
+		case !fi.IsDir():
+			return fmt.Errorf("working directory %q: %q is not a directory on the runner (a previous job changed it); run with --fresh", j.Spec.Dir, p)
+		}
+	}
+	return nil
 }
 
 func (s *Server) workDir(j *job) string {
@@ -589,7 +679,7 @@ func (s *Server) startJobLocked(j *job) error {
 		env[k] = v
 	}
 	dir := s.workDir(j)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := s.makeWorkDir(j); err != nil {
 		s.releaseCPUsLocked(j.cpus)
 		j.cpus = nil // released exactly once: finishLocked must not release them again
 		return err
@@ -645,8 +735,10 @@ func (s *Server) startJobLocked(j *job) error {
 		return fmt.Errorf("can't record the job before starting it: %w", err)
 	}
 	if err := startUnit(contextBG(), u); err != nil {
-		if active, known := unitActive(u.Name); known && active {
-			log.Printf("job %s: systemd-run reported %v, but the unit is running; keeping it", j.ID, err)
+		if active, known := unitActive(u.Name); !known || active {
+			// The unit may be running (systemd-run timed out after submitting it): keep the
+			// job "running" with its resources; checkRunning settles it once systemd answers.
+			log.Printf("job %s: systemd-run reported %v; unit state: active=%v known=%v, keeping the job", j.ID, err, active, known)
 			return nil
 		}
 		s.releaseCPUsLocked(j.cpus)
@@ -787,6 +879,9 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	case api.StateUploading, api.StateQueued:
 		if j.syncing {
 			j.cancel = true // the upload handler finishes it once the slot is consistent
+			if j.abortUpload != nil {
+				j.abortUpload()
+			}
 		} else {
 			s.finishLocked(j, api.StateCancelled, nil, "cancelled")
 		}

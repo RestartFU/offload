@@ -33,10 +33,9 @@ type session struct {
 
 	relay *relay // client networking requests, when the session uses network = "client"
 
-	inMu   sync.Mutex // serializes stdin writes
-	conn   net.Conn
-	connR  *bufio.Reader
-	legacy bool // the wrapper predates the framed protocol (started by an older runner)
+	inMu  sync.Mutex // serializes stdin writes
+	conn  net.Conn
+	connR *bufio.Reader
 }
 
 func (se *session) save() error {
@@ -61,11 +60,13 @@ func (s *Server) restoreSessions() {
 		se.Attached = 0 // no client connection survives a runner restart
 		if !api.Terminal(se.State) {
 			se.LastSeen = time.Now()
-			if se.Network == "client" {
-				se.relay = newRelay()
-				if _, err := s.startControl(se.relay, "sessions", se.ID, true, false); err != nil {
-					log.Printf("session %s: control socket after restart: %v", se.ID, err)
-				}
+			if se.Proto < runnerProto {
+				// Started by an older runner: its stdin protocol and mounts differ. Stop it; the
+				// MCP client sees the session end and starts a new one.
+				se.Reason = "runner upgraded; start the session again"
+				stopUnit(se.Unit)
+			} else if se.Network == "client" {
+				se.relay = newRelay() // sockets: ensureRelays
 			}
 			if c, ok := s.unitCPUs(se.dir); ok {
 				se.cpus = c
@@ -130,6 +131,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if spec.Client == "" {
 		spec.Client = r.Header.Get("X-Offload-Caller")
 	}
+	if err := validSecrets(spec.Secrets, spec.SecretFiles); err != nil {
+		out.err(400, err.Error())
+		return
+	}
 	res := s.cfg.effective(spec.Resources, prof)
 	rt := spec.Runtime
 	if rt == "" {
@@ -187,7 +192,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	se := &session{Session: api.Session{
 		ID: newID("s-"), Runner: s.cfg.Name, Profile: spec.Profile, State: api.StateRunning,
-		Resources: res, CreatedAt: now, LastSeen: now, Runtime: rt, Image: image,
+		Resources: res, CreatedAt: now, LastSeen: now, Runtime: rt, Image: image, Proto: runnerProto,
 	}}
 	if prof.Network == "client" {
 		if rt != "container" {
@@ -303,8 +308,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	err = se.save()
 	if err == nil {
 		if err = startUnit(contextBG(), u); err != nil {
-			if active, known := unitActive(u.Name); known && active {
-				err = nil // systemd-run timed out but the unit did start
+			if active, known := unitActive(u.Name); !known || active {
+				// It may be running: keep the record and resources; checkSessions settles it.
+				log.Printf("session %s: systemd-run reported %v; keeping it (active=%v known=%v)", se.ID, err, active, known)
+				err = nil
 			}
 		}
 	}
@@ -373,8 +380,8 @@ func (s *Server) handleSessionStdin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusGone, "session has ended")
 		return
 	}
-	seq, _ := strconv.ParseInt(r.URL.Query().Get("seq"), 10, 64)
-	if seq <= 0 {
+	seq, perr := strconv.ParseInt(r.URL.Query().Get("seq"), 10, 64)
+	if perr != nil || seq <= 0 {
 		writeErr(w, 400, "seq must be a positive sequence number")
 		return
 	}
@@ -391,16 +398,16 @@ func (s *Server) handleSessionStdin(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			se.connR = bufio.NewReader(se.conn)
-			se.legacy = !readGreeting(se.conn, se.connR)
+			if !readGreeting(se.conn, se.connR) {
+				// Not the framed protocol (sessions from older runners are stopped on restore):
+				// send nothing rather than guess.
+				se.conn.Close()
+				se.conn, se.connR = nil, nil
+				writeErr(w, http.StatusBadGateway, "session stdin: wrapper protocol mismatch")
+				return
+			}
 		}
-		if se.legacy {
-			// A wrapper from before the framed protocol (started by an older runner): raw bytes.
-			_ = se.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			_, err = se.conn.Write(body)
-			_ = se.conn.SetWriteDeadline(time.Time{})
-		} else {
-			err = sendFrame(se.conn, se.connR, seq, body)
-		}
+		err = sendFrame(se.conn, se.connR, seq, body)
 		if err == nil {
 			break
 		}
@@ -408,6 +415,10 @@ func (s *Server) handleSessionStdin(w http.ResponseWriter, r *http.Request) {
 		se.conn, se.connR = nil, nil
 		if errors.Is(err, errBusy) {
 			writeErr(w, http.StatusServiceUnavailable, "session is not reading its input; retry")
+			return
+		}
+		if errors.Is(err, errStdinClosed) {
+			writeErr(w, http.StatusGone, "the session's process closed its input")
 			return
 		}
 		if attempt > 0 || errors.Is(err, os.ErrDeadlineExceeded) {
@@ -438,11 +449,16 @@ func sendFrame(c net.Conn, r *bufio.Reader, seq int64, body []byte) error {
 		return nil
 	case "busy\n":
 		return errBusy
+	case "stdin closed\n":
+		return errStdinClosed
 	}
 	return fmt.Errorf("wrapper: %s", strings.TrimSpace(ack))
 }
 
-var errBusy = errors.New("busy")
+var (
+	errBusy        = errors.New("busy")
+	errStdinClosed = errors.New("stdin closed")
+)
 
 // readGreeting reports whether the wrapper on c speaks the framed protocol.
 func readGreeting(c net.Conn, r *bufio.Reader) bool {

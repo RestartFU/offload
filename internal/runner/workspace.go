@@ -41,6 +41,7 @@ func (s *slot) id() string { return fmt.Sprintf("%s/%d", s.Key, s.Index) }
 type slotRecord struct {
 	Key      string               `json:"key"`
 	LastUsed time.Time            `json:"last_used"`
+	Rev      int64                `json:"rev"` // bumped on every save: plans are only valid against their revision
 	Files    map[string]slotEntry `json:"files"`
 }
 
@@ -59,20 +60,30 @@ func validKey(k string) bool { return keyRE.MatchString(k) && k != "." && k != "
 func (s *slot) recordPath() string { return s.Dir + ".json" }
 
 func (s *slot) load() slotRecord {
+	rec, _ := s.loadErr()
+	return rec
+}
+
+// loadErr reads the slot record; a missing record is an empty slot, an unreadable one an error.
+func (s *slot) loadErr() (slotRecord, error) {
 	rec := slotRecord{Files: map[string]slotEntry{}}
 	b, err := os.ReadFile(s.recordPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return rec, nil
+	}
 	if err == nil {
-		_ = json.Unmarshal(b, &rec)
+		err = json.Unmarshal(b, &rec)
 	}
 	if rec.Files == nil {
 		rec.Files = map[string]slotEntry{}
 	}
-	return rec
+	return rec, err
 }
 
 func (s *slot) save(rec slotRecord) error {
 	rec.Key = s.Key
 	rec.LastUsed = s.LastUsed
+	rec.Rev++
 	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -171,7 +182,7 @@ func (s *slot) plan(manifest []api.FileEntry) ([]string, error) {
 			continue
 		}
 		fi, err := root.Lstat(p)
-		if err != nil || !fi.Mode().IsRegular() || fi.Size() != old.Size || fi.ModTime().UnixNano() != old.MTime {
+		if err != nil || !fi.Mode().IsRegular() || fi.Size() != old.Size || fi.ModTime().UnixNano() != old.MTime || !realParents(root, p) {
 			needed = append(needed, p)
 		}
 	}
@@ -202,16 +213,6 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 		}
 		want[p] = e
 	}
-	for p := range rec.Files {
-		if _, ok := want[p]; !ok {
-			// Only through real directories: a parent the runner turned into a symlink (even one
-			// pointing inside the tree) must not redirect this delete onto another tracked file.
-			if _, err := cleanRel(p); err == nil && realParents(root, p) {
-				_ = root.Remove(p)
-			}
-			delete(rec.Files, p)
-		}
-	}
 	pending := map[string]bool{}
 	for _, p := range needed {
 		pending[p] = true
@@ -222,6 +223,17 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 	}
 	for p := range pending {
 		return fmt.Errorf("upload is missing %q (and %d more)", p, len(pending)-1)
+	}
+	// Only now, with the upload known complete, remove what left the manifest.
+	for p := range rec.Files {
+		if _, ok := want[p]; !ok {
+			// Only through real directories: a parent the runner turned into a symlink (even one
+			// pointing inside the tree) must not redirect this delete onto another tracked file.
+			if _, err := cleanRel(p); err == nil && realParents(root, p) {
+				_ = root.Remove(p)
+			}
+			delete(rec.Files, p)
+		}
 	}
 	for _, e := range manifest {
 		old, had := rec.Files[e.Path]
@@ -283,8 +295,7 @@ func realParents(root *os.Root, rel string) bool {
 
 // extract writes the uploaded files (verifying each hash) through the confined root, each via an
 // exclusively created temporary file and an atomic rename.
-// Entries outside pending are accepted too when they match the manifest (another client may have
-// synced some of them between this client's plan and its upload).
+// Entries in the manifest but outside pending are read past and ignored.
 func extract(root *os.Root, upload io.Reader, want map[string]api.FileEntry, pending, written map[string]bool) error {
 	if upload == nil {
 		return nil
@@ -312,6 +323,13 @@ func extract(root *os.Root, upload io.Reader, want map[string]api.FileEntry, pen
 		e, ok := want[p]
 		if !ok || e.Link != "" || h.Typeflag != tar.TypeReg {
 			return fmt.Errorf("upload: unexpected entry %q", h.Name)
+		}
+		if !pending[p] {
+			// Not needed (anymore): read past it without touching the runner's copy.
+			if _, err := io.Copy(io.Discard, tr); err != nil {
+				return fmt.Errorf("upload: %w", err)
+			}
+			continue
 		}
 		if err := prepareParents(root, p); err != nil {
 			return err

@@ -486,14 +486,20 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, quiet
 			skipped = append(skipped, c.Path)
 			continue
 		}
-		// Replace only if the local file is still the one that was hashed (no edit in between).
+		// Replace only if the local file is still exactly what was hashed: same file, mode and
+		// content, re-checked right before the rename. Otherwise the job's version is kept next
+		// to it as <file>.offload-incoming, never silently dropped or written over an edit.
 		unchanged := func() bool {
 			now, err := tree.Lstat(c.Path)
-			return err == nil && os.SameFile(before, now) && now.Size() == before.Size() && now.ModTime().Equal(before.ModTime())
+			if err != nil || !os.SameFile(before, now) || now.Mode() != before.Mode() {
+				return false
+			}
+			h, err := hashIn(tree, c.Path)
+			return err == nil && h == c.BaseHash
 		}
 		if err := writeInIf(tree, c.Path, tr, os.FileMode(c.Mode).Perm(), c.Hash, unchanged); err != nil {
 			if errors.Is(err, errChangedLocally) {
-				skipped = append(skipped, c.Path)
+				skipped = append(skipped, c.Path+" (job's version: "+c.Path+".offload-incoming)")
 				continue
 			}
 			return err
@@ -552,6 +558,30 @@ func realParents(root *os.Root, rel string) bool {
 
 var errChangedLocally = errors.New("changed locally")
 
+// mkdirReal creates dir (and its parents) inside root, refusing any existing component that is
+// not a real directory (a symlink there would alias another path).
+func mkdirReal(root *os.Root, dir string) error {
+	if dir == "." || dir == "" {
+		return nil
+	}
+	parts := strings.Split(dir, "/")
+	for i := range parts {
+		p := strings.Join(parts[:i+1], "/")
+		fi, err := root.Lstat(p)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			if err := root.Mkdir(p, 0o755); err != nil {
+				return err
+			}
+		case err != nil:
+			return err
+		case !fi.IsDir():
+			return fmt.Errorf("%s is not a real directory", p)
+		}
+	}
+	return nil
+}
+
 // writeIn replaces rel inside root with r's content via an exclusively created temporary file
 // and an atomic rename; wantHash, when set, must match.
 func writeIn(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHash string) error {
@@ -579,6 +609,10 @@ func writeInIf(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHas
 		err = root.Chmod(tmp, mode)
 	}
 	if err == nil && still != nil && !still() {
+		// Keep the incoming content beside the local file instead of discarding it.
+		if root.Rename(tmp, rel+".offload-incoming") == nil {
+			return errChangedLocally
+		}
 		err = errChangedLocally
 	}
 	if err == nil {
@@ -630,23 +664,25 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string) error {
 		if err := checkRel(name); err != nil {
 			return fmt.Errorf("refusing artifact path %q", hd.Name)
 		}
+		// Every entry type goes through real directories only: an existing symlink in the
+		// destination (even one pointing inside it) must not alias another path.
+		if err := mkdirReal(tree, path.Dir(name)); err != nil {
+			return fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
+		}
 		switch hd.Typeflag {
 		case tar.TypeDir:
-			if err := tree.MkdirAll(name, 0o755); err != nil {
-				return err
+			if err := mkdirReal(tree, name); err != nil {
+				return fmt.Errorf("refusing artifact %q: %w", hd.Name, err)
 			}
 		case tar.TypeReg:
-			if err := tree.MkdirAll(path.Dir(name), 0o755); err != nil {
-				return err
-			}
-			if !realParents(tree, name) {
-				return fmt.Errorf("refusing artifact %q: a parent directory is a symlink", hd.Name)
-			}
 			if err := writeIn(tree, name, tr, os.FileMode(hd.Mode).Perm(), ""); err != nil {
 				return err
 			}
 			n++
 		case tar.TypeSymlink:
+			if fi, err := tree.Lstat(name); err == nil && fi.IsDir() {
+				return fmt.Errorf("refusing artifact %q: would replace a directory", hd.Name)
+			}
 			_ = tree.Remove(name)
 			if err := tree.Symlink(hd.Linkname, name); err != nil {
 				return err

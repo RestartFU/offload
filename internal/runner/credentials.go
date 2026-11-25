@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -54,6 +55,7 @@ type relay struct {
 	srv      *http.Server // serves ctl; closing it also closes its open connections
 	conns    map[net.Conn]struct{}
 	closed   bool
+	done     chan struct{} // closed by close(): wakes waiting askers and pollers
 }
 
 // track registers a workload's live stream legs so close can end them; false once closed.
@@ -81,7 +83,7 @@ func (r *relay) untrack(cs ...net.Conn) {
 }
 
 func newRelay() *relay {
-	return &relay{pending: map[string]*callback{}, notify: make(chan struct{}, 1)}
+	return &relay{pending: map[string]*callback{}, notify: make(chan struct{}, 1), done: make(chan struct{})}
 }
 
 func (r *relay) attached() bool {
@@ -91,6 +93,10 @@ func (r *relay) attached() bool {
 // ask sends a request to the client and waits for its answer.
 func (r *relay) ask(kind string, data []byte, timeout time.Duration) ([]byte, error) {
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, errors.New("the workload has ended")
+	}
 	if !r.attached() {
 		r.mu.Unlock()
 		return nil, errNoClient
@@ -118,6 +124,8 @@ func (r *relay) ask(kind string, data []byte, timeout time.Duration) ([]byte, er
 	select {
 	case b := <-cb.resp:
 		return b, nil
+	case <-r.done:
+		return nil, errors.New("the workload has ended")
 	case <-time.After(timeout):
 		return nil, fmt.Errorf("client did not answer %s request in %s", kind, timeout)
 	}
@@ -126,7 +134,11 @@ func (r *relay) ask(kind string, data []byte, timeout time.Duration) ([]byte, er
 func (r *relay) close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if !r.closed {
+		close(r.done)
+	}
 	r.closed = true
+	r.queue, r.pending = nil, map[string]*callback{} // nothing queued may reach a client later
 	if r.srv != nil {
 		r.srv.Close() // the listener and every open connection on it
 		r.srv = nil
@@ -220,6 +232,10 @@ func (r *relay) startAgent(id string) (string, error) {
 
 func (r *relay) serveAgent(c net.Conn) {
 	defer c.Close()
+	if !r.track(c) { // closed with the relay when the workload ends
+		return
+	}
+	defer r.untrack(c)
 	failure := []byte{0, 0, 0, 1, 5} // SSH_AGENT_FAILURE
 	for {
 		var hdr [4]byte
@@ -254,10 +270,9 @@ func (s *Server) setupCredentials(j *job, env map[string]string) (string, error)
 	if j.relay != nil && container && (j.Spec.Network == "client" || slices.Contains(j.Spec.Relay, "git")) {
 		ctl, err := s.startControl(j.relay, "jobs", j.ID, j.Spec.Network == "client", slices.Contains(j.Spec.Relay, "git"))
 		if err != nil {
-			s.note(j, "control socket unavailable: "+err.Error())
-		} else {
-			sock = ctl
+			return "", fmt.Errorf("control socket: %w", err)
 		}
+		sock = ctl
 	}
 	if j.Spec.Network == "client" {
 		env["OFFLOAD_RUNNER_SOCK"] = sock
@@ -268,8 +283,7 @@ func (s *Server) setupCredentials(j *job, env map[string]string) (string, error)
 			case "ssh-agent":
 				path, err := j.relay.startAgent(j.ID)
 				if err != nil {
-					s.note(j, "ssh-agent relay unavailable: "+err.Error())
-					continue
+					return "", fmt.Errorf("ssh-agent relay: %w", err) // it was asked for: don't run without it
 				}
 				env["SSH_AUTH_SOCK"] = path
 				if _, ok := env["GIT_SSH_COMMAND"]; !ok {
@@ -303,6 +317,26 @@ func (s *Server) setupCredentials(j *job, env map[string]string) (string, error)
 		}
 	}
 	return dir, nil
+}
+
+var envNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// validSecrets rejects secrets that could not be exported faithfully (bad names, NUL bytes).
+func validSecrets(vars map[string]string, files map[string][]byte) error {
+	for k, v := range vars {
+		if !envNameRE.MatchString(k) {
+			return fmt.Errorf("secret name %q is not a valid environment variable name", k)
+		}
+		if strings.ContainsRune(v, 0) {
+			return fmt.Errorf("secret %s contains a NUL byte", k)
+		}
+	}
+	for k := range files {
+		if !envNameRE.MatchString(k) {
+			return fmt.Errorf("secret file name %q is not a valid environment variable name", k)
+		}
+	}
+	return nil
 }
 
 // writeSecrets puts secrets in a tmpfs directory for the unit wrapper to load ("" if none).
@@ -361,6 +395,50 @@ func addGitConfig(env map[string]string, key, value string) {
 	env[fmt.Sprintf("GIT_CONFIG_KEY_%d", n)] = key
 	env[fmt.Sprintf("GIT_CONFIG_VALUE_%d", n)] = value
 	env["GIT_CONFIG_COUNT"] = fmt.Sprint(n + 1)
+}
+
+// ensureRelays (re)creates missing relay sockets of live workloads: after a runner restart, or
+// when binding failed. Called every few seconds, so a transient failure doesn't disable a relay
+// for good.
+func (s *Server) ensureRelays() {
+	type want struct {
+		rl                     *relay
+		kind, id               string
+		agent, ctl, dial, cred bool
+	}
+	var todo []want
+	s.mu.Lock()
+	for _, j := range s.jobs {
+		if j.State != api.StateRunning || j.relay == nil {
+			continue
+		}
+		w := want{rl: j.relay, kind: "jobs", id: j.ID, agent: slices.Contains(j.Spec.Relay, "ssh-agent"),
+			dial: j.Spec.Network == "client", cred: slices.Contains(j.Spec.Relay, "git")}
+		w.ctl = j.Runtime == "container" && (w.dial || w.cred)
+		todo = append(todo, w)
+	}
+	for _, se := range s.sessions {
+		if !api.Terminal(se.State) && se.relay != nil {
+			todo = append(todo, want{rl: se.relay, kind: "sessions", id: se.ID, ctl: true, dial: true})
+		}
+	}
+	s.mu.Unlock()
+	for _, w := range todo {
+		w.rl.mu.Lock()
+		needAgent := w.agent && w.rl.agent == nil && !w.rl.closed
+		needCtl := w.ctl && w.rl.ctl == nil && !w.rl.closed
+		w.rl.mu.Unlock()
+		if needAgent {
+			if _, err := w.rl.startAgent(w.id); err != nil {
+				log.Printf("%s %s: ssh-agent socket: %v (retrying)", w.kind, w.id, err)
+			}
+		}
+		if needCtl {
+			if _, err := s.startControl(w.rl, w.kind, w.id, w.dial, w.cred); err != nil {
+				log.Printf("%s %s: control socket: %v (retrying)", w.kind, w.id, err)
+			}
+		}
+	}
 }
 
 // cleanupCredentials closes relays and deletes the job's secrets.
@@ -432,6 +510,11 @@ func (s *Server) handleCallbacks(w http.ResponseWriter, r *http.Request) {
 	}
 	rl := o.rl
 	rl.mu.Lock()
+	if rl.closed {
+		rl.mu.Unlock()
+		w.WriteHeader(http.StatusGone)
+		return
+	}
 	rl.polling++
 	rl.mu.Unlock()
 	defer func() {
@@ -460,6 +543,9 @@ func (s *Server) handleCallbacks(w http.ResponseWriter, r *http.Request) {
 		}
 		select {
 		case <-rl.notify:
+		case <-rl.done:
+			w.WriteHeader(http.StatusGone)
+			return
 		case <-deadline:
 			w.WriteHeader(http.StatusNoContent)
 			return

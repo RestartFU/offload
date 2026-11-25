@@ -89,11 +89,17 @@ func serveDial(ctx context.Context, h *Host, data []byte) string {
 		conn.Close()
 		return err.Error()
 	}
-	if req.Proto == "udp" {
-		go streamio.RelayDatagrams(conn.(*net.UDPConn), stream, 2*time.Minute)
-	} else {
-		go streamio.Splice(stream, conn)
-	}
+	// When the workload ends (or this client stops serving it), its connections end too, even a
+	// half-closed one still waiting for the far side.
+	stopOnEnd := context.AfterFunc(ctx, func() { stream.Close(); conn.Close() })
+	go func() {
+		defer stopOnEnd()
+		if req.Proto == "udp" {
+			streamio.RelayDatagrams(conn.(*net.UDPConn), stream, 2*time.Minute)
+		} else {
+			streamio.Splice(stream, conn)
+		}
+	}()
 	return "ok"
 }
 

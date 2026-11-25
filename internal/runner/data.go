@@ -2,6 +2,7 @@ package runner
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -83,12 +84,18 @@ func (s *Server) handleDataPlan(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	needed, changed, err := s.dataSlot(name).planData(plan.Manifest)
+	sl := s.dataSlot(name)
+	rec, err := sl.loadErr()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	needed, changed, err := sl.planData(plan.Manifest)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, map[string]any{"needed": needed, "changed": changed})
+	writeJSON(w, map[string]any{"needed": needed, "changed": changed, "rev": rec.Rev})
 }
 
 // handleDataUpload applies a manifest (multipart: "manifest" JSON, then "files" tar.gz).
@@ -112,6 +119,7 @@ func (s *Server) handleDataUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	var plan api.DataPlan
 	var needed []string
+	revOK := false
 	sl := s.dataSlot(name)
 	for {
 		part, err := mr.NextPart()
@@ -132,7 +140,21 @@ func (s *Server) handleDataUpload(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, 400, err.Error())
 				return
 			}
+		case "rev":
+			// The upload must answer the current plan: another client may have synced since.
+			var rev int64
+			b, _ := io.ReadAll(io.LimitReader(part, 32))
+			rec, err := sl.loadErr()
+			if _, perr := fmt.Sscan(string(b), &rev); perr != nil || err != nil || rev != rec.Rev {
+				writeErr(w, http.StatusConflict, "data set changed since this plan; plan again")
+				return
+			}
+			revOK = true
 		case "files":
+			if !revOK {
+				writeErr(w, http.StatusConflict, "missing plan revision; plan again")
+				return
+			}
 			if err := sl.applyMode(plan.Manifest, needed, part, true); err != nil {
 				writeErr(w, 400, "data sync: "+err.Error())
 				return
