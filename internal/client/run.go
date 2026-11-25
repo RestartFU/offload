@@ -413,7 +413,7 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 // finish applies write-back and artifacts and prints a one-line summary.
 func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOptions) {
 	if j.WriteBack != nil && ws != nil {
-		if err := applyWriteBack(ctx, h, j, ws.Root, o.Quiet); err != nil {
+		if err := applyWriteBack(ctx, h, j, ws.Root, ws.Manifest, o.Quiet); err != nil {
 			logf(false, "write-back: %v", err)
 		}
 	}
@@ -433,7 +433,11 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 
 // applyWriteBack writes files the job edited into the local tree, unless the local copy also
 // changed since upload (then it's left alone and reported).
-func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, quiet bool) error {
+func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, sent []api.FileEntry, quiet bool) error {
+	base := map[string]api.FileEntry{}
+	for _, e := range sent {
+		base[e.Path] = e
+	}
 	wb := j.WriteBack
 	if len(wb.Deleted) > 0 {
 		logf(quiet, "job deleted %d synced file(s) on the runner (not deleted locally): %s", len(wb.Deleted), strings.Join(firstN(wb.Deleted, 5), ", "))
@@ -480,17 +484,18 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, quiet
 			skipped = append(skipped, c.Path)
 			continue
 		}
+		// Replace only if the local file is still exactly what this job was sent (content and
+		// mode), re-checked right before the rename. Otherwise the job's version is kept next to
+		// it as <file>.offload-incoming[.N], never silently dropped or written over an edit.
+		orig, known := base[c.Path]
 		cur, before, err := hashFileIn(tree, c.Path)
-		if err != nil || cur != c.BaseHash {
-			skipped = append(skipped, c.Path)
-			continue
-		}
-		// Replace only if the local file is still exactly what was hashed: same file, mode and
-		// content, re-checked right before the rename. Otherwise the job's version is kept next
-		// to it as <file>.offload-incoming[.N], never silently dropped or written over an edit.
+		same := known && orig.Link == "" && orig.Hash == c.BaseHash
 		unchanged := func() bool {
+			if !same || err != nil || cur != orig.Hash || before.Mode().Perm() != os.FileMode(orig.Mode).Perm() {
+				return false
+			}
 			h, now, err := hashFileIn(tree, c.Path)
-			return err == nil && os.SameFile(before, now) && now.Mode() == before.Mode() && h == c.BaseHash
+			return err == nil && os.SameFile(before, now) && now.Mode() == before.Mode() && h == orig.Hash
 		}
 		if err := writeInIf(tree, c.Path, tr, os.FileMode(c.Mode).Perm(), c.Hash, unchanged); err != nil {
 			var ce *conflictError

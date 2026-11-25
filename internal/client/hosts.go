@@ -5,7 +5,9 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -48,7 +50,7 @@ func newRequest(ctx context.Context, h *Host, method, path string, body io.Reade
 	if err != nil {
 		return nil, err
 	}
-	if h.Token != "" {
+	if h.sendsToken(path) {
 		req.Header.Set("Authorization", "Bearer "+h.Token)
 	}
 	req.Header.Set(api.ProtoHeader, fmt.Sprint(api.Proto))
@@ -75,6 +77,7 @@ type Host struct {
 	Status   *api.Status
 	http     *http.Client
 	sock     string // unix socket path for a local runner
+	derived  bool   // Token is runnerToken(URL), not configured
 }
 
 // dialRaw opens a plain connection to the runner (for stream upgrades).
@@ -153,11 +156,31 @@ func clientToken() string {
 	return tok
 }
 
-func newHost(name, url, token string, prio int) *Host {
-	if token == "" && !strings.HasPrefix(url, "unix://") {
-		token = clientToken()
+// runnerToken is this client's token for one runner: derived from the client secret and the
+// runner's URL, so a token that reached some other address is useless at the real runner.
+func runnerToken(url string) string {
+	secret := clientToken()
+	if secret == "" {
+		return ""
 	}
-	h := &Host{Name: name, URL: strings.TrimRight(url, "/"), Token: token, Priority: prio}
+	m := hmac.New(sha256.New, []byte(secret))
+	m.Write([]byte("offload-runner\x00" + url))
+	return hex.EncodeToString(m.Sum(nil))
+}
+
+// sendsToken says whether a request carries the token. A discovery probe of a peer that may not
+// be a runner at all never carries the token this client derived for it.
+func (h *Host) sendsToken(path string) bool {
+	return h.Token != "" && !(h.derived && path == "/v1/status")
+}
+
+func newHost(name, url, token string, prio int) *Host {
+	url = strings.TrimRight(url, "/")
+	derived := false
+	if token == "" && !strings.HasPrefix(url, "unix://") {
+		token, derived = runnerToken(url), true
+	}
+	h := &Host{Name: name, URL: url, Token: token, Priority: prio, derived: derived}
 	if sock, ok := strings.CutPrefix(url, "unix://"); ok {
 		h.URL, h.sock = "http://local", sock
 		h.http = &http.Client{CheckRedirect: noRedirects, Transport: &http.Transport{
@@ -364,7 +387,7 @@ func (h *Host) request(ctx context.Context, method, path string, body io.Reader)
 	if err != nil {
 		return nil, err
 	}
-	if h.Token != "" {
+	if h.sendsToken(path) {
 		req.Header.Set("Authorization", "Bearer "+h.Token)
 	}
 	req.Header.Set(api.ProtoHeader, fmt.Sprint(api.Proto))

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base32"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,7 +51,6 @@ type Server struct {
 	readyImages map[string]bool
 	imageUse    map[string]time.Time
 
-	startedAt time.Time
 	upgrading bool   // a new binary is being swapped in: start nothing
 	retireErr string // set while workloads of another version couldn't be confirmed stopped
 
@@ -72,7 +73,7 @@ func New(cfg *Config, version string) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg: cfg, version: version, self: self, startedAt: time.Now(),
+		cfg: cfg, version: version, self: self,
 		jobs: map[string]*job{}, sessions: map[string]*session{}, slots: map[string][]*slot{},
 		cpuUse: map[int]int{}, wake: make(chan struct{}, 1), whois: map[string]whoisEntry{},
 		builds: map[string]*envBuild{}, buildErrs: map[string]error{}, readyImages: map[string]bool{}, tz: hostTimezone(),
@@ -86,13 +87,25 @@ func New(cfg *Config, version string) (*Server, error) {
 	}
 	s.loadHistory()
 	s.loadImageUse()
-	s.resetCachesIfOld()
 	s.restore()
-	if err := s.retireOtherVersions(); err != nil {
-		log.Printf("retiring old workloads: %v (admitting nothing until this succeeds)", err)
+	if err := s.reconcile(); err != nil {
+		log.Printf("startup: %v (admitting nothing until this succeeds)", err)
 		s.retireErr = err.Error()
 	}
 	return s, nil
+}
+
+// reconcile settles what a previous runner process left behind before any new work starts:
+// orphaned build/bootstrap units first, then the cache layout (which those may be writing), then
+// workloads of another protocol version.
+func (s *Server) reconcile() error {
+	if err := s.stopOrphanBuilds(); err != nil {
+		return err
+	}
+	if err := s.resetCachesIfOld(); err != nil {
+		return err
+	}
+	return s.retireOtherVersions()
 }
 
 func (s *Server) kick() {
@@ -253,11 +266,14 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			writeErr(w, http.StatusForbidden, "not allowed: the runner API does not accept requests from web pages")
 			return
 		}
-		r.Header.Del(firstPairHeader) // only ever set by us, below
+		r.Header.Del(pairByCodeHeader) // only ever set by us, below
+		r.Header.Del(callerTokenHeader)
 		r.Header.Del("X-Offload-Caller")
 		tok, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		next := checkClientProto(next)
 		if tok != "" && s.tokenOK(tok) {
+			sum := sha256.Sum256([]byte(tok))
+			r.Header.Set(callerTokenHeader, hex.EncodeToString(sum[:]))
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -272,9 +288,9 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		switch {
 		case idOK && r.Method == "GET" && r.URL.Path == "/v1/status":
 			next.ServeHTTP(w, r)
-		case idOK && r.Method == "POST" && r.URL.Path == "/v1/admin/pair" && s.noClientPaired() && time.Since(s.startedAt) < pairWindow:
-			r.Header.Set(firstPairHeader, "1") // handlePair re-checks under the lock
-			next.ServeHTTP(w, r)               // first pairing of a fresh runner
+		case idOK && r.Method == "POST" && r.URL.Path == "/v1/admin/pair":
+			r.Header.Set(pairByCodeHeader, "1") // handlePair requires the runner's one-time code
+			next.ServeHTTP(w, r)
 		case idOK:
 			writeErr(w, http.StatusForbidden, "this client isn't paired with the runner: run `offload host pair "+s.cfg.Name+"`")
 		default:
@@ -283,9 +299,81 @@ func (s *Server) auth(next http.Handler) http.Handler {
 	})
 }
 
-// pairWindow is how long after it starts a runner with no paired client accepts its first
-// pairing by tailnet identity alone (restart it to open the window again).
-const pairWindow = 30 * time.Minute
+// removeToken drops the tokens-file line for a token hash (stored hashed or, legacy, raw).
+func (s *Server) removeToken(hash string) error {
+	b, err := os.ReadFile(s.tokensPath())
+	if err != nil {
+		return err
+	}
+	var keep []string
+	for _, line := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(line)
+		h, hashed := strings.CutPrefix(t, "sha256:")
+		if !hashed {
+			sum := sha256.Sum256([]byte(t))
+			h = hex.EncodeToString(sum[:])
+		}
+		if t != "" && h == hash {
+			continue
+		}
+		if t != "" {
+			keep = append(keep, t)
+		}
+	}
+	tmp := s.tokensPath() + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strings.Join(keep, "\n")+"\n"), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.tokensPath())
+}
+
+// consumePairCode checks a one-time pairing code and uses it up. Callers hold s.mu.
+func (s *Server) consumePairCode(code string) error {
+	const help = "pairing this client needs the runner's one-time code: on the runner, run `offload runner pair-code`, then `offload host pair NAME --code CODE` here"
+	b, err := os.ReadFile(s.pairCodePath())
+	if code == "" || err != nil {
+		return errors.New(help)
+	}
+	f := strings.Fields(string(b)) // "<sha256 hex> <unix expiry>"
+	if len(f) != 2 {
+		return errors.New(help)
+	}
+	exp, _ := strconv.ParseInt(f[1], 10, 64)
+	sum := sha256.Sum256([]byte(strings.TrimSpace(code)))
+	if time.Now().Unix() > exp {
+		_ = os.Remove(s.pairCodePath())
+		return errors.New("the pairing code expired; " + help)
+	}
+	if subtle.ConstantTimeCompare([]byte(f[0]), []byte(hex.EncodeToString(sum[:]))) != 1 {
+		// One guess per code: a wrong one burns it, so it can't be brute-forced.
+		_ = os.Remove(s.pairCodePath())
+		return errors.New("wrong pairing code (it is now used up); " + help)
+	}
+	return os.Remove(s.pairCodePath())
+}
+
+// NewPairCode makes a fresh one-time pairing code for the runner whose tokens file is
+// tokensFile ("" for the default), valid for a day, and returns it.
+func NewPairCode(tokensFile string) (string, error) {
+	if tokensFile == "" {
+		tokensFile = filepath.Join(filepath.Dir(DefaultConfigPath()), "tokens")
+	}
+	buf := make([]byte, 10)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	code := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf))
+	sum := sha256.Sum256([]byte(code))
+	dir := filepath.Dir(tokensFile)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	line := fmt.Sprintf("%s %d\n", hex.EncodeToString(sum[:]), time.Now().Add(24*time.Hour).Unix())
+	if err := os.WriteFile(filepath.Join(dir, "pair-code"), []byte(line), 0o600); err != nil {
+		return "", err
+	}
+	return code, nil
+}
 
 // checkClientProto refuses requests from clients of another protocol version, except the ones
 // that bring versions back in step (status, pairing, binary upgrades).
@@ -314,16 +402,14 @@ func (s *Server) tokensPath() string {
 	return filepath.Join(filepath.Dir(DefaultConfigPath()), "tokens")
 }
 
-const firstPairHeader = "X-Offload-First-Pair"
+const pairByCodeHeader = "X-Offload-Pair-By-Code"
 
-// noClientPaired reports whether no client is paired yet: the tokens file is missing or empty
-// (an unreadable file counts as paired, so an error never reopens first pairing).
-func (s *Server) noClientPaired() bool {
-	_, err := os.Stat(s.tokensPath())
-	if errors.Is(err, os.ErrNotExist) {
-		return true
-	}
-	return err == nil && len(s.pairedTokens()) == 0
+// callerTokenHeader carries the sha256 of the token a request authenticated with (set by auth).
+const callerTokenHeader = "X-Offload-Caller-Token"
+
+// pairCodePath holds the hash of the runner's one-time pairing code (see NewPairCode).
+func (s *Server) pairCodePath() string {
+	return filepath.Join(filepath.Dir(s.tokensPath()), "pair-code")
 }
 
 func (s *Server) pairedTokens() []string {
@@ -340,11 +426,15 @@ func (s *Server) pairedTokens() []string {
 	return out
 }
 
-// handlePair adds a client's token hash. A fresh runner accepts the first pairing from an
-// allowed tailnet identity; after that only an already paired client can pair another.
+// handlePair adds a client's token hash. A paired client (or the local socket) may pair another;
+// anyone else needs the runner's one-time pairing code, which only someone on the runner itself
+// can read (`offload runner pair-code`). Tailnet identity alone never pairs: jobs on other
+// runners share it.
 func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Hash string `json:"hash"`
+		Hash   string `json:"hash"`
+		Code   string `json:"code"`
+		Rotate bool   `json:"rotate"` // replace the token this request authenticated with
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || len(req.Hash) != 64 {
 		writeErr(w, 400, "want {\"hash\": \"<sha256 hex of the client token>\"}")
@@ -356,32 +446,43 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if r.Header.Get(firstPairHeader) == "1" && !s.noClientPaired() {
-		writeErr(w, http.StatusForbidden, "another client paired first: pair from it (`offload host pair "+s.cfg.Name+"`)")
-		return
-	}
-	for _, line := range s.pairedTokens() {
-		if line == "sha256:"+req.Hash {
-			writeJSON(w, map[string]string{"status": "already paired"})
+	if r.Header.Get(pairByCodeHeader) == "1" {
+		if err := s.consumePairCode(req.Code); err != nil {
+			writeErr(w, http.StatusForbidden, err.Error())
 			return
 		}
 	}
-	_ = os.MkdirAll(filepath.Dir(s.tokensPath()), 0o700)
-	f, err := os.OpenFile(s.tokensPath(), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
+	status := "paired"
+	for _, line := range s.pairedTokens() {
+		if line == "sha256:"+req.Hash {
+			status = "already paired"
+		}
 	}
-	_, err = fmt.Fprintf(f, "sha256:%s\n", req.Hash)
-	if cerr := f.Close(); err == nil {
-		err = cerr
+	if status == "paired" {
+		_ = os.MkdirAll(filepath.Dir(s.tokensPath()), 0o700)
+		f, err := os.OpenFile(s.tokensPath(), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		_, err = fmt.Fprintf(f, "sha256:%s\n", req.Hash)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 	}
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
+	if old := r.Header.Get(callerTokenHeader); req.Rotate && old != "" && old != req.Hash {
+		if err := s.removeToken(old); err != nil {
+			writeErr(w, 500, "paired, but the old token is still valid: "+err.Error())
+			return
+		}
+		status += "; old token retired"
 	}
-	log.Printf("paired a client (%s)", r.Header.Get("X-Offload-Caller"))
-	writeJSON(w, map[string]string{"status": "paired"})
+	log.Printf("pair request from %s: %s", r.Header.Get("X-Offload-Caller"), status)
+	writeJSON(w, map[string]string{"status": status})
 }
 
 func (s *Server) tokenOK(tok string) bool {
@@ -461,15 +562,18 @@ func (s *Server) loop(ctx context.Context) {
 			s.mu.Unlock()
 			if failed {
 				lastRetire = time.Now()
-				err := s.retireOtherVersions()
+				err := s.reconcile()
 				s.mu.Lock()
 				if err != nil {
 					s.retireErr = err.Error()
 				} else {
 					s.retireErr = ""
-					log.Printf("old workloads retired; admitting work")
+					log.Printf("startup reconciliation done; admitting work")
 				}
 				s.mu.Unlock()
+				if err == nil {
+					go s.prebuildBase()
+				}
 			}
 		}
 		s.reapUploads()
@@ -542,7 +646,7 @@ func (s *Server) status() api.Status {
 		st.Accepting, st.Reason = false, "host memory below reserve"
 	}
 	if s.retireErr != "" {
-		st.Accepting, st.Reason = false, "workloads of an older version still running: "+s.retireErr
+		st.Accepting, st.Reason = false, "not ready: "+s.retireErr
 	}
 	if s.upgrading {
 		st.Accepting, st.Reason = false, "upgrading"
@@ -611,56 +715,53 @@ func (s *Server) releaseCPUsLocked(cpus []int) {
 }
 
 func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
+	// Receive and check the candidate first, with an idle deadline and a total one: a stalled
+	// upload must never hold admission.
+	f, err := os.CreateTemp(filepath.Dir(s.self), ".offload-upgrade-*")
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // a no-op once renamed into place
+	deadline := time.Now().Add(10 * time.Minute)
+	_, err = f.ReadFrom(uploadBody(w, r, 512<<20, func() bool { return time.Now().After(deadline) }))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(tmp, 0o755)
+	}
+	proto := 0
+	if err == nil {
+		proto, err = checkBinary(tmp)
+	}
+	if err != nil {
+		writeErr(w, 400, "upgrade: "+err.Error())
+		return
+	}
+	// Then, briefly: no new work starts between the compatibility check and the restart.
 	s.mu.Lock()
 	if s.upgrading {
 		s.mu.Unlock()
 		writeErr(w, 503, "an upgrade is already in progress")
 		return
 	}
-	s.upgrading = true // no new work starts until the new binary takes over (or this fails)
-	s.mu.Unlock()
-	done := false
-	defer func() {
-		if !done {
-			s.mu.Lock()
-			s.upgrading = false
-			s.mu.Unlock()
-			s.kick()
-		}
-	}()
-	tmp := s.self + ".new"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	_, err = f.ReadFrom(http.MaxBytesReader(w, r.Body, 512<<20))
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	proto := 0
-	if err == nil {
-		proto, err = checkBinary(tmp)
-	}
-	if err == nil && proto != api.Proto && r.URL.Query().Get("force") != "1" {
-		// The new version would stop every workload this one started: only when none run, or
-		// when asked to.
-		s.mu.Lock()
-		busy := s.allocatedBusyLocked()
+	if busy := s.allocatedBusyLocked(); proto != api.Proto && busy > 0 && r.URL.Query().Get("force") != "1" {
 		s.mu.Unlock()
-		if busy > 0 {
-			err = fmt.Errorf("the new binary speaks protocol %d (this one %d) and would stop %d running job(s)/session(s); retry when idle, or with --force", proto, api.Proto, busy)
-		}
-	}
-	if err == nil {
-		err = os.Rename(tmp, s.self)
-	}
-	if err != nil {
-		_ = os.Remove(tmp)
-		writeErr(w, 400, "upgrade: "+err.Error())
+		writeErr(w, 400, fmt.Sprintf("upgrade: the new binary speaks protocol %d (this one %d) and would stop %d running job(s)/session(s); retry when idle, or with --force", proto, api.Proto, busy))
 		return
 	}
-	done = true
+	s.upgrading = true
+	s.mu.Unlock()
+	if err := os.Rename(tmp, s.self); err != nil {
+		s.mu.Lock()
+		s.upgrading = false
+		s.mu.Unlock()
+		s.kick()
+		writeErr(w, 500, "upgrade: "+err.Error())
+		return
+	}
 	writeJSON(w, map[string]string{"status": "upgraded; restarting"})
 	log.Printf("binary replaced; exiting so systemd restarts the new version")
 	go func() { time.Sleep(300 * time.Millisecond); os.Exit(0) }()

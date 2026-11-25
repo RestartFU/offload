@@ -12,8 +12,8 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
 ```
 
 - **No SSH.** Runners listen on their tailnet addresses only. The laptop pairs with each runner
-  once (`offload host pair`) and then authenticates with its client token; tailnet identity
-  alone only discovers runners.
+  once (`offload host pair NAME --code C`) and then authenticates with a token of its own for
+  that runner; tailnet identity alone only discovers runners.
 - **Discovery.** The client probes online tailnet peers on port 7420 and keeps the ones that answer.
 - **Sliced, not exclusive.** Every job asks for a guaranteed CPU share, a burst ceiling and a
   hard memory limit. Jobs are packed onto runners and queue when nothing fits. Tools see their
@@ -77,9 +77,8 @@ sudo dnf install podman   # or apt: rootless podman for container jobs (optional
 systemctl --user daemon-reexec && systemctl --user restart offload-runner
 ```
 
-Then, from the laptop and within 30 minutes of the runner starting, pair with it:
-`offload host pair <name>` (the first pairing only needs your tailnet login; later clients pair
-from an already paired one). After that, upgrades come from the laptop with
+`runner install` ends by printing a one-time pairing code (valid a day; `offload runner
+pair-code` prints a new one). On the laptop: `offload host pair <name> --code <code>`. After that, upgrades come from the laptop with
 `offload host upgrade <name>`.
 
 The config lives in `~/.config/offload/runner.toml` and holds capacity, reserve, storage and

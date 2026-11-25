@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -117,8 +118,21 @@ func usesContext(cf string) bool {
 			}
 		case "RUN":
 			for _, w := range flags {
-				if strings.HasPrefix(w, "--mount=") && !strings.Contains(w, "from=") &&
-					(strings.Contains(w, "type=bind") || !strings.Contains(w, "type=")) { // bind is the default type
+				opts, ok := strings.CutPrefix(w, "--mount=")
+				if !ok {
+					continue
+				}
+				typ, from := "bind", false // bind is the default type
+				for _, kv := range strings.Split(opts, ",") {
+					k, v, _ := strings.Cut(kv, "=")
+					switch strings.TrimSpace(k) {
+					case "type":
+						typ = v
+					case "from":
+						from = true
+					}
+				}
+				if typ == "bind" && !from {
 					return true
 				}
 			}
@@ -423,22 +437,59 @@ var toolchainDirs = map[string]string{"rustup": "/opt/offload/rustup", "cargo-bi
 
 // cacheLayout versions the cache directory layout. Older layouts mounted toolchains writable into
 // jobs, so on a change everything is wiped once and the bootstrap reinstalls it from scratch.
-const cacheLayout = "2"
+const cacheLayout = "3"
 
 func (s *Server) cacheDir(parts ...string) string {
 	return filepath.Join(append([]string{s.cfg.StateDir, "cache"}, parts...)...)
 }
 
 // resetCachesIfOld wipes caches from an older layout (they may have been tampered with).
-func (s *Server) resetCachesIfOld() {
+func (s *Server) resetCachesIfOld() error {
 	marker := s.cacheDir(".layout")
 	if b, err := os.ReadFile(marker); err == nil && strings.TrimSpace(string(b)) == cacheLayout {
-		return
+		return nil
 	}
 	log.Printf("cache layout changed: wiping shared toolchains and caches (the bootstrap reinstalls them)")
-	_ = removeAll(s.cacheDir())
-	_ = os.MkdirAll(s.cacheDir(), 0o755)
-	_ = os.WriteFile(marker, []byte(cacheLayout+"\n"), 0o644)
+	if err := removeAll(s.cacheDir()); err != nil {
+		return fmt.Errorf("wiping old caches: %w", err)
+	}
+	if err := os.MkdirAll(s.cacheDir(), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(marker, []byte(cacheLayout+"\n"), 0o644)
+}
+
+// stopOrphanBuilds stops build and bootstrap units a previous runner process started in our
+// slice: nothing waits for them any more, and a bootstrap still writing the toolchain volumes
+// must be gone before anything else touches them.
+func (s *Server) stopOrphanBuilds() error {
+	out, err := systemctl(context.Background(), "list-units", "--all", "--plain", "--no-legend", "--type=service",
+		"offload-build-*", "offload-bootstrap-*")
+	if err != nil {
+		return fmt.Errorf("listing build units: %v: %s", err, out)
+	}
+	var problems []string
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		unit := f[0]
+		if slice, _ := systemctl(context.Background(), "show", "-p", "Slice", "--value", unit); slice != s.cfg.Slice {
+			continue // another runner's (a dev runner uses its own slice)
+		}
+		if active, known := unitActive(unit); known && !active {
+			continue
+		}
+		log.Printf("stopping %s: left over from a previous runner process", unit)
+		if err := stopUnitConfirmed(unit); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
+	if len(problems) > 0 {
+		return errors.New(strings.Join(problems, "; "))
+	}
+	return nil
 }
 
 // cacheMounts are the toolchain volumes for the runner's bootstrap step, which installs them:
@@ -456,20 +507,18 @@ func (s *Server) cacheMounts() []string {
 // build caches (cargo registry and git checkouts, Go modules and build cache) are writable, so
 // they are scoped: workloads of the same repository share them (as they already share target/),
 // other repositories never do. CARGO_HOME itself is not shared, so a job's cargo config or
-// credentials never reach another. npm's cache is shared: it verifies content on every read.
-// scope "" (no workspace) gets no persistent caches at all.
+// credentials never reach another. npm's cache holds runnable tool trees (npx), so it is scoped
+// too. scope "" (no workspace) gets no persistent caches at all.
 func (s *Server) workloadMounts(scope string) []string {
 	var out []string
 	for name, dst := range toolchainDirs {
 		_ = os.MkdirAll(s.cacheDir(name), 0o755)
 		out = append(out, s.cacheDir(name)+":"+dst+":ro")
 	}
-	_ = os.MkdirAll(s.cacheDir("npm"), 0o755)
-	out = append(out, s.cacheDir("npm")+":/opt/offload/npm")
 	if scope != "" && validKey(scope) {
 		for name, dst := range map[string]string{
 			"cargo-registry": "/opt/offload/cargo/registry", "cargo-git": "/opt/offload/cargo/git",
-			"go-mod": "/opt/offload/go/pkg/mod", "go-build": "/opt/offload/go/cache",
+			"go-mod": "/opt/offload/go/pkg/mod", "go-build": "/opt/offload/go/cache", "npm": "/opt/offload/npm",
 		} {
 			dir := s.cacheDir("scoped", scope, name)
 			_ = os.MkdirAll(dir, 0o755)
@@ -542,6 +591,12 @@ func (s *Server) copyBuildLog(b *envBuild) int {
 
 // prebuildBase builds the base image in the background at startup so the first job doesn't wait.
 func (s *Server) prebuildBase() {
+	s.mu.Lock()
+	blocked := s.retireErr != ""
+	s.mu.Unlock()
+	if blocked {
+		return // started again once startup reconciliation succeeds
+	}
 	if !s.containersAvailable() || (imageExists(baseTag()) && s.bootstrapped(baseTag())) {
 		s.mu.Lock()
 		s.readyImages[baseTag()] = s.containersAvailable()

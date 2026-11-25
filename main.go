@@ -81,7 +81,7 @@ Client:
 Secrets can also come from the environment (e.g. an MCP entry's "env"):
   OFFLOAD_SECRET_<NAME>=<source>   OFFLOAD_SECRET_FILE_<NAME>=<path>   OFFLOAD_WITH=set1,set2
   offload host upgrade NAME|--all [--binary PATH]   push this (or a matching) binary to runners
-  offload host pair NAME|--all       let this client use a runner (once per runner)
+  offload host pair NAME [--code C]  let this client use a runner (C from "offload runner pair-code" on it)
 
 Environments (jobs run in containers; agents are root inside and can install anything):
   offload env show [--environment N]            the environment a job here would use
@@ -95,6 +95,7 @@ Runner (on the server):
   offload runner install [--name N] [--profiles] config, profiles, systemd user units
   sudo offload runner install-system --user U    linger, cgroup delegation, keep-alive, firewall
   offload runner serve [--config PATH]           the daemon (run by systemd)
+  offload runner pair-code                       print a one-time code for "offload host pair"
 
 Other:
   offload hook claude                Claude Code PreToolUse guard
@@ -277,10 +278,24 @@ func cmdMCP(args []string) error {
 
 func cmdHost(args []string) error {
 	if len(args) >= 1 && args[0] == "pair" {
-		fs := flag.NewFlagSet("pair", flag.ExitOnError)
-		all := fs.Bool("all", false, "pair with every runner")
-		_ = fs.Parse(args[1:])
-		return client.Pair(fs.Args(), *all)
+		var names []string
+		all, code := false, ""
+		for i := 1; i < len(args); i++ { // flags may follow the name: `host pair vps --code X`
+			switch a := args[i]; {
+			case a == "--all" || a == "-all":
+				all = true
+			case (a == "--code" || a == "-code") && i+1 < len(args):
+				i++
+				code = args[i]
+			case strings.HasPrefix(a, "--code="):
+				code = strings.TrimPrefix(a, "--code=")
+			case strings.HasPrefix(a, "-"):
+				die("usage: offload host pair NAME... [--code CODE] | --all")
+			default:
+				names = append(names, a)
+			}
+		}
+		return client.Pair(names, all, code)
 	}
 	if len(args) < 1 || args[0] != "upgrade" {
 		die("usage: offload host upgrade|pair NAME...|--all")
@@ -320,7 +335,7 @@ func cmdEnv(args []string) (int, error) {
 
 func cmdRunner(args []string) (int, error) {
 	if len(args) < 1 {
-		die("usage: offload runner serve|install|install-system")
+		die("usage: offload runner serve|install|install-system|pair-code")
 	}
 	switch args[0] {
 	case "serve":
@@ -339,6 +354,17 @@ func cmdRunner(args []string) (int, error) {
 		defer stop()
 		log.Printf("offload runner %s (%s) starting", cfg.Name, versionString())
 		return 0, s.Serve(ctx)
+	case "pair-code":
+		cfg, err := runner.LoadConfig(runner.DefaultConfigPath())
+		if err != nil {
+			return 1, err
+		}
+		code, err := runner.NewPairCode(cfg.TokensFile)
+		if err != nil {
+			return 1, err
+		}
+		fmt.Printf("pairing code (one use, valid 24h): %s\non the laptop: offload host pair %s --code %s\n", code, cfg.Name, code)
+		return 0, nil
 	case "install":
 		fs := flag.NewFlagSet("install", flag.ExitOnError)
 		name := fs.String("name", "", "runner name (default: hostname)")
@@ -398,6 +424,6 @@ func cmdRunner(args []string) (int, error) {
 		}
 		return runner.RunPipe(*dir, *sock, *secrets, rest), nil
 	}
-	die("usage: offload runner serve|install|install-system")
+	die("usage: offload runner serve|install|install-system|pair-code")
 	return 2, nil
 }

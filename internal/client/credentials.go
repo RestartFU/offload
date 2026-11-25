@@ -112,7 +112,7 @@ func resolveValue(src string) (string, error) {
 	case strings.HasPrefix(src, "cmd:"):
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		out, err := groupCommand(ctx, "sh", "-c", strings.TrimPrefix(src, "cmd:")).Output()
+		out, err := groupOutput(groupCommand(ctx, "sh", "-c", strings.TrimPrefix(src, "cmd:")))
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", strings.TrimPrefix(src, "cmd:"), err)
 		}
@@ -443,6 +443,16 @@ func groupCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
 	return cmd
 }
 
+// groupOutput runs a groupCommand and then kills whatever is left of its process group, so a
+// helper that backgrounded a worker can't leave it running here.
+func groupOutput(cmd *exec.Cmd) ([]byte, error) {
+	out, err := cmd.Output()
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	return out, err
+}
+
 // gitCredentialFill asks this machine's git for a credential, never prompting.
 func gitCredentialFill(ctx context.Context, req []byte) []byte {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -456,7 +466,7 @@ func gitCredentialFill(ctx context.Context, req []byte) []byte {
 		}
 	}
 	cmd.Env = append(env, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
-	out, err := cmd.Output()
+	out, err := groupOutput(cmd)
 	if err != nil || credentialField(out, "password") == "" {
 		return nil // nothing usable; never lend an empty login
 	}

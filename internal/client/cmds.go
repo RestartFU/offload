@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -200,7 +201,8 @@ func Upgrade(names []string, all bool, binary string, force bool) error {
 		}
 		// A runner of another protocol version stops workloads started by its old version when it
 		// restarts: say so before doing it.
-		if busy := h.Status.Running + h.Status.Sessions; busy > 0 && h.Status.Proto != api.Proto && !force {
+		// For this binary we know the protocol; a --binary candidate is checked by the runner.
+		if busy := h.Status.Running + h.Status.Sessions; binary == "" && busy > 0 && h.Status.Proto != api.Proto && !force {
 			return fmt.Errorf("%s has %d running job(s)/session(s) that the upgrade would stop (protocol %d -> %d); wait, or pass --force", h.Name, busy, h.Status.Proto, api.Proto)
 		}
 		f, err := os.Open(self)
@@ -221,9 +223,10 @@ func Upgrade(names []string, all bool, binary string, force bool) error {
 	return nil
 }
 
-// Pair registers this client's token with runners (the first pairing of a fresh runner only needs
-// your tailnet identity; later ones need an already paired client).
-func Pair(names []string, all bool) error {
+// Pair registers this client's token for each runner. A runner that hasn't paired this client
+// yet wants its one-time code (`offload runner pair-code` on it); re-pairing a paired runner
+// needs none.
+func Pair(names []string, all bool, code string) error {
 	ctx := context.Background()
 	hosts, err := discover(ctx)
 	if err != nil {
@@ -243,10 +246,28 @@ func Pair(names []string, all bool) error {
 	if len(targets) == 0 {
 		return fmt.Errorf("name a runner or pass --all")
 	}
-	sum := sha256.Sum256([]byte(clientToken()))
+	if code != "" && len(targets) > 1 {
+		return fmt.Errorf("a pairing code belongs to one runner: name it")
+	}
 	for _, h := range targets {
+		if h.Token == "" {
+			fmt.Printf("%s: local, nothing to pair\n", h.Name)
+			continue
+		}
+		sum := sha256.Sum256([]byte(h.Token))
+		body := map[string]any{"hash": hex.EncodeToString(sum[:]), "code": code}
 		var out map[string]string
-		if err := h.do(ctx, "POST", "/v1/admin/pair", map[string]string{"hash": hex.EncodeToString(sum[:])}, &out); err != nil {
+		err := h.do(ctx, "POST", "/v1/admin/pair", body, &out)
+		var ae *APIError
+		if errors.As(err, &ae) && ae.Code == 403 && h.derived {
+			// Paired before per-runner tokens: authenticate once with the old shared token, which
+			// the runner then forgets.
+			legacy := *h
+			legacy.Token, legacy.derived = clientToken(), false
+			body["rotate"] = true
+			err = legacy.do(ctx, "POST", "/v1/admin/pair", body, &out)
+		}
+		if err != nil {
 			return fmt.Errorf("%s: %w", h.Name, err)
 		}
 		fmt.Printf("%s: %s\n", h.Name, out["status"])

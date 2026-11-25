@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,11 +54,29 @@ func dnsSearch() []string {
 
 var tailnetRanges = []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("fd7a:115c:a1e0::/48")}
 
-// blockedTarget refuses connections a job must never make with this machine's identity: any
-// runner's API (the tailnet runner port, or a configured runner URL), which would otherwise accept
-// the job as the user who owns this laptop. Everything else goes through.
-func blockedTarget(target string, cfg *Config) string {
+// splitTarget splits host:port with the port parsed as the dialer will read it, so checks and
+// dials always agree on the endpoint.
+func splitTarget(target string) (string, string, error) {
 	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return "", "", err
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || host == "" {
+		return "", "", fmt.Errorf("bad address %q", target)
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		host = ip.Unmap().WithZone("").String()
+	}
+	return host, strconv.FormatUint(n, 10), nil
+}
+
+// blockedTarget refuses connections a job must never make with this machine's identity: any
+// runner's API (the tailnet runner port, or a configured runner URL). Runners don't accept this
+// machine's tailnet identity for anything but discovery, so this is defense in depth. Everything
+// else goes through. target must be a resolved IP address and port.
+func blockedTarget(target string, cfg *Config) string {
+	host, port, err := splitTarget(target)
 	if err != nil {
 		return "bad address"
 	}
@@ -66,21 +85,14 @@ func blockedTarget(target string, cfg *Config) string {
 		runnerPort = fmt.Sprint(cfg.Port)
 	}
 	if ip, err := netip.ParseAddr(host); err == nil && port == runnerPort {
-		ip = ip.Unmap()
 		for _, p := range tailnetRanges {
 			if p.Contains(ip) {
 				return "refused: jobs can't reach offload runners through this machine"
 			}
 		}
 	}
-	if cfg != nil && len(cfg.Hosts) > 0 {
-		norm := target
-		if ip, err := netip.ParseAddr(host); err == nil {
-			norm = net.JoinHostPort(ip.Unmap().String(), port)
-		}
-		if configuredRunnerAddrs(cfg)[norm] {
-			return "refused: jobs can't reach offload runners through this machine"
-		}
+	if cfg != nil && len(cfg.Hosts) > 0 && configuredRunnerAddrs(cfg)[net.JoinHostPort(host, port)] {
+		return "refused: jobs can't reach offload runners through this machine"
 	}
 	return ""
 }
@@ -88,21 +100,20 @@ func blockedTarget(target string, cfg *Config) string {
 // resolveTarget resolves a destination here and checks every address it has, so a name can't
 // smuggle a dial to a runner past blockedTarget. It returns the checked address to dial.
 func resolveTarget(ctx context.Context, target string, cfg *Config) (string, string) {
-	if why := blockedTarget(target, cfg); why != "" {
-		return "", why
-	}
-	host, port, err := net.SplitHostPort(target)
+	host, port, err := splitTarget(target)
 	if err != nil {
 		return "", "bad address"
 	}
-	if _, err := netip.ParseAddr(host); err == nil {
-		return target, ""
-	}
-	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	ips, err := net.DefaultResolver.LookupNetIP(rctx, "ip", host)
-	if err != nil || len(ips) == 0 {
-		return "", fmt.Sprintf("can't resolve %s: %v", host, err)
+	var ips []netip.Addr
+	if ip, err := netip.ParseAddr(host); err == nil {
+		ips = []netip.Addr{ip}
+	} else {
+		rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		ips, err = net.DefaultResolver.LookupNetIP(rctx, "ip", host)
+		cancel()
+		if err != nil || len(ips) == 0 {
+			return "", fmt.Sprintf("can't resolve %s: %v", host, err)
+		}
 	}
 	for _, ip := range ips {
 		if why := blockedTarget(net.JoinHostPort(ip.Unmap().String(), port), cfg); why != "" {
@@ -137,6 +148,9 @@ func configuredRunnerAddrs(cfg *Config) map[string]bool {
 			if port == "" {
 				port = "80"
 			}
+		}
+		if n, err := strconv.ParseUint(port, 10, 16); err == nil {
+			port = strconv.FormatUint(n, 10)
 		}
 		set[net.JoinHostPort(host, port)] = true
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

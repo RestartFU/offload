@@ -70,7 +70,8 @@ func (sl *slot) planData(manifest []api.FileEntry) (needed []string, changed boo
 			needed = append(needed, p) // deleted on the runner: restore it
 		}
 	}
-	return needed, changed || len(needed) > 0, nil
+	// An interrupted apply may have left any marked path half-done: apply again to repair it.
+	return needed, changed || len(needed) > 0 || len(rec.Dirty) > 0, nil
 }
 
 func (s *Server) handleDataPlan(w http.ResponseWriter, r *http.Request) {

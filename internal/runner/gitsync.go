@@ -44,6 +44,9 @@ func gitCmdCtx(ctx context.Context, dir string, args ...string) (string, error) 
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1")
 	out, err := cmd.CombinedOutput()
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // leftovers of the group
+	}
 	if err != nil {
 		return "", fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
@@ -101,19 +104,19 @@ func (s *Server) gitReceive(ctx context.Context, key, head, bundle string) error
 	if _, err := gitCmdCtx(ctx, shared, "cat-file", "-e", head+"^{commit}"); err != nil {
 		return fmt.Errorf("bundle did not contain %s", head)
 	}
-	s.pruneGitRefs(shared)
+	s.pruneGitRefs(ctx, shared)
 	return nil
 }
 
 // pruneGitRefs keeps the 64 newest pinned commits (they are what we advertise as "have").
-func (s *Server) pruneGitRefs(shared string) {
-	out, err := gitCmd(shared, "for-each-ref", "--sort=-committerdate", "--format=%(refname)", "refs/offload/")
+func (s *Server) pruneGitRefs(ctx context.Context, shared string) {
+	out, err := gitCmdCtx(ctx, shared, "for-each-ref", "--sort=-committerdate", "--format=%(refname)", "refs/offload/")
 	if err != nil {
 		return
 	}
 	refs := strings.Split(out, "\n")
 	for i := 64; i < len(refs); i++ {
-		_, _ = gitCmd(shared, "update-ref", "-d", refs[i])
+		_, _ = gitCmdCtx(ctx, shared, "update-ref", "-d", refs[i])
 	}
 }
 

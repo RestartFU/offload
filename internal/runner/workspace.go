@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -262,12 +263,30 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 			return fmt.Errorf("upload is missing %q", p)
 		}
 	}
-	// Record what is about to change before changing it, so a crash between the renames and the
-	// final save leaves those files marked untrusted rather than described by stale metadata.
+	// Record everything about to change (new content, symlinks, modes, deletions) before changing
+	// it, so a crash before the final save leaves those paths marked untrusted rather than
+	// described by stale metadata. Paths an earlier interrupted apply marked stay marked.
+	dirtyBefore := rec.dirtySet()
+	dirty := rec.dirtySet()
 	for p := range staged {
+		dirty[p] = true
+	}
+	for p, e := range want {
+		if old, had := rec.Files[p]; !had || old.Link != e.Link || old.Mode != e.Mode {
+			dirty[p] = true
+		}
+	}
+	for p := range rec.Files {
+		if _, ok := want[p]; !ok {
+			dirty[p] = true
+		}
+	}
+	rec.Dirty = rec.Dirty[:0]
+	for p := range dirty {
 		rec.Dirty = append(rec.Dirty, p)
 	}
-	if len(staged) > 0 {
+	sort.Strings(rec.Dirty)
+	if len(rec.Dirty) > 0 {
 		if err := s.save(rec); err != nil {
 			return err
 		}
@@ -301,7 +320,7 @@ func (s *slot) applyMode(manifest []api.FileEntry, needed []string, upload io.Re
 	}
 	for _, e := range manifest {
 		old, had := rec.Files[e.Path]
-		if keepRunner && had && !written[e.Path] && old.Link == e.Link && (e.Link != "" || (old.Hash == e.Hash && old.Mode == e.Mode)) {
+		if keepRunner && had && !written[e.Path] && !dirtyBefore[e.Path] && old.Link == e.Link && (e.Link != "" || (old.Hash == e.Hash && old.Mode == e.Mode)) {
 			continue // unchanged on the client: leave the runner's copy alone
 		}
 		if err := prepareParents(root, e.Path); err != nil {

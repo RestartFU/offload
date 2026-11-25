@@ -159,9 +159,18 @@ func dataFiles(cfg DataSetConfig) (string, []string, error) {
 		return false
 	}
 	var files []string
+	// The manifest is complete or not sent at all: a file left out of it is deleted on the
+	// runner, so an unreadable directory or a missing (unmounted) root aborts the sync.
+	if fi, err := os.Stat(root); err != nil || !fi.IsDir() {
+		return "", nil, fmt.Errorf("%s is not a readable directory: %v", root, err)
+	}
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			if errors.Is(err, fs.ErrNotExist) && p != root {
+				return nil // deleted while we walked: gone on the runner too
+			}
+			rel, _ := filepath.Rel(root, p)
+			return fmt.Errorf("can't read %s (exclude it if it doesn't belong in the data set): %w", filepath.ToSlash(rel), err)
 		}
 		rel, _ := filepath.Rel(root, p)
 		rel = filepath.ToSlash(rel)

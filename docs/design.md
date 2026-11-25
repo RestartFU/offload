@@ -10,9 +10,12 @@
 - **Auth is a paired client token, not tailnet identity.** Runners are devices of the same
   tailnet user, and so are their jobs' network connections: a WhoIs match can't tell the laptop
   from a job on another runner. So the API wants a bearer token whose hash is in the runner's
-  `tokens` file (`offload host pair`). An allowed WhoIs identity (`allow_users`, `allow_tags`)
-  may only read `/v1/status` and, while no client is paired and within 30 minutes of the
-  runner's start, pair the first client. The local unix socket needs nothing.
+  `tokens` file. An allowed WhoIs identity (`allow_users`, `allow_tags`) may only read
+  `/v1/status`; pairing needs a paired client or a one-time code that only someone on the
+  runner can read (`offload runner pair-code`; a wrong guess burns it). The local unix socket
+  needs nothing. Each runner gets its own token, an HMAC of the client secret and the runner's
+  URL, and discovery probes carry none: a peer that only pretends to be a runner learns nothing
+  usable elsewhere.
 - **One protocol version at a time.** Clients send `X-Offload-Proto`; runners refuse other
   versions except for status, pairing and upgrades. A runner of a new version stops workloads
   the old one started (their mounts and sockets differ) and admits nothing until it has
@@ -104,7 +107,8 @@ image's `/etc/offload/bootstrap.sh` runs once against the toolchain volumes (als
 to install or repair rustup and the cargo/Go bin directories. Only the runner's own base image
 ever writes them; jobs see them read-only, because one job's planted binary would otherwise run
 in every later job. Dependency and build caches (cargo registry and git, Go modules and build
-cache) are writable and therefore scoped per repository, and `CARGO_HOME` itself stays in the
+cache, npm's cache with its runnable `npx` trees) are writable and therefore scoped per
+repository, and `CARGO_HOME` itself stays in the
 container, so cargo config and credentials never carry over. The cache dir records its layout
 version; an older layout is wiped once. Workspace slots
 are keyed by repo plus environment base (`<key>--b<base>`), so a different base never reuses

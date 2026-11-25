@@ -633,12 +633,22 @@ func CredentialHelper(op string, in io.Reader, out io.Writer) int {
 	client := &http.Client{Timeout: 90 * time.Second, Transport: &http.Transport{
 		Dial: func(_, _ string) (net.Conn, error) { return net.Dial("unix", sock) },
 	}}
-	resp, err := client.Post("http://local/v1/jobs/"+id+"/credential", "text/plain", in)
+	req, err := http.NewRequest("POST", "http://local/v1/jobs/"+id+"/credential", in)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set(api.ProtoHeader, fmt.Sprint(api.Proto)) // host jobs reach the main socket
+	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "offload credential: %v\n", err)
 		return 0
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != 200 && resp.StatusCode != 204 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		fmt.Fprintf(os.Stderr, "offload credential: %s: %s\n", resp.Status, strings.TrimSpace(string(b)))
+	}
 	if resp.StatusCode == 200 {
 		b, _ := io.ReadAll(resp.Body)
 		// Only pass through credential fields; never let the answer set other helper options.

@@ -44,7 +44,7 @@ func LoadEnvDef(root, named string) (*api.EnvDef, error) {
 	if root == "" {
 		return nil, nil
 	}
-	if b, err := os.ReadFile(filepath.Join(root, repoContainerfile)); err == nil {
+	if b, err := readWorkspaceFile(root, repoContainerfile); err == nil {
 		return &api.EnvDef{Name: repoContainerfile, Containerfile: string(b), ContextDir: ".", Devices: devicesFrom(string(b))}, nil
 	}
 	return loadDevcontainer(root)
@@ -65,7 +65,7 @@ func devicesFrom(cf string) []string {
 // image, build.dockerfile/context, containerEnv and --device runArgs. Features are not supported.
 func loadDevcontainer(root string) (*api.EnvDef, error) {
 	for _, rel := range []string{".devcontainer/devcontainer.json", ".devcontainer.json"} {
-		b, err := os.ReadFile(filepath.Join(root, rel))
+		b, err := readWorkspaceFile(root, rel)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
@@ -100,7 +100,7 @@ func loadDevcontainer(root string) (*api.EnvDef, error) {
 		base := filepath.Dir(rel)
 		switch {
 		case dockerfile != "":
-			cf, err := os.ReadFile(filepath.Join(root, base, dockerfile))
+			cf, err := readWorkspaceFile(root, filepath.ToSlash(filepath.Clean(filepath.Join(base, dockerfile))))
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", rel, err)
 			}
@@ -118,6 +118,16 @@ func loadDevcontainer(root string) (*api.EnvDef, error) {
 		return def, nil
 	}
 	return nil, nil
+}
+
+// readWorkspaceFile reads a file the workspace names, confined to the workspace.
+func readWorkspaceFile(root, rel string) ([]byte, error) {
+	tree, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer tree.Close()
+	return readInTree(tree, rel)
 }
 
 // stripJSONC removes // and /* */ comments and trailing commas (devcontainer.json is JSONC).

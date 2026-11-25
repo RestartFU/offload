@@ -255,6 +255,8 @@ func TestUsesContext(t *testing.T) {
 		"FROM b\nCOPY --chown=1:1 --from=builder /a /a\n":                      false,
 		"FROM b\nCOPY ./--from=x /a\n":                                         true, // not a flag
 		"FROM b\nRUN --mount=target=/src make\n":                               true, // bind is the default mount type
+		"FROM b\nRUN --mount=type=bind,source=from=docs,target=/d ls\n":        true, // a source named from=…
+		"FROM b\nRUN --mount=type=cache,target=/root/.cache make\n":            false,
 		"# escape=`\nFROM b\nCOPY `\n  . /src\n":                               true,
 	} {
 		if got := usesContext(cf); got != want {
@@ -318,5 +320,35 @@ func TestAgentRequestAllowed(t *testing.T) {
 		if got := api.AgentRequestAllowed(c.msg); got != c.want {
 			t.Errorf("AgentRequestAllowed(%v) = %v, want %v", c.msg, got, c.want)
 		}
+	}
+}
+
+func TestInterruptedDataApplyRepairsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	sl := &slot{Key: "d", Index: 0, Dir: filepath.Join(dir, "0")}
+	os.MkdirAll(sl.Dir, 0o755)
+	m := []api.FileEntry{{Path: "cur", Link: "v1", Mode: 0o777}}
+	if err := sl.applyMode(m, nil, tarOf(t, nil, nil), true); err != nil {
+		t.Fatal(err)
+	}
+	// A crash mid-apply towards v2: the link already points at v2, the record still says v1 and
+	// marks it dirty. The client is back at v1: the plan must still repair it.
+	rec := sl.load()
+	rec.Dirty = []string{"cur"}
+	sl.save(rec)
+	os.Remove(filepath.Join(sl.Dir, "cur"))
+	os.Symlink("v2", filepath.Join(sl.Dir, "cur"))
+	needed, changed, err := sl.planData(m)
+	if err != nil || len(needed) != 0 || !changed {
+		t.Fatalf("plan: %v %v %v", needed, changed, err)
+	}
+	if err := sl.applyMode(m, nil, tarOf(t, nil, nil), true); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.Readlink(filepath.Join(sl.Dir, "cur")); got != "v1" {
+		t.Fatalf("link = %q, want v1", got)
+	}
+	if len(sl.load().Dirty) != 0 {
+		t.Fatal("still dirty")
 	}
 }

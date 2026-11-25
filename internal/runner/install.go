@@ -216,6 +216,11 @@ func Install(o InstallOptions) error {
 		}
 	}
 	fmt.Fprintln(out, "started offload-runner.service")
+	if cfg, err := LoadConfig(cfgPath); err == nil {
+		if code, err := NewPairCode(cfg.TokensFile); err == nil {
+			fmt.Fprintf(out, "\nPair your laptop with this runner (one use, valid 24h; `offload runner pair-code` makes another):\n  offload host pair %s --code %s\n", cfg.Name, code)
+		}
+	}
 
 	ctrl := delegatedControllers()
 	var missing []string

@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -101,5 +103,52 @@ func TestAuthRefusesBrowsersAndForeignHosts(t *testing.T) {
 	// An unknown name is refused before the tailnet identity is even looked up.
 	if code, body := do("evil.example:7420", nil); code != 403 || !strings.Contains(body, "hostnames") {
 		t.Fatalf("foreign host: %d %s", code, body)
+	}
+}
+
+func TestPairCodeIsOneUse(t *testing.T) {
+	tokens := filepath.Join(t.TempDir(), "tokens")
+	s := testServer(t, &Config{TokensFile: tokens})
+	code, err := NewPairCode(tokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.consumePairCode(""); err == nil {
+		t.Fatal("empty code accepted")
+	}
+	if err := s.consumePairCode(code); err != nil {
+		t.Fatalf("right code refused: %v", err)
+	}
+	if err := s.consumePairCode(code); err == nil {
+		t.Fatal("code accepted twice")
+	}
+	code, _ = NewPairCode(tokens)
+	if err := s.consumePairCode("wrong"); err == nil {
+		t.Fatal("wrong code accepted")
+	}
+	if err := s.consumePairCode(code); err == nil {
+		t.Fatal("a wrong guess must burn the code")
+	}
+}
+
+func TestRemoveToken(t *testing.T) {
+	tokens := filepath.Join(t.TempDir(), "tokens")
+	keep := strings.Repeat("a", 64)
+	if err := os.WriteFile(tokens, []byte("legacy-secret\nsha256:"+keep+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := testServer(t, &Config{TokensFile: tokens})
+	if !s.tokenOK("legacy-secret") {
+		t.Fatal("legacy token not accepted")
+	}
+	sum := sha256.Sum256([]byte("legacy-secret"))
+	if err := s.removeToken(hex.EncodeToString(sum[:])); err != nil {
+		t.Fatal(err)
+	}
+	if s.tokenOK("legacy-secret") {
+		t.Fatal("removed token still accepted")
+	}
+	if got := s.pairedTokens(); len(got) != 1 || got[0] != "sha256:"+keep {
+		t.Fatalf("other tokens changed: %v", got)
 	}
 }

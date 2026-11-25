@@ -158,7 +158,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.retireErr != "" {
-		out.err(503, "runner busy retiring workloads of an older version: "+s.retireErr)
+		out.err(503, "runner not ready: "+s.retireErr)
 		return
 	}
 	if s.upgrading {

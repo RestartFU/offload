@@ -121,12 +121,15 @@ func TestArtifactsRefuseSymlinkParentsInsideTree(t *testing.T) {
 func TestBlockedTarget(t *testing.T) {
 	cfg := &Config{Port: 7420, Hosts: []HostConfig{{URL: "http://box.example:9000"}}}
 	for target, blocked := range map[string]bool{
-		"100.106.54.69:7420":       true, // a runner's API on the tailnet
-		"[fd7a:115c:a1e0::1]:7420": true,
-		"box.example:9000":         true,  // a configured runner
-		"100.106.54.69:22":         false, // other tailnet services are the point of the feature
-		"127.0.0.1:18080":          false,
-		"140.82.114.3:443":         false,
+		"100.106.54.69:7420":          true, // a runner's API on the tailnet
+		"[fd7a:115c:a1e0::1]:7420":    true,
+		"box.example:9000":            true, // a configured runner
+		"100.106.54.69:07420":         true, // the same port, spelled differently
+		"[::ffff:100.106.54.69]:7420": true,
+		"box.example:09000":           true,
+		"100.106.54.69:22":            false, // other tailnet services are the point of the feature
+		"127.0.0.1:18080":             false,
+		"140.82.114.3:443":            false,
 	} {
 		if got := blockedTarget(target, cfg) != ""; got != blocked {
 			t.Errorf("blockedTarget(%s) = %v, want %v", target, got, blocked)

@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/RestartFU/offload/internal/api"
 )
@@ -175,6 +176,13 @@ func hashFiles(root string, files []string) ([]api.FileEntry, error) {
 	var mu sync.Mutex
 	next := hashCache{}
 	var firstErr error
+	// Every read is confined to the tree: a tracked directory replaced by a symlink (to a sibling
+	// checkout, say) must not upload what it points at.
+	tree, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer tree.Close()
 	work := make(chan int)
 	var wg sync.WaitGroup
 	for w := 0; w < runtime.NumCPU(); w++ {
@@ -183,22 +191,27 @@ func hashFiles(root string, files []string) ([]api.FileEntry, error) {
 			defer wg.Done()
 			for i := range work {
 				p := files[i]
-				full := filepath.Join(root, filepath.FromSlash(p))
-				fi, err := os.Lstat(full)
+				if checkRel(p) != nil || !realParents(tree, p) {
+					continue // not really in the tree (behind a symlink): absent, like a deleted file
+				}
+				fi, err := tree.Lstat(p)
 				if err != nil {
 					continue
 				}
 				e := api.FileEntry{Path: p, Mode: uint32(fi.Mode().Perm())}
 				switch {
 				case fi.Mode()&fs.ModeSymlink != 0:
-					e.Link, err = os.Readlink(full)
+					e.Link, err = tree.Readlink(p)
 				case fi.Mode().IsRegular():
 					ino := inode(fi)
 					c, ok := cache[p]
 					if ok && c.Size == fi.Size() && c.MTime == fi.ModTime().UnixNano() && c.Ino == ino {
 						e.Hash = c.Hash
 					} else {
-						e.Hash, err = hashFile(full)
+						var now os.FileInfo
+						if e.Hash, now, err = hashFileIn(tree, p); err == nil && !os.SameFile(fi, now) {
+							err = fmt.Errorf("changed while being hashed; run again")
+						}
 					}
 					if err == nil {
 						mu.Lock()
@@ -244,17 +257,31 @@ func hashFiles(root string, files []string) ([]api.FileEntry, error) {
 	return out, nil
 }
 
-func hashFile(p string) (string, error) {
-	f, err := os.Open(p)
+// readInTree reads a regular file inside root, through real directories only and never
+// following a symlink.
+func readInTree(root *os.Root, rel string) ([]byte, error) {
+	if err := checkRel(rel); err != nil {
+		return nil, err
+	}
+	parts := strings.Split(rel, "/")
+	for i := 1; i < len(parts); i++ {
+		fi, err := root.Lstat(strings.Join(parts[:i], "/"))
+		if err != nil {
+			return nil, err // missing parent: ErrNotExist, like a missing file
+		}
+		if !fi.IsDir() {
+			return nil, fmt.Errorf("%s: %s is not a real directory (a symlink?)", rel, strings.Join(parts[:i], "/"))
+		}
+	}
+	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", rel)
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return io.ReadAll(f)
 }
 
 // writeTar streams the needed files as a gzip tar, re-checking each file's hash so an edit made
@@ -264,6 +291,11 @@ func writeTar(w io.Writer, root string, manifest []api.FileEntry, needed []strin
 	for _, e := range manifest {
 		byPath[e.Path] = e
 	}
+	tree, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer tree.Close()
 	gz, _ := gzip.NewWriterLevel(w, gzip.BestSpeed)
 	tw := tar.NewWriter(gz)
 	for _, p := range needed {
@@ -271,7 +303,7 @@ func writeTar(w io.Writer, root string, manifest []api.FileEntry, needed []strin
 		if !ok {
 			return fmt.Errorf("runner asked for unknown file %q", p)
 		}
-		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(p)))
+		b, err := readInTree(tree, p)
 		if err != nil {
 			return err
 		}
