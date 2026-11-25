@@ -100,3 +100,18 @@ func TestWriteInRefusesSymlinkEscape(t *testing.T) {
 		}
 	}
 }
+
+func TestArtifactsRefuseSymlinkParentsInsideTree(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "src"), 0o755)
+	os.WriteFile(filepath.Join(dir, "src", "config"), []byte("keep"), 0o644)
+	os.Symlink("src", filepath.Join(dir, "out")) // out -> src, inside the tree
+	root, _ := os.OpenRoot(dir)
+	defer root.Close()
+	if realParents(root, "out/config") {
+		t.Fatal("symlinked parent accepted")
+	}
+	if !realParents(root, "src/config") {
+		t.Fatal("real parent rejected")
+	}
+}

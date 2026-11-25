@@ -473,11 +473,29 @@ func applyWriteBack(ctx context.Context, h *Host, j *api.Job, root string, quiet
 		if err := checkRel(c.Path); err != nil {
 			return err
 		}
+		if !realParents(tree, c.Path) { // a symlinked parent could alias another file in the tree
+			skipped = append(skipped, c.Path)
+			continue
+		}
+		before, err := tree.Lstat(c.Path)
+		if err != nil {
+			skipped = append(skipped, c.Path)
+			continue
+		}
 		if cur, err := hashIn(tree, c.Path); err != nil || cur != c.BaseHash {
 			skipped = append(skipped, c.Path)
 			continue
 		}
-		if err := writeIn(tree, c.Path, tr, os.FileMode(c.Mode).Perm(), c.Hash); err != nil {
+		// Replace only if the local file is still the one that was hashed (no edit in between).
+		unchanged := func() bool {
+			now, err := tree.Lstat(c.Path)
+			return err == nil && os.SameFile(before, now) && now.Size() == before.Size() && now.ModTime().Equal(before.ModTime())
+		}
+		if err := writeInIf(tree, c.Path, tr, os.FileMode(c.Mode).Perm(), c.Hash, unchanged); err != nil {
+			if errors.Is(err, errChangedLocally) {
+				skipped = append(skipped, c.Path)
+				continue
+			}
 			return err
 		}
 		wrote = append(wrote, c.Path)
@@ -520,9 +538,28 @@ func hashIn(root *os.Root, rel string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// realParents reports whether every parent directory of rel inside root is a real directory.
+func realParents(root *os.Root, rel string) bool {
+	parts := strings.Split(rel, "/")
+	for i := 1; i < len(parts); i++ {
+		fi, err := root.Lstat(strings.Join(parts[:i], "/"))
+		if err != nil || !fi.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
+var errChangedLocally = errors.New("changed locally")
+
 // writeIn replaces rel inside root with r's content via an exclusively created temporary file
 // and an atomic rename; wantHash, when set, must match.
 func writeIn(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHash string) error {
+	return writeInIf(root, rel, r, mode, wantHash, nil)
+}
+
+// writeInIf is writeIn, but replaces rel only if still() reports true just before the rename.
+func writeInIf(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHash string, still func() bool) error {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	tmp := path.Join(path.Dir(rel), ".offload-"+hex.EncodeToString(b))
@@ -540,6 +577,9 @@ func writeIn(root *os.Root, rel string, r io.Reader, mode os.FileMode, wantHash 
 	}
 	if err == nil {
 		err = root.Chmod(tmp, mode)
+	}
+	if err == nil && still != nil && !still() {
+		err = errChangedLocally
 	}
 	if err == nil {
 		err = root.Rename(tmp, rel)
@@ -598,6 +638,9 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string) error {
 		case tar.TypeReg:
 			if err := tree.MkdirAll(path.Dir(name), 0o755); err != nil {
 				return err
+			}
+			if !realParents(tree, name) {
+				return fmt.Errorf("refusing artifact %q: a parent directory is a symlink", hd.Name)
 			}
 			if err := writeIn(tree, name, tr, os.FileMode(hd.Mode).Perm(), ""); err != nil {
 				return err
