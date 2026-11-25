@@ -174,7 +174,7 @@ func (s *Server) pruneGitRefs(ctx context.Context, shared string) {
 // gitCheckout makes the slot a repository at head without touching its files (they were just
 // synced from the client): HEAD and branch point at head, and the index matches head, so
 // `git status` / `git diff` show the client's uncommitted changes as working-tree changes.
-func (s *Server) gitCheckout(ctx context.Context, sl *slot, key string, g *api.GitRef) error {
+func (s *Server) gitCheckout(ctx context.Context, sl *slot, key string, g *api.GitRef, ignoreRules, ignoreGlobal string) error {
 	shared, err := s.ensureShared(key)
 	if err != nil {
 		return err
@@ -217,6 +217,18 @@ func (s *Server) gitCheckout(ctx context.Context, sl *slot, key string, g *api.G
 	}
 	if _, err := gitCmdCtx(ctx, sl.Dir, "read-tree", "HEAD"); err != nil {
 		return err
+	}
+	// The client's ignore rules from outside the tree, ranked as on the client, so `git status`
+	// in the job agrees with the laptop (and with pruning).
+	if ignoreRules != "" {
+		_ = os.MkdirAll(filepath.Join(gitDir, "info"), 0o755)
+		_ = os.WriteFile(filepath.Join(gitDir, "info", "exclude"), []byte(ignoreRules), 0o644)
+	}
+	if ignoreGlobal != "" {
+		global := filepath.Join(gitDir, "offload-global-excludes")
+		if os.WriteFile(global, []byte(ignoreGlobal), 0o644) == nil {
+			_, _ = gitCmdCtx(ctx, sl.Dir, "config", "core.excludesFile", global)
+		}
 	}
 	// The client's tags (those reachable from HEAD), for `git describe`; ones whose objects
 	// never arrived are left out rather than failing the checkout.

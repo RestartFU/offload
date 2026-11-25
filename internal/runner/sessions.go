@@ -149,7 +149,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	def := spec.Environment
-	if def == nil && prof.Containerfile != "" {
+	if def == nil && prof.Containerfile != "" && rt == "container" { // host sessions use no image
 		b, err := os.ReadFile(filepath.Join(s.cfg.ProfilesDir, prof.Containerfile))
 		if err != nil {
 			out.err(500, "profile environment: "+err.Error())
@@ -209,6 +209,12 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		ID: newID("s-"), Runner: s.cfg.Name, Profile: spec.Profile, State: api.StateRunning,
 		Resources: res, CreatedAt: now, LastSeen: now, Runtime: rt, Image: image, Proto: api.Proto,
 	}}
+	if spec.Def != nil {
+		for name := range spec.Def.Data {
+			se.DataSets = append(se.DataSets, name)
+		}
+		sort.Strings(se.DataSets)
+	}
 	if prof.Network == "client" {
 		if rt != "container" {
 			out.err(400, "network = \"client\" needs the container runtime")
@@ -407,6 +413,7 @@ func (s *Server) handleSessionStdin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "seq must be a positive sequence number")
 		return
 	}
+	eof := r.URL.Query().Get("eof") != "" // the client's input ended (after every frame before it)
 	se.inMu.Lock()
 	defer se.inMu.Unlock()
 	// The wrapper (which outlives runner restarts) deduplicates by seq and acknowledges each
@@ -429,7 +436,11 @@ func (s *Server) handleSessionStdin(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		err = sendFrame(se.conn, se.connR, seq, body)
+		if eof {
+			err = sendFrame(se.conn, se.connR, seq, nil)
+		} else {
+			err = sendFrame(se.conn, se.connR, seq, body)
+		}
 		if err == nil {
 			break
 		}
@@ -456,11 +467,17 @@ func (s *Server) handleSessionStdin(w http.ResponseWriter, r *http.Request) {
 func sendFrame(c net.Conn, r *bufio.Reader, seq int64, body []byte) error {
 	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
 	defer c.SetDeadline(time.Time{})
-	if _, err := fmt.Fprintf(c, "%d %d\n", seq, len(body)); err != nil {
-		return err
-	}
-	if _, err := c.Write(body); err != nil {
-		return err
+	if body == nil { // end of input
+		if _, err := fmt.Fprintf(c, "%d eof\n", seq); err != nil {
+			return err
+		}
+	} else {
+		if _, err := fmt.Fprintf(c, "%d %d\n", seq, len(body)); err != nil {
+			return err
+		}
+		if _, err := c.Write(body); err != nil {
+			return err
+		}
 	}
 	ack, err := r.ReadString('\n')
 	if err != nil {

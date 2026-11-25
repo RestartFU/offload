@@ -9,7 +9,7 @@ const DefaultPort = 7420
 // Proto versions the runner protocol and how workloads are wired (mounts, relay sockets, the
 // stdin wrapper). A client only uses runners of its own version (`offload host upgrade` brings
 // them in line), and a runner stops workloads started by another version when it starts.
-const Proto = 7
+const Proto = 8
 
 // ProtoHeader carries the client's protocol version on every request; runners refuse other
 // versions (except for status, pairing and upgrades, which is how versions get back in step).
@@ -242,6 +242,7 @@ type Session struct {
 	FinishedAt    *time.Time `json:"finished_at,omitempty"`
 	ExitCode      *int       `json:"exit_code,omitempty"`
 	Reason        string     `json:"reason,omitempty"`
+	DataSets      []string   `json:"data_sets,omitempty"` // data sets it has mounted (never changed under it)
 }
 
 // ProfileInfo summarizes a runner profile in /v1/status.

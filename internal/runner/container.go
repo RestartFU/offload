@@ -312,7 +312,22 @@ func (s *Server) build(b *envBuild, cf string) {
 			err = phase("build", baseTag(), buildBase)
 		}
 		if err == nil {
-			err = phase("bootstrap", baseTag(), func(unit string) error { return s.runBootstrap(unit, baseTag(), b.logPath) })
+			// One bootstrap at a time (they write the same volumes). Waiting for the lock ends if
+			// the build is abandoned meanwhile; phase re-checks right before the unit starts.
+			for !bootstrapMu.TryLock() {
+				s.mu.Lock()
+				abandoned := b.abandoned
+				s.mu.Unlock()
+				if abandoned {
+					err = errors.New("abandoned: no job wants it any more")
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+			if err == nil {
+				err = phase("bootstrap", baseTag(), func(unit string) error { return s.runBootstrap(unit, baseTag(), b.logPath) })
+				bootstrapMu.Unlock()
+			}
 		}
 	}
 	close(stop)
@@ -446,10 +461,8 @@ func (s *Server) bootstrapped(string) bool {
 // mounted, in its own unit with the build memory limit, so toolchain installs never count
 // against (or get killed by) a small job's limit.
 func (s *Server) runBootstrap(unit, tag, logPath string) error {
-	// One at a time: two environment builds finishing together must not both install into the
-	// same shared volumes.
-	bootstrapMu.Lock()
-	defer bootstrapMu.Unlock()
+	// The caller holds bootstrapMu: two builds finishing together must not both install into
+	// the same shared volumes.
 	if _, err := os.Stat(s.bootstrapMarker(tag)); err == nil {
 		return nil
 	}
@@ -716,6 +729,7 @@ func stockInstallEnv(def *api.EnvDef) map[string]string {
 		if !strings.Contains(cf, imageRepo+"/base") && !strings.Contains(cf, "offload/base") {
 			return nil
 		}
+		cf = finalStage(cf)
 		set = envKeys(cf)
 	}
 	m := basePathRE.FindStringSubmatch(baseContainerfile)
@@ -730,6 +744,44 @@ func stockInstallEnv(def *api.EnvDef) map[string]string {
 		env["CARGO_INSTALL_ROOT"] = "/usr/local"
 	}
 	return env
+}
+
+var fromLineRE = regexp.MustCompile(`(?mi)^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?`)
+
+// finalStage is the text of the stage that makes the image, with the stages it builds on (FROM
+// an earlier stage's name): an ENV in an unrelated builder stage doesn't reach the image.
+func finalStage(cf string) string {
+	locs := fromLineRE.FindAllStringSubmatchIndex(cf, -1)
+	if len(locs) == 0 {
+		return cf
+	}
+	type stage struct{ from, name, text string }
+	stages := make([]stage, len(locs))
+	for i, l := range locs {
+		end := len(cf)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		st := stage{from: cf[l[2]:l[3]], text: cf[l[0]:end]}
+		if l[4] >= 0 {
+			st.name = strings.ToLower(cf[l[4]:l[5]])
+		}
+		stages[i] = st
+	}
+	out := ""
+	cur := len(stages) - 1
+	for seen := 0; cur >= 0 && seen < len(stages); seen++ {
+		out = stages[cur].text + "\n" + out
+		next := -1
+		for i := cur - 1; i >= 0; i-- {
+			if stages[i].name != "" && stages[i].name == strings.ToLower(stages[cur].from) {
+				next = i
+				break
+			}
+		}
+		cur = next
+	}
+	return out
 }
 
 var envLineRE = regexp.MustCompile(`(?mi)^\s*ENV\s+(.+)$`)

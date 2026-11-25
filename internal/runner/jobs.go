@@ -502,7 +502,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	g := j.Spec.Git
 	s.mu.Unlock()
 	if err == nil && g != nil {
-		if gerr := s.gitCheckout(gitCtx, sl, j.Spec.WorkspaceKey, g); gerr != nil {
+		if gerr := s.gitCheckout(gitCtx, sl, j.Spec.WorkspaceKey, g, j.Spec.IgnoreRules, j.Spec.IgnoreGlobal); gerr != nil {
 			s.note(j, "running without .git: "+gerr.Error())
 			// Never a previous job's .git describing another commit.
 			if root, err := os.OpenRoot(sl.Dir); err == nil {

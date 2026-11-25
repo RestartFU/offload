@@ -458,11 +458,7 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 			if gerr := h.do(ctx, "GET", "/v1/jobs/"+id, nil, &j); gerr == nil && api.Terminal(j.State) {
 				// The stream may have ended for a reconnect just before the job did: read
 				// what was written in between, without following.
-				if resp, rerr := h.request(ctx, "GET", fmt.Sprintf("/v1/jobs/%s/logs?stream=%s&offset=%d", id, stream, offset), nil); rerr == nil {
-					_, _ = io.Copy(w, resp.Body)
-					resp.Body.Close()
-				}
-				return nil
+				return drainRest(ctx, h, func(off int64) string { return fmt.Sprintf("/v1/jobs/%s/logs?stream=%s&offset=%d", id, stream, off) }, offset, w)
 			}
 			time.Sleep(200 * time.Millisecond)
 			continue
@@ -478,6 +474,37 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 		case <-ctx.Done():
 			return nil
 		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// drainRest reads a finished stream from offset to its end, retrying a broken transfer from
+// where it stopped, so the end of a job's output (or a session's last reply) is never dropped.
+// Errors writing locally are returned.
+func drainRest(ctx context.Context, h *Host, url func(int64) string, offset int64, w io.Writer) error {
+	for attempt := 0; ; attempt++ {
+		resp, err := h.request(ctx, "GET", url(offset), nil)
+		if err == nil {
+			rw := &recordingWriter{w: w}
+			n, cerr := io.Copy(rw, resp.Body)
+			resp.Body.Close()
+			offset += n
+			if rw.err != nil {
+				return rw.err
+			}
+			if cerr == nil {
+				return nil
+			}
+			err = cerr
+		}
+		var ae *APIError
+		if errors.As(err, &ae) || ctx.Err() != nil || attempt >= 30 {
+			return fmt.Errorf("reading the rest of the output: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
 		}
 	}
 }

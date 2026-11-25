@@ -482,3 +482,14 @@ func TestStockInstallEnvReadsEnvKeys(t *testing.T) {
 		t.Fatalf("image's own Go settings overridden: %v", env)
 	}
 }
+
+func TestStockInstallEnvFinalStage(t *testing.T) {
+	cf := "FROM node:22 AS web\nENV PATH=/opt/web/bin:$PATH\nRUN build\nFROM offload/base\nCOPY --from=web /out /out\n"
+	if env := stockInstallEnv(&api.EnvDef{Containerfile: cf}); env["GOPATH"] != "/root/go" {
+		t.Fatalf("a builder stage's PATH disabled the final image's defaults: %v", env)
+	}
+	cf = "FROM offload/base AS tools\nENV GOBIN=/opt/t\nFROM tools\n"
+	if env := stockInstallEnv(&api.EnvDef{Containerfile: cf}); env["GOPATH"] != "" {
+		t.Fatalf("inherited GOBIN ignored: %v", env)
+	}
+}

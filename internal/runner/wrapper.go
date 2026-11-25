@@ -281,6 +281,11 @@ func RunPipe(dir, sock, secrets string, noStdin bool, argv []string) int {
 	go func() {
 		defer pw.Close()
 		for payload := range frames {
+			if payload == nil { // end of input: the process reads EOF after everything before it
+				pw.Close()
+				broken.Store(true)
+				continue
+			}
 			queued.Add(-int64(len(payload)))
 			if broken.Load() {
 				continue // drain so senders never block; they are told "stdin closed"
@@ -309,13 +314,16 @@ func RunPipe(dir, sock, secrets string, noStdin bool, argv []string) int {
 					if err != nil {
 						return
 					}
-					if _, err := fmt.Sscanf(hdr, "%d %d", &seq, &n); err != nil || seq <= 0 || n < 0 || n > maxStdinFrame {
+					var payload []byte // nil: the end-of-input frame "<seq> eof"
+					if _, err := fmt.Sscanf(hdr, "%d eof", &seq); err == nil && strings.HasSuffix(strings.TrimSpace(hdr), " eof") && seq > 0 {
+					} else if _, err := fmt.Sscanf(hdr, "%d %d", &seq, &n); err != nil || seq <= 0 || n < 0 || n > maxStdinFrame {
 						fmt.Fprintf(c, "bad frame\n")
 						return
-					}
-					payload := make([]byte, n)
-					if _, err := io.ReadFull(r, payload); err != nil {
-						return
+					} else {
+						payload = make([]byte, n)
+						if _, err := io.ReadFull(r, payload); err != nil {
+							return
+						}
 					}
 					reply := "ok\n"
 					mu.Lock()

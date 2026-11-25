@@ -273,11 +273,18 @@ func SyncData(ctx context.Context, h *Host, name string, cfg DataSetConfig, quie
 			Needed  []string `json:"needed"`
 			Changed bool     `json:"changed"` // deletions, symlinks or modes changed: apply even with no files
 			Rev     int64    `json:"rev"`
+			InUse   string   `json:"in_use"` // a live session has it mounted
 		}
 		if err := h.do(ctx, "POST", "/v1/data/"+dataKey(name), api.DataPlan{Manifest: manifest}, &plan); err != nil {
 			return fmt.Errorf("data set %s: %w", name, err)
 		}
 		if len(plan.Needed) == 0 && !plan.Changed {
+			return nil
+		}
+		if plan.InUse != "" {
+			// Changing files a running session has open would cut it off from them: this
+			// session starts with the runner's copy, and the next sync catches up.
+			logf(false, "data set %s is in use by session %s on %s; using the runner's copy (not synced)", name, plan.InUse, h.Name)
 			return nil
 		}
 		if len(manifest) == 0 && !cfg.AllowEmpty {

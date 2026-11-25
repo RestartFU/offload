@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -80,13 +81,12 @@ func MCP(o MCPOptions) error {
 	} else if o.Prepare {
 		return fmt.Errorf("--prepare needs a session definition in %s", filepath.Join(configDir(), "sessions", profile+".toml"))
 	}
-	if o.Environment != "" {
+	if o.Host { // runs on the runner itself: no environment to load at all
+		spec.Runtime, spec.Environment = "host", nil
+	} else if o.Environment != "" {
 		if spec.Environment, err = LoadEnvDef("", o.Environment); err != nil {
 			return err
 		}
-	}
-	if o.Host {
-		spec.Runtime, spec.Environment = "host", nil
 	}
 	var h *Host
 	var se api.Session
@@ -258,24 +258,15 @@ pick:
 			drainStderr() // the server's last words (why it stopped reading) are usually there
 			return err
 		}
-		// Input closed: let answers already in flight arrive, then end the session. Wait at
-		// least 3s from the start (a fresh container may still be starting), stop once output
-		// has been quiet for a second, and never wait more than 10s.
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) {
-			if time.Since(out.started) >= 3*time.Second && time.Since(out.last()) >= time.Second {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return nil
-			case err := <-done:
-				drainStderr()
-				return err
-			case <-time.After(100 * time.Millisecond):
-			}
+		// Input ended and the server's stdin is closed after it: answers still being worked on
+		// arrive until the server exits (or the caller gives up).
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-done:
+			drainStderr()
+			return err
 		}
-		return nil
 	}
 }
 
@@ -377,7 +368,8 @@ func pumpIn(ctx context.Context, h *Host, id string, in io.Reader) error {
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil // the MCP client closed stdin: end the session
+				// The MCP client closed stdin: so does the server's, after everything sent.
+				return sendEOF(ctx, h, id, seq+1)
 			}
 			return err
 		}
@@ -405,9 +397,21 @@ func readLineMax(r *bufio.Reader, max int) ([]byte, error) {
 	}
 }
 
+func sendEOF(ctx context.Context, h *Host, id string, seq int64) error {
+	err := sendFrameReq(ctx, h, fmt.Sprintf("/v1/sessions/%s/stdin?seq=%d&eof=1", id, seq), nil)
+	if err != nil && strings.HasPrefix(err.Error(), "session ended") {
+		return nil // its input was already closed, or it is gone: nothing left to close
+	}
+	return err
+}
+
 func sendStdin(ctx context.Context, h *Host, id string, seq int64, line []byte) error {
+	return sendFrameReq(ctx, h, fmt.Sprintf("/v1/sessions/%s/stdin?seq=%d", id, seq), line)
+}
+
+func sendFrameReq(ctx context.Context, h *Host, url string, line []byte) error {
 	for attempt := 0; ; attempt++ {
-		err := h.do(ctx, "POST", fmt.Sprintf("/v1/sessions/%s/stdin?seq=%d", id, seq), bytes.NewReader(line), nil)
+		err := h.do(ctx, "POST", url, bytes.NewReader(line), nil)
 		if err == nil {
 			return nil
 		}
@@ -460,9 +464,8 @@ func pumpOut(ctx context.Context, h *Host, id, stream string, w io.Writer) error
 			if gerr := h.do(ctx, "GET", "/v1/sessions/"+id, nil, &se); gerr == nil && api.Terminal(se.State) {
 				// Read what was written between the stream's end and the session's (the last
 				// reply), without following.
-				if resp, rerr := h.request(ctx, "GET", fmt.Sprintf("/v1/sessions/%s/%s?offset=%d", id, stream, offset), nil); rerr == nil {
-					_, _ = io.Copy(w, resp.Body)
-					resp.Body.Close()
+				if err := drainRest(ctx, h, func(off int64) string { return fmt.Sprintf("/v1/sessions/%s/%s?offset=%d", id, stream, off) }, offset, w); err != nil {
+					return err
 				}
 				if se.Reason != "" && stream == "stdout" {
 					fmt.Fprintf(os.Stderr, "offload: session ended: %s\n", se.Reason)

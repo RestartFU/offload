@@ -135,7 +135,7 @@ func (s *Server) handleDataPlan(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	writeJSON(w, map[string]any{"needed": needed, "changed": changed, "rev": rec.Rev})
+	writeJSON(w, map[string]any{"needed": needed, "changed": changed, "rev": rec.Rev, "in_use": s.dataInUse(name)})
 }
 
 // handleDataUpload applies a manifest (multipart: "manifest" JSON, then "files" tar.gz).
@@ -195,6 +195,12 @@ func (s *Server) handleDataUpload(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, http.StatusConflict, "missing plan revision; plan again")
 				return
 			}
+			if by := s.dataInUse(name); by != "" {
+				// A live session has it mounted: renaming files under it would cut it off from
+				// what it has open. The session keeps the runner's copy.
+				writeErr(w, http.StatusLocked, "data set in use by session "+by)
+				return
+			}
 			if err := sl.applyMode(plan.Manifest, needed, part, true); err != nil {
 				writeErr(w, 400, "data sync: "+err.Error())
 				return
@@ -204,6 +210,23 @@ func (s *Server) handleDataUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeErr(w, 400, "missing files part")
+}
+
+// dataInUse is the live session that has the data set mounted ("" if none).
+func (s *Server) dataInUse(name string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, se := range s.sessions {
+		if api.Terminal(se.State) {
+			continue
+		}
+		for _, d := range se.DataSets {
+			if d == name {
+				return se.ID
+			}
+		}
+	}
+	return ""
 }
 
 func (s *Server) dataPath(name string) string { return filepath.Join(s.cfg.StateDir, "data", name) }
