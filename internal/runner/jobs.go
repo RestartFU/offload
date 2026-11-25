@@ -1313,7 +1313,9 @@ func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 
 // gc drops finished jobs past retention and workspace slots unused for too long.
 func (s *Server) gc() {
-	s.gcLedger() // without s.mu: it can read a large file
+	if s.ledgerGCing.CompareAndSwap(false, true) { // it can read a large file: not on the scheduler loop
+		go func() { defer s.ledgerGCing.Store(false); s.gcLedger() }()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcContainersLocked()

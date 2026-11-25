@@ -30,6 +30,8 @@ type session struct {
 	dir      string
 	cpus     []int
 	inactive int
+	peakMem  int64   // from the exit record, for the ledger
+	cpuSecs  float64 // likewise
 
 	relay *relay // client networking requests, when the session uses network = "client"
 
@@ -569,14 +571,28 @@ func (s *Server) touch(se *session, attachDelta int) {
 }
 
 func (s *Server) handleSessionStdout(w http.ResponseWriter, r *http.Request) {
-	s.streamSession(w, r, "stdout")
+	s.streamSession(w, r, "stdout", true)
 }
 
 func (s *Server) handleSessionStderr(w http.ResponseWriter, r *http.Request) {
-	s.streamSession(w, r, "stderr.log")
+	s.streamSession(w, r, "stderr.log", true)
 }
 
-func (s *Server) streamSession(w http.ResponseWriter, r *http.Request, file string) {
+// handleSessionObserve streams a session's output to a viewer (the dashboard) that isn't a
+// client: watching doesn't keep an idle session alive. It is its own route so that a runner
+// too old to know it refuses the request instead of counting the viewer as a client.
+func (s *Server) handleSessionObserve(w http.ResponseWriter, r *http.Request) {
+	switch r.PathValue("stream") {
+	case "stdout":
+		s.streamSession(w, r, "stdout", false)
+	case "stderr":
+		s.streamSession(w, r, "stderr.log", false)
+	default:
+		writeErr(w, 404, "stream: stdout or stderr")
+	}
+}
+
+func (s *Server) streamSession(w http.ResponseWriter, r *http.Request, file string, client bool) {
 	se := s.getSession(w, r)
 	if se == nil {
 		return
@@ -584,7 +600,7 @@ func (s *Server) streamSession(w http.ResponseWriter, r *http.Request, file stri
 	var offset int64
 	fmt.Sscan(r.URL.Query().Get("offset"), &offset)
 	follow := r.URL.Query().Get("follow") != ""
-	if r.URL.Query().Get("observe") == "" { // a dashboard watching isn't a client keeping it alive
+	if client {
 		s.touch(se, 1)
 		defer s.touch(se, -1)
 	}
@@ -641,6 +657,7 @@ func (s *Server) checkSessions() {
 		case err == nil:
 			code := rec.Code
 			reason := se.Reason
+			se.peakMem, se.cpuSecs = rec.PeakMem, float64(rec.CPUUsec)/1e6
 			if rec.OOM {
 				reason = fmt.Sprintf("out of memory (limit %s)", units.FormatSize(se.Resources.Mem))
 			}

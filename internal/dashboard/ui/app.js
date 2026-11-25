@@ -145,7 +145,7 @@ const state = {
   range: store("range") || "1h",
   runner: store("runner") || "",
   series: {}, seriesFor: "", seriesLoading: false,
-  ledger: null, ledgerFor: "", ledgerErrors: null,
+  ledger: null, ledgerFor: "", ledgerErrors: null, ledgerTruncated: [],
   cfilter: { state: store("cstate") || "active", kind: "", runner: "", q: "" },
   sel: null, // {runner, id}
   stopping: new Map(), // "runner/id" -> "" while stopping, or the error
@@ -196,7 +196,8 @@ function recordUsage() {
 
 const metricRunners = () => (state.fleet?.runners || []).filter((r) => r.online && r.status?.metrics && (!state.runner || r.name === state.runner));
 
-async function loadSeries() {
+// gen is the schedule that asked (see scheduleData): an answer for an older one is dropped.
+async function loadSeries(gen) {
   const key = state.range + "|" + state.runner;
   const runners = metricRunners();
   if (!runners.length) { state.series = {}; state.seriesFor = key; state.seriesLoading = false; renderCharts(); return; }
@@ -206,19 +207,21 @@ async function loadSeries() {
   await Promise.all(runners.map(async (r) => {
     try { out[r.name] = await api(`/api/series?host=${encodeURIComponent(r.name)}&range=${state.range}`); } catch {}
   }));
-  if (key !== state.range + "|" + state.runner) return; // the filter changed meanwhile
+  if (gen !== dataGen || key !== state.range + "|" + state.runner) return; // the filter changed meanwhile
   state.series = out; state.seriesFor = key; state.seriesLoading = false;
   renderCharts();
 }
 
-async function loadLedger() {
+async function loadLedger(gen) {
   const key = state.range;
   const since = new Date(Date.now() - rangeSecs() * 1000).toISOString().replace(/\.\d+Z$/, "Z");
   try {
     const res = await api("/api/ledger?since=" + encodeURIComponent(since));
-    if (key !== state.range) return;
+    if (gen !== dataGen || key !== state.range) return;
     state.ledger = res.rows; state.ledgerErrors = res.errors || null; state.ledgerFor = key;
+    state.ledgerTruncated = res.truncated || [];
   } catch (e) {
+    if (gen !== dataGen) return;
     state.ledgerErrors = { dashboard: e.message };
   }
   renderActivity();
@@ -229,8 +232,8 @@ function scheduleData() {
   clearTimeout(seriesTimer); clearTimeout(ledgerTimer);
   // A load still in flight from an earlier schedule must not queue another loop when it ends.
   const gen = ++dataGen;
-  const tickSeries = async () => { if (state.view === "overview") await loadSeries(); if (gen === dataGen) seriesTimer = setTimeout(tickSeries, state.range === "1h" ? 5000 : 30000); };
-  const tickLedger = async () => { if (state.view === "overview") await loadLedger(); if (gen === dataGen) ledgerTimer = setTimeout(tickLedger, 30000); };
+  const tickSeries = async () => { if (state.view === "overview") await loadSeries(gen); if (gen === dataGen) seriesTimer = setTimeout(tickSeries, state.range === "1h" ? 5000 : 30000); };
+  const tickLedger = async () => { if (state.view === "overview") await loadLedger(gen); if (gen === dataGen) ledgerTimer = setTimeout(tickLedger, 30000); };
   tickSeries(); tickLedger();
 }
 
@@ -659,6 +662,8 @@ function renderActivity() {
   const rows = state.ledger.filter((e) => !state.runner || e.runner === state.runner);
   const jobs = rows.filter((e) => e.kind === "job");
   const errs = state.ledgerErrors ? Object.entries(state.ledgerErrors).map(([k, v]) => h("div", { class: "note" }, `${k}: ${v}`)) : [];
+  const cut = state.ledgerTruncated.filter((n) => !state.runner || n === state.runner);
+  if (cut.length) errs.push(h("div", { class: "note" }, `Partial: ${cut.join(", ")} sent only its newest 50,000 entries for this range, so these statistics leave out older work.`));
   if (!jobs.length) {
     el.replaceChildren(head, h("div", { class: "card empty-state" }, rows.length ? "Only sessions finished in this range." : "No jobs finished in this range."), errs);
     return;
@@ -980,7 +985,7 @@ async function startLogs() {
     v.status.textContent = isActive(v.w) ? "Streaming" : "Complete";
     const reader = r.body.getReader();
     const dec = new TextDecoder();
-    let size = 0, preamble = "", partial = false;
+    let size = 0, preamble = "", partial = false, held = "";
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
@@ -995,11 +1000,12 @@ async function startLogs() {
         preamble = null;
         partial = off > 0; // the tail starts mid-line: drop up to the first newline
       }
-      if (partial) {
-        const nl = text.indexOf("\n");
-        if (nl < 0) continue;
-        text = text.slice(nl + 1);
-        partial = false;
+      if (partial) { // skip the cut-off line, unless no line ends soon (one huge line): then show it
+        held += text;
+        const nl = held.indexOf("\n");
+        if (nl < 0 && held.length < 64 * 1024) continue;
+        text = nl < 0 ? held : held.slice(nl + 1);
+        partial = false; held = "";
       }
       text = stripAnsi(text);
       size += text.length;
@@ -1007,6 +1013,7 @@ async function startLogs() {
       while (size > 2 * 1024 * 1024 && v.pre.childNodes.length > 1) { size -= v.pre.firstChild.textContent.length; v.pre.firstChild.remove(); }
       if (v.follow) v.pre.scrollTop = v.pre.scrollHeight;
     }
+    if (held && logView === v) v.pre.append(document.createTextNode(stripAnsi(held))); // it never reached a line end
     if (logView === v && v.abort === ac) v.status.textContent = "Ended";
   } catch (e) {
     if (e.name !== "AbortError" && logView === v) v.status.textContent = "Disconnected: " + e.message;

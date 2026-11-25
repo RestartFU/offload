@@ -129,10 +129,16 @@ func openBrowser(ctx context.Context, link string) error {
 	if runtime.GOOS == "darwin" {
 		cmd = "open"
 	}
-	if err := exec.Command(cmd, f.Name()).Start(); err != nil {
+	c := exec.Command(cmd, f.Name())
+	if err := c.Start(); err != nil {
 		os.Remove(f.Name())
 		return err
 	}
+	go func() {
+		if err := c.Wait(); err != nil {
+			fmt.Printf("%s failed (%v); open the link above\n", cmd, err)
+		}
+	}()
 	return nil
 }
 
@@ -181,7 +187,7 @@ func (s *server) guard(next http.Handler) http.Handler {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			site := r.Header.Get("Sec-Fetch-Site")
 			origin := r.Header.Get("Origin")
-			if r.Header.Get("X-Offload-Dashboard") != "1" || (site != "" && site != "same-origin") || (origin != "" && origin != "http://"+s.host) {
+			if r.Header.Get("X-Offload-Dashboard") != "1" || (site != "" && site != "same-origin") || (origin != "" && origin != "http://"+r.Host) {
 				http.Error(w, "cross-site request refused", http.StatusForbidden)
 				return
 			}
@@ -250,22 +256,30 @@ func (s *server) handleLedger(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	type result struct {
-		name string
-		rows []api.LedgerEntry
-		err  error
+		name      string
+		rows      []api.LedgerEntry
+		truncated bool
+		err       error
 	}
 	hosts := s.fleet.ledgerHosts()
 	ch := make(chan result, len(hosts))
 	for name, h := range hosts {
 		go func() {
-			var rows []api.LedgerEntry
-			err := h.Do(ctx, "GET", "/v1/ledger?since="+url.QueryEscape(since), nil, &rows)
-			ch <- result{name, rows, err}
+			res := result{name: name}
+			resp, err := h.Request(ctx, "GET", "/v1/ledger?since="+url.QueryEscape(since), nil)
+			if err == nil {
+				res.truncated = resp.Header.Get("X-Offload-Truncated") != ""
+				err = json.NewDecoder(resp.Body).Decode(&res.rows)
+				resp.Body.Close()
+			}
+			res.err = err
+			ch <- res
 		}()
 	}
 	out := struct {
-		Rows   []ledgerRow       `json:"rows"`
-		Errors map[string]string `json:"errors,omitempty"`
+		Rows      []ledgerRow       `json:"rows"`
+		Errors    map[string]string `json:"errors,omitempty"`
+		Truncated []string          `json:"truncated,omitempty"` // runners that sent only their newest entries
 	}{Rows: []ledgerRow{}}
 	for range hosts {
 		res := <-ch
@@ -275,6 +289,9 @@ func (s *server) handleLedger(w http.ResponseWriter, r *http.Request) {
 			}
 			out.Errors[res.name] = res.err.Error()
 			continue
+		}
+		if res.truncated {
+			out.Truncated = append(out.Truncated, res.name)
 		}
 		for _, e := range res.rows {
 			out.Rows = append(out.Rows, ledgerRow{Runner: res.name, LedgerEntry: e})
@@ -303,24 +320,26 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	tail, _ := strconv.ParseInt(q.Get("tail"), 10, 64)
 	tail = min(max(tail, 4<<10), 1<<20)
-	var path string
+	var base, state string // the stream without offset or follow, and where to read its state
 	switch q.Get("kind") {
 	case "job":
-		path = "/v1/jobs/" + id + "/logs?follow=1&tail=" + strconv.FormatInt(tail, 10)
+		stream := "stdout"
 		if q.Get("stream") == "stderr" {
-			path += "&stream=stderr"
+			stream = "stderr"
 		}
+		base, state = "/v1/jobs/"+id+"/logs?stream="+stream, "/v1/jobs/"+id
 	case "session":
-		file := "stderr"
+		stream := "stderr"
 		if q.Get("stream") == "stdout" {
-			file = "stdout"
+			stream = "stdout"
 		}
-		path = "/v1/sessions/" + id + "/" + file + "?follow=1&observe=1&tail=" + strconv.FormatInt(tail, 10)
+		base, state = "/v1/sessions/"+id+"/observe/"+stream+"?", "/v1/sessions/"+id
 	default:
 		writeErr(w, 400, "kind: job or session")
 		return
 	}
-	resp, err := h.Request(r.Context(), "GET", path, nil)
+	ctx := r.Context()
+	resp, err := h.Request(ctx, "GET", base+"&follow=1&tail="+strconv.FormatInt(tail, 10), nil)
 	if err != nil {
 		var ae *client.APIError
 		if errors.As(err, &ae) && ae.Code == 404 {
@@ -330,7 +349,6 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 502, err.Error())
 		return
 	}
-	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	off, _ := strconv.ParseInt(resp.Header.Get("X-Offload-Offset"), 10, 64)
 	fmt.Fprintf(w, "{\"offset\":%d}\n", off)
@@ -338,19 +356,52 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if flusher != nil {
 		flusher.Flush()
 	}
+	// The runner ends a follow every few minutes (each reconnect is authorized again), so keep
+	// reconnecting from where it stopped until the workload is over, then read the rest.
+	for follow := true; ; {
+		n, err := copyFlush(w, flusher, resp.Body)
+		resp.Body.Close()
+		off += n
+		if err != nil || !follow || ctx.Err() != nil {
+			return
+		}
+		var st struct {
+			State string `json:"state"`
+		}
+		if err := h.Do(ctx, "GET", state, nil, &st); err != nil {
+			return
+		}
+		follow = !api.Terminal(st.State)
+		path := base + "&offset=" + strconv.FormatInt(off, 10)
+		if follow {
+			path += "&follow=1"
+		}
+		if resp, err = h.Request(ctx, "GET", path, nil); err != nil {
+			return
+		}
+	}
+}
+
+// copyFlush copies src to w, flushing after every read so output shows as it arrives. Its error
+// is nil at the end of src.
+func copyFlush(w io.Writer, flusher http.Flusher, src io.Reader) (int64, error) {
+	var n int64
 	buf := make([]byte, 32<<10)
 	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
+		k, err := src.Read(buf)
+		if k > 0 {
+			if _, werr := w.Write(buf[:k]); werr != nil {
+				return n, werr
 			}
+			n += int64(k)
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
-		if err != nil {
-			return
+		if errors.Is(err, io.EOF) {
+			return n, nil
+		} else if err != nil {
+			return n, err
 		}
 	}
 }

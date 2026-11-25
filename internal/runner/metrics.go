@@ -209,7 +209,7 @@ func (s *Server) sample() (save bool) {
 		m.raw = m.raw[len(m.raw)-rawKeep:]
 	}
 	if len(m.pending) > 0 && m.pending[0].T/60 != pt.T/60 {
-		m.minute = append(m.minute, average(m.pending, m.pending[0].T/60*60))
+		m.minute = appendMinute(m.minute, average(m.pending, m.pending[0].T/60*60))
 		if len(m.minute) > minuteKeep {
 			m.minute = m.minute[len(m.minute)-minuteKeep:]
 		}
@@ -223,10 +223,24 @@ func (s *Server) sample() (save bool) {
 	return false
 }
 
+// appendMinute adds a minute's average. The same minute can come twice: the part saved before a
+// restart and the rest sampled after it. They are averaged into one point.
+func appendMinute(pts []api.MetricPoint, p api.MetricPoint) []api.MetricPoint {
+	if n := len(pts); n > 0 && pts[n-1].T == p.T {
+		pts[n-1] = average([]api.MetricPoint{pts[n-1], p}, p.T)
+		return pts
+	}
+	return append(pts, p)
+}
+
 func (s *Server) saveMetrics() {
-	s.metrics.mu.Lock()
-	pts := append([]api.MetricPoint(nil), s.metrics.minute...)
-	s.metrics.mu.Unlock()
+	m := &s.metrics
+	m.mu.Lock()
+	pts := append([]api.MetricPoint(nil), m.minute...)
+	if len(m.pending) > 0 { // the minute being filled, so a restart doesn't lose it
+		pts = appendMinute(pts, average(m.pending, m.pending[0].T/60*60))
+	}
+	m.mu.Unlock()
 	if err := writeFileJSON(s.metricsPath(), pts); err != nil {
 		log.Printf("metrics: %v", err)
 	}

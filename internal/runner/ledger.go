@@ -23,8 +23,8 @@ import (
 //
 // Appends hold ledgerMu and write a whole line in one call. A crash can still leave a torn
 // last line; the next append starts a fresh line first, and readers skip what doesn't parse.
-// A workload can be recorded twice (a crash between the append and saving its terminal
-// state), so readers keep the last entry per ID.
+// A workload can be recorded twice: a crash between the append and saving its terminal state
+// finishes it again after the restart, with the restart's time. Readers keep the first entry.
 
 const (
 	ledgerMaxRead  = 50000   // entries one request returns at most (the newest)
@@ -54,7 +54,10 @@ func (s *Server) recordSessionLocked(se *session) {
 		ID: se.ID, Kind: "session", Command: se.Profile, Profile: se.Profile, Client: se.Client,
 		Caller: se.Caller, Runtime: se.Runtime, State: se.State, ExitCode: se.ExitCode, Reason: se.Reason,
 		OOM: isOOMReason(se.Reason), CreatedAt: se.CreatedAt, StartedAt: &started, Resources: se.Resources,
-		CPUSeconds: s.takeCPUSeconds(se.ID),
+		PeakMem: se.peakMem, CPUSeconds: se.cpuSecs,
+	}
+	if cpu := s.takeCPUSeconds(se.ID); e.CPUSeconds == 0 {
+		e.CPUSeconds = cpu // from the last sample: an older wrapper, or no exit record
 	}
 	s.appendLedger(e, se.FinishedAt)
 }
@@ -131,7 +134,7 @@ func readLine(br *bufio.Reader) ([]byte, error) {
 }
 
 // readLedger returns the entries that finished at or after since, oldest first, at most the
-// newest ledgerMaxRead of them (truncated says so), and the last entry per workload.
+// newest ledgerMaxRead of them (truncated says so), and the first entry per workload.
 func (s *Server) readLedger(since time.Time) (out []api.LedgerEntry, truncated bool, err error) {
 	out = []api.LedgerEntry{}
 	f, err := os.Open(s.ledgerPath())
@@ -147,9 +150,7 @@ func (s *Server) readLedger(since time.Time) (out []api.LedgerEntry, truncated b
 		line, rerr := readLine(br)
 		var e api.LedgerEntry
 		if len(line) > 0 && json.Unmarshal(line, &e) == nil && !e.FinishedAt.Before(since) {
-			if i, ok := at[e.ID]; ok {
-				out[i] = e
-			} else {
+			if _, ok := at[e.ID]; !ok {
 				at[e.ID] = len(out)
 				out = append(out, e)
 			}

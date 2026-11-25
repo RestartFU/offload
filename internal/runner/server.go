@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -68,6 +69,7 @@ type Server struct {
 	metrics     metricsState  // usage samples (metrics.go)
 	samplerDone chan struct{} // closed once the sampler has saved its last minute averages
 	ledgerMu    sync.Mutex    // serializes ledger appends with the ledger GC's swap (ledger.go)
+	ledgerGCing atomic.Bool   // a ledger GC is running
 }
 
 type whoisEntry struct {
@@ -161,6 +163,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/sessions/{id}/stdin", s.handleSessionStdin)
 	mux.HandleFunc("GET /v1/sessions/{id}/stdout", s.handleSessionStdout)
 	mux.HandleFunc("GET /v1/sessions/{id}/stderr", s.handleSessionStderr)
+	mux.HandleFunc("GET /v1/sessions/{id}/observe/{stream}", s.handleSessionObserve)
 	mux.HandleFunc("DELETE /v1/sessions/{id}", s.handleStopSession)
 	mux.HandleFunc("POST /v1/data/{name}", s.handleDataPlan)
 	mux.HandleFunc("PUT /v1/data/{name}", s.handleDataUpload)
@@ -179,11 +182,12 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	go s.loop(ctx)
 	go s.prebuildBase()
+	sctx, stopSampler := context.WithCancel(ctx)
 	s.samplerDone = make(chan struct{})
-	go s.sampleLoop(ctx)
+	go s.sampleLoop(sctx)
+	defer func() { stopSampler(); <-s.samplerDone }() // its final save, however Serve returns
 	select {
 	case <-ctx.Done():
-		<-s.samplerDone // its final save
 		return nil
 	case err := <-errc:
 		return err

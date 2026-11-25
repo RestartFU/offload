@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/url"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -116,13 +117,18 @@ func (f *fleet) addLocked(h *client.Host) {
 		r.host = h
 		return
 	}
+	// Names identify runners in the page and its requests, so they must be unique: a second
+	// runner with a taken name gets its address added (and a number, should that be taken too).
+	addr := h.URL
+	if u, err := url.Parse(h.URL); err == nil && u.Host != "" {
+		addr = u.Host
+	}
 	name := h.Name
-	if f.byNameLocked(name) != nil { // another runner already has it: tell them apart by address
-		addr := h.URL
-		if u, err := url.Parse(h.URL); err == nil && u.Host != "" {
-			addr = u.Host
+	for i := 1; f.byNameLocked(name) != nil; i++ {
+		name = h.Name + " (" + addr + ")"
+		if i > 1 {
+			name += " " + strconv.Itoa(i)
 		}
-		name += " (" + addr + ")"
 	}
 	f.runners[h.URL] = &runnerState{host: h, Name: name, URL: h.URL, Status: h.Status, Online: true, LastSeen: time.Now(),
 		Jobs: []api.Job{}, Sessions: []api.Session{}}

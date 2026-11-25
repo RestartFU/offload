@@ -80,6 +80,9 @@ func TestGuard(t *testing.T) {
 	if w := do(h, "POST", "/api/stop", with(map[string]string{"X-Offload-Dashboard": "1", "Sec-Fetch-Site": "same-origin", "Origin": "http://127.0.0.1:7421"})); w.Code != 204 {
 		t.Errorf("same-origin post: %d", w.Code)
 	}
+	if w := do(h, "POST", "/api/stop", with(map[string]string{"X-Offload-Dashboard": "1", "Host": "localhost:7421", "Sec-Fetch-Site": "same-origin", "Origin": "http://localhost:7421"})); w.Code != 204 {
+		t.Errorf("same-origin post via localhost: %d", w.Code)
+	}
 	if w := do(h, "POST", "/api/stop", with(map[string]string{"X-Offload-Dashboard": "1", "Sec-Fetch-Site": "cross-site"})); w.Code != 403 {
 		t.Errorf("cross-site post: %d", w.Code)
 	}
@@ -102,6 +105,21 @@ func TestFleetNamesStayUnique(t *testing.T) {
 	}
 	if h := f.host("build (100.64.0.2:7422)"); h == nil || h.URL != "http://100.64.0.2:7422" {
 		t.Fatalf("lookup: %+v", h)
+	}
+	// A runner whose own name is what the second one was given: still unique.
+	f = newFleet(nil)
+	f.addLocked(&client.Host{Name: "build", URL: "http://100.64.0.1:7422"})
+	f.addLocked(&client.Host{Name: "build (100.64.0.2:7422)", URL: "http://100.64.0.3:7422"})
+	f.addLocked(&client.Host{Name: "build", URL: "http://100.64.0.2:7422"})
+	seen := map[string]string{}
+	for _, r := range f.snapshot("").Runners {
+		if prev, dup := seen[r.Name]; dup {
+			t.Fatalf("%q names both %s and %s", r.Name, prev, r.URL)
+		}
+		seen[r.Name] = r.URL
+		if h := f.host(r.Name); h == nil || h.URL != r.URL {
+			t.Fatalf("%q resolves to %+v, want %s", r.Name, h, r.URL)
+		}
 	}
 }
 
