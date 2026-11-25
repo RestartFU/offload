@@ -91,5 +91,5 @@ type LedgerEntry struct {
 	PeakMem    int64      `json:"peak_mem,omitempty"`
 	CPUSeconds float64    `json:"cpu_seconds,omitempty"`
 	SyncFiles  int        `json:"sync_files,omitempty"`
-	Uploaded   int        `json:"uploaded,omitempty"`
+	Uploaded   *int       `json:"uploaded,omitempty"` // absent: the sync didn't finish, or an older runner
 }

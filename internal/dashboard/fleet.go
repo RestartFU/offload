@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -39,17 +38,17 @@ type fleet struct {
 
 type runnerState struct {
 	host     *client.Host
-	alts     []*client.Host // the same runner (by ID) at other addresses, tried when host fails
-	Name     string         `json:"name"` // unique here: a runner's own name, or name (address) for a second one
-	URL      string         `json:"url"`
-	Online   bool           `json:"online"`
-	Current  bool           `json:"current"` // online, on our protocol, with metrics, ledger and the log viewer
-	Error    string         `json:"error,omitempty"`
-	LastSeen time.Time      `json:"last_seen"`
-	Status   *api.Status    `json:"status,omitempty"`
-	Metrics  *api.Metrics   `json:"metrics,omitempty"`
-	Jobs     []api.Job      `json:"jobs"`
-	Sessions []api.Session  `json:"sessions"`
+	key      string        // its key in fleet.runners: the runner's ID, or its URL
+	Name     string        `json:"name"` // unique here: a runner's own name, or name (address) for a second one
+	URL      string        `json:"url"`
+	Online   bool          `json:"online"`
+	Current  bool          `json:"current"` // online, on our protocol, with metrics, ledger and the log viewer
+	Error    string        `json:"error,omitempty"`
+	LastSeen time.Time     `json:"last_seen"`
+	Status   *api.Status   `json:"status,omitempty"`
+	Metrics  *api.Metrics  `json:"metrics,omitempty"`
+	Jobs     []api.Job     `json:"jobs"`
+	Sessions []api.Session `json:"sessions"`
 }
 
 func newFleet(cfg *client.Config) *fleet {
@@ -117,9 +116,9 @@ func (f *fleet) discover(ctx context.Context) {
 }
 
 // addLocked adds a runner found by discovery, or points a known one at its fresh client. A
-// runner reachable at two addresses (pinned in client.toml and found on the tailnet) is one row:
-// discovery lists pinned hosts first, the first address found is used, and the others are kept
-// to fall back on.
+// runner reachable at two addresses (pinned in client.toml and found on the tailnet) is one row.
+// Discovery lists pinned hosts first, so that address is used, and while it isn't answering, a
+// paired one that discovery just reached stands in.
 func (f *fleet) addLocked(h *client.Host) {
 	key := h.URL
 	if h.Status != nil && h.Status.ID != "" {
@@ -129,17 +128,9 @@ func (f *fleet) addLocked(h *client.Host) {
 		}
 	}
 	if r := f.runners[key]; r != nil {
-		if r.URL == h.URL {
-			r.host = h
-			return
+		if r.URL == h.URL || (!r.Online && h.Token != "") {
+			r.host, r.URL = h, h.URL
 		}
-		for i, a := range r.alts {
-			if a.URL == h.URL {
-				r.alts[i] = h
-				return
-			}
-		}
-		r.alts = append(r.alts, h)
 		return
 	}
 	// Names identify runners in the page and its requests, so they must be unique: a second
@@ -155,7 +146,7 @@ func (f *fleet) addLocked(h *client.Host) {
 			name += " " + strconv.Itoa(i)
 		}
 	}
-	f.runners[key] = &runnerState{host: h, Name: name, URL: h.URL, Status: h.Status, Online: true, LastSeen: time.Now(),
+	f.runners[key] = &runnerState{host: h, key: key, Name: name, URL: h.URL, Status: h.Status, Online: true, LastSeen: time.Now(),
 		Jobs: []api.Job{}, Sessions: []api.Session{}}
 }
 
@@ -202,26 +193,21 @@ func (f *fleet) pollOne(ctx context.Context, r *runnerState) {
 	)
 	if err := h.Do(ctx, "GET", "/v1/status", nil, &st); err != nil {
 		f.mu.Lock()
-		alts := append([]*client.Host(nil), r.alts...)
+		r.Online, r.Error = false, err.Error()
 		f.mu.Unlock()
-		for _, a := range alts { // the same runner at another address
-			if a.Do(ctx, "GET", "/v1/status", nil, &st) == nil {
-				f.mu.Lock()
-				if r.host == h {
-					r.alts = append(slices.DeleteFunc(r.alts, func(x *client.Host) bool { return x == a }), h)
-					r.host, r.URL = a, a.URL
-				}
-				f.mu.Unlock()
-				h, err = a, nil
-				break
-			}
+		return
+	}
+	if st.ID != "" && st.ID != r.key && r.key != r.URL {
+		// This address now answers as another runner (its state was moved or reset): drop the
+		// row, and the next discovery lists it under its new ID.
+		f.mu.Lock()
+		if f.runners[r.key] == r {
+			delete(f.runners, r.key)
 		}
-		if err != nil {
-			f.mu.Lock()
-			r.Online, r.Error = false, err.Error()
-			f.mu.Unlock()
-			return
-		}
+		f.found = time.Time{} // rediscover on the next round
+		f.mu.Unlock()
+		f.poke()
+		return
 	}
 	// A runner on another protocol answers status but refuses the rest: show it, with why.
 	var werr error
@@ -274,7 +260,7 @@ func (f *fleet) snapshot(version string) fleetView {
 	v := fleetView{Version: version, At: time.Now(), Runners: []runnerState{}}
 	for _, r := range f.runners {
 		c := *r
-		c.host, c.alts = nil, nil
+		c.host = nil
 		c.Current = r.currentLocked()
 		v.Runners = append(v.Runners, c)
 	}

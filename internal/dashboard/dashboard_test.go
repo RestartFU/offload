@@ -177,9 +177,15 @@ func TestFleetOneRowPerRunnerID(t *testing.T) {
 	if len(v.Runners) != 1 || v.Runners[0].URL != "http://build.example:7420" || v.Runners[0].Name != "build" {
 		t.Fatalf("runners: %+v", v.Runners)
 	}
-	// The other address is kept to fall back on, once.
-	f.addLocked(&client.Host{Name: "build", URL: "http://100.64.0.1:7420", Status: &api.Status{ID: "r1"}})
-	if r := f.runners["r1"]; len(r.alts) != 1 || r.alts[0].URL != "http://100.64.0.1:7420" {
-		t.Fatalf("alternates: %+v", r.alts)
+	// While the pinned address is down, a paired address discovery reached stands in; an
+	// unpaired one (status answers, nothing else would) doesn't.
+	f.runners["r1"].Online = false
+	f.addLocked(&client.Host{Name: "build", URL: "http://100.64.0.2:7420", Status: &api.Status{ID: "r1"}})
+	if r := f.runners["r1"]; r.URL != "http://build.example:7420" {
+		t.Fatalf("switched to an unpaired address: %s", r.URL)
+	}
+	f.addLocked(&client.Host{Name: "build", URL: "http://100.64.0.1:7420", Token: "t", Status: &api.Status{ID: "r1"}})
+	if r := f.runners["r1"]; r.URL != "http://100.64.0.1:7420" || r.host.URL != r.URL {
+		t.Fatalf("didn't fall back: %s", r.URL)
 	}
 }

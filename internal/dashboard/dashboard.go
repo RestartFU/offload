@@ -306,7 +306,8 @@ func (s *server) handleLedger(w http.ResponseWriter, r *http.Request) {
 // line also gets a quiet stream going: browsers wait for a first byte before handing it over.
 func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	h, current := s.fleet.runner(q.Get("host"))
+	name := q.Get("host")
+	h, current := s.fleet.runner(name)
 	id := q.Get("id")
 	if h == nil || !idRE.MatchString(id) {
 		writeErr(w, 404, "no such runner or workload")
@@ -360,7 +361,7 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	// connection can drop: reconnect from where it stopped until the workload is over, then read
 	// the rest. A drop that brought no output counts as a failure and waits before retrying.
 	// Give up, saying why, on an answer retrying can't change or after about five minutes.
-	follow, failures := true, 0
+	follow, failures, opened := true, 0, time.Now()
 	for {
 		n, readErr, writeErr := copyFlush(w, flusher, resp.Body)
 		resp.Body.Close()
@@ -372,9 +373,11 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		if readErr == nil && !follow {
 			return // read to the end of a finished workload
 		}
+		// A quiet follow ends empty when the runner rolls it over (every five minutes); one that
+		// ends empty well before that, or with an error, is a failure.
 		if n > 0 {
 			failures = 0
-		} else if readErr != nil {
+		} else if readErr != nil || (follow && time.Since(opened) < 4*time.Minute) {
 			failures++
 		}
 		for {
@@ -389,6 +392,9 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 				case <-time.After(5 * time.Second):
 				}
 			}
+			if h2, _ := s.fleet.runner(name); h2 != nil {
+				h = h2 // the fleet may have moved to another address of this runner
+			}
 			var st struct {
 				State string `json:"state"`
 			}
@@ -402,6 +408,7 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 					path += "&follow=1"
 				}
 				if resp, done, err = openStream(ctx, h, path); err == nil {
+					opened = time.Now()
 					break
 				}
 			}
@@ -418,8 +425,9 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// openStream starts a streaming request that must answer within 15 seconds; the body then has
-// no deadline. done releases the request once its body is closed.
+// openStream starts a streaming request that must answer within 15 seconds. The body is then
+// cut off after six minutes, past the runner's five-minute follow, so a connection that went
+// silent can't hold the viewer forever. done releases the request once its body is closed.
 func openStream(ctx context.Context, h *client.Host, path string) (*http.Response, func(), error) {
 	ctx, cancel := context.WithCancel(ctx)
 	timer := time.AfterFunc(15*time.Second, cancel)
@@ -432,7 +440,8 @@ func openStream(ctx context.Context, h *client.Host, path string) (*http.Respons
 		cancel()
 		return nil, nil, err
 	}
-	return resp, cancel, nil
+	timer = time.AfterFunc(6*time.Minute, cancel)
+	return resp, func() { timer.Stop(); cancel() }, nil
 }
 
 // copyFlush copies src to w, flushing after every read so output shows as it arrives. readErr

@@ -156,7 +156,9 @@ the session needs no laptop-side help.
 
 ## Usage metrics and the ledger
 
-The runner samples CPU and memory every 5 seconds, per CPU and per workload unit cgroup. It
+The runner samples CPU and memory every 5 seconds, per CPU and per workload unit cgroup. Offload's
+CPU total comes from the slice's own counter, because jobs shorter than a sample never show up
+in two unit readings. It
 keeps an hour at full resolution and a week of one-minute averages in `metrics.json`. The
 sampler snapshots the scheduler's state under `s.mu`, then reads `/proc` and cgroups without
 it. `finishLocked` takes the metrics lock while holding `s.mu`, so the sampler must never wait on

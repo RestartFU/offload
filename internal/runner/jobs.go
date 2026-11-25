@@ -630,7 +630,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j.State, j.queuedAt = api.StateQueued, time.Now()
-	j.Uploaded = len(j.planNeeded) // only once the sync is done: a cancelled upload sent nothing
+	up := len(j.planNeeded)
+	j.Uploaded = &up // only once the sync is done: a cancelled upload sent nothing
 	j.planNeeded, j.planHave = nil, nil
 	if e := j.Spec.Environment; e != nil {
 		ctx := contextRel(e.ContextDir)

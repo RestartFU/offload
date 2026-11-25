@@ -680,7 +680,7 @@ function renderActivity() {
   const started = jobs.filter((e) => e.started_at);
   const waits = started.map((e) => e.queue_wait);
   const cpuH = sum(jobs, (e) => e.cpu_seconds) / 3600;
-  const warm = jobs.filter((e) => e.sync_files > 0 && e.started_at); // the sync finished
+  const warm = jobs.filter((e) => e.sync_files > 0 && e.uploaded != null); // the sync finished
   const warmRate = warm.length ? 1 - sum(warm, (e) => e.uploaded) / Math.max(1, sum(warm, (e) => e.sync_files)) : null;
   const stats = h("div", { class: "stats" },
     kpi("Jobs finished", String(jobs.length), `${pct(ok / jobs.length)} succeeded`),
@@ -919,8 +919,8 @@ function drawerInfo(w) {
     add("Repository", sp.workspace_key ? h("span", { class: "mono" }, sp.workspace_key) : "none (throwaway directory)");
     add("Directory", sp.dir && sp.dir !== "." ? h("span", { class: "mono" }, sp.dir) : null);
     add("Git", sp.git ? h("span", { class: "mono" }, (sp.git.branch ? sp.git.branch + " @ " : "") + sp.git.head.slice(0, 12)) : null);
-    const up = r.uploaded || 0, synced = r.state === "queued" || r.started_at; // the upload finished
-    add("Synced files", !r.sync_files ? null : !synced ? `${r.sync_files}` :
+    const up = r.uploaded; // absent until the sync finished (or from an older runner)
+    add("Synced files", !r.sync_files ? null : up == null ? `${r.sync_files}` :
       `${r.sync_files} · ` + (up === 0 ? "all already on the runner" : up === r.sync_files ? "all uploaded" : `${up} uploaded, ${r.sync_files - up} already on the runner`));
   } else {
     add("Profile", r.profile);

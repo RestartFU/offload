@@ -152,8 +152,9 @@ type Job struct {
 	// Caller is the authenticated identity that created the job (tailnet login or tags, "token",
 	// or "local"), set by the runner. Spec.Client is the caller's own free-form label.
 	Caller string `json:"caller,omitempty"`
-	// Uploaded is how many of SyncFiles the client had to send (the rest were already warm).
-	Uploaded int `json:"uploaded,omitempty"`
+	// Uploaded is how many of SyncFiles the client had to send (the rest were already warm),
+	// once the sync has succeeded. Absent before that, or from an older runner.
+	Uploaded *int `json:"uploaded,omitempty"`
 	// CPUSeconds is the CPU time the job used, once it has finished.
 	CPUSeconds float64 `json:"cpu_seconds,omitempty"`
 	// Needed lists the manifest paths the client must upload. Only set in the create response.

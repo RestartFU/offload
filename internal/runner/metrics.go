@@ -41,9 +41,10 @@ type metricsState struct {
 	cpuSecs map[string]float64 // workload id -> CPU seconds last seen, for the ledger
 
 	// Owned by the sampler goroutine alone.
-	prevCPU  map[int]cpuTimes
-	prevUnit map[string]unitSample // unit -> last usage reading
-	cgPaths  map[string]string     // unit -> cgroup directory
+	prevCPU   map[int]cpuTimes
+	prevUnit  map[string]unitSample // unit -> last usage reading
+	prevSlice unitSample            // the slice's, for offload's total
+	cgPaths   map[string]string     // unit -> cgroup directory
 }
 
 type cpuTimes struct{ busy, total uint64 }
@@ -51,6 +52,15 @@ type cpuTimes struct{ busy, total uint64 }
 type unitSample struct {
 	usec uint64
 	at   time.Time
+}
+
+// rate is the CPU use (cores) between this reading and a later one, 0 without a baseline.
+func (p unitSample) rate(usec uint64, at time.Time) float64 {
+	dt := at.Sub(p.at).Seconds()
+	if p.at.IsZero() || usec < p.usec || dt <= 0 {
+		return 0
+	}
+	return float64(usec-p.usec) / 1e6 / dt
 }
 
 // workloadRef is what the sampler needs to know about a live job or session.
@@ -184,12 +194,8 @@ func (s *Server) sample(ctx context.Context) (save bool) {
 		seen[r.unit] = true
 		w := api.WorkloadUsage{ID: r.id, Kind: r.kind, Mem: cgroupFileInt(dir, "memory.current"), MemPeak: cgroupFileInt(dir, "memory.peak")}
 		if usec, ok := cgroupCPUUsec(dir); ok {
-			if p, ok := m.prevUnit[r.unit]; ok && usec >= p.usec {
-				if dt := now.Sub(p.at).Seconds(); dt > 0 {
-					w.CPU = float64(usec-p.usec) / 1e6 / dt
-				}
-			}
-			m.prevUnit[r.unit] = unitSample{usec: usec, at: now}
+			w.CPU = m.prevUnit[r.unit].rate(usec, time.Now())
+			m.prevUnit[r.unit] = unitSample{usec: usec, at: time.Now()}
 			cpuSecs[r.id] = float64(usec) / 1e6
 		}
 		pt.CPUUsed += w.CPU
@@ -203,6 +209,18 @@ func (s *Server) sample(ctx context.Context) (save bool) {
 		}
 	}
 	sort.Slice(work, func(a, b int) bool { return work[a].ID < work[b].ID })
+	// Offload's total comes from the slice's own counter when it can be read: it includes work
+	// too short to be seen by two samples (a queue of one-second jobs).
+	if base := userManagerCgroup(); base != "" {
+		if usec, ok := cgroupCPUUsec(filepath.Join(base, sliceCgroupPath(s.cfg.Slice))); ok {
+			if m.prevSlice.at.IsZero() {
+				pt.CPUUsed = 0 // no baseline yet; the next sample has one
+			} else {
+				pt.CPUUsed = m.prevSlice.rate(usec, time.Now())
+			}
+			m.prevSlice = unitSample{usec: usec, at: time.Now()}
+		}
+	}
 
 	total, avail := memTotal(), memAvailable()
 	pt.MemUsed = total - avail

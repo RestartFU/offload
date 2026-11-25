@@ -278,3 +278,17 @@ func TestLockOrDoneGivesUpAtShutdown(t *testing.T) {
 		t.Fatal("couldn't lock a free mutex")
 	}
 }
+
+func TestUnitSampleRate(t *testing.T) {
+	t0 := time.Now()
+	p := unitSample{usec: 1_000_000, at: t0}
+	if got := p.rate(3_000_000, t0.Add(2*time.Second)); got != 1 {
+		t.Errorf("2 CPU-seconds over 2s: %v cores", got)
+	}
+	if got := (unitSample{}).rate(5_000_000, t0); got != 0 {
+		t.Errorf("no baseline: %v", got)
+	}
+	if got := p.rate(500_000, t0.Add(time.Second)); got != 0 { // counter reset (a new cgroup)
+		t.Errorf("reset counter: %v", got)
+	}
+}
