@@ -422,7 +422,7 @@ func TestPruneUntrackedKeepsIgnoredOutput(t *testing.T) {
 	write("vendor/mod/x.go", "package mod // go mod vendor, on the runner")
 	write("local-out/bin", "ignored only by the client's .git/info/exclude")
 	s := &Server{cfg: &Config{}}
-	s.pruneUntracked(context.Background(), &slot{Dir: dir}, []api.FileEntry{{Path: ".gitignore"}, {Path: "main.go"}}, "local-out/\n")
+	s.pruneUntracked(context.Background(), &slot{Dir: dir}, []api.FileEntry{{Path: ".gitignore"}, {Path: "main.go"}}, "local-out/\n", "")
 	if _, err := os.Stat(filepath.Join(dir, "gen.go")); !os.IsNotExist(err) {
 		t.Fatal("runner-created source survived")
 	}
@@ -469,5 +469,16 @@ func TestStockInstallEnvKeepsSystemPath(t *testing.T) {
 	}
 	if stockInstallEnv(&api.EnvDef{Containerfile: "FROM node:22\n"}) != nil {
 		t.Fatal("a foreign image got install defaults")
+	}
+}
+
+func TestStockInstallEnvReadsEnvKeys(t *testing.T) {
+	env := stockInstallEnv(&api.EnvDef{Containerfile: "FROM offload/base\nENV PYTHONPATH=/opt/tools\n"})
+	if env["GOPATH"] != "/root/go" || env["CARGO_INSTALL_ROOT"] != "/usr/local" {
+		t.Fatalf("PYTHONPATH taken for PATH: %v", env)
+	}
+	env = stockInstallEnv(&api.EnvDef{Containerfile: "FROM offload/base\nENV GOBIN=/opt/tools/bin \\\n    PATH=/opt/tools/bin:$PATH\n"})
+	if _, ok := env["GOPATH"]; ok || env["CARGO_INSTALL_ROOT"] != "/usr/local" {
+		t.Fatalf("image's own Go settings overridden: %v", env)
 	}
 }

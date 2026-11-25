@@ -134,7 +134,7 @@ func Run(o RunOptions) (int, error) {
 			return 1, fmt.Errorf("reading workspace: %w", err)
 		}
 		spec.WorkspaceKey, spec.Manifest, spec.Dir = ws.Key, ws.Manifest, ws.Dir
-		spec.GitTree, spec.IgnoreRules = ws.GitTree, ws.IgnoreRules
+		spec.GitTree, spec.IgnoreRules, spec.IgnoreGlobal = ws.GitTree, ws.IgnoreRules, ws.IgnoreGlobal
 		spec.WriteBack = !o.NoWriteBack
 		if !o.Host { // --host runs on the runner itself: no environment, even if the repo has one
 			if spec.Environment, err = LoadEnvDef(ws.Root, o.Environment); err != nil {
@@ -332,7 +332,11 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 // uploadGit sends the commits the runner is missing. The first job of a repository on a runner
 // sends the whole history once; later ones send only new commits.
 func uploadGit(ctx context.Context, h *Host, j api.Job, ws *Workspace, quiet bool) error {
-	path, err := gitBundle(ctx, ws.Root, j.GitHave, ws.Git.Tags)
+	tags := map[string]string{}
+	for k, v := range ws.Git.Tags {
+		tags[k] = v
+	}
+	path, err := gitBundle(ctx, ws.Root, ws.Git.Head, j.GitHave, tags)
 	if err != nil {
 		return err
 	}
@@ -452,6 +456,12 @@ func streamLog(ctx context.Context, h *Host, id, stream string, w io.Writer, qui
 		if err == nil {
 			var j api.Job
 			if gerr := h.do(ctx, "GET", "/v1/jobs/"+id, nil, &j); gerr == nil && api.Terminal(j.State) {
+				// The stream may have ended for a reconnect just before the job did: read
+				// what was written in between, without following.
+				if resp, rerr := h.request(ctx, "GET", fmt.Sprintf("/v1/jobs/%s/logs?stream=%s&offset=%d", id, stream, offset), nil); rerr == nil {
+					_, _ = io.Copy(w, resp.Body)
+					resp.Body.Close()
+				}
 				return nil
 			}
 			time.Sleep(200 * time.Millisecond)
@@ -677,6 +687,33 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 		return wbErr
 	}
 	return artErr
+}
+
+// checkTarGz reads a downloaded tar.gz to its end (a truncated one fails), then rewinds it.
+func checkTarGz(f *os.File) error {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	tr := tar.NewReader(gz)
+	for {
+		if _, err := tr.Next(); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return err
+		}
+		if _, err := io.Copy(io.Discard, tr); err != nil {
+			return err
+		}
+	}
+	if _, err := io.Copy(io.Discard, gz); err != nil { // and the gzip trailer (checksum)
+		return err
+	}
+	_, err = f.Seek(0, io.SeekStart)
+	return err
 }
 
 // verifyArchive checks a downloaded write-back archive is complete and intact (every entry's
@@ -1111,12 +1148,28 @@ func unchangedSinceSnap(tree *os.Root, rel string, snap map[string]fileSig) bool
 // a path that appeared or changed here since it was taken is kept, and the artifact is saved
 // beside it as <file>.offload-incoming[.N]; kept counts those.
 func fetchArtifacts(ctx context.Context, h *Host, id, dest string, snap map[string]fileSig) (kept int, err error) {
+	// The whole archive first, checked complete: a connection lost halfway must not leave new
+	// and old outputs mixed.
+	_ = os.MkdirAll(stateDir(), 0o700)
+	archive, err := os.CreateTemp(stateDir(), ".artifacts-*")
+	if err != nil {
+		return kept, err
+	}
+	defer os.Remove(archive.Name())
+	defer archive.Close()
 	resp, err := h.request(ctx, "GET", "/v1/jobs/"+id+"/artifacts", nil)
 	if err != nil {
 		return kept, err
 	}
-	defer resp.Body.Close()
-	gz, err := gzip.NewReader(resp.Body)
+	_, err = io.Copy(archive, resp.Body)
+	resp.Body.Close()
+	if err == nil {
+		err = checkTarGz(archive)
+	}
+	if err != nil {
+		return kept, fmt.Errorf("downloading artifacts: %w", err)
+	}
+	gz, err := gzip.NewReader(archive)
 	if err != nil {
 		return kept, err
 	}

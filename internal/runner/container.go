@@ -284,28 +284,35 @@ func (s *Server) build(b *envBuild, cf string) {
 		}
 		s.mu.Unlock()
 	}
-	if err == nil && strings.Contains(cf, baseTag()) && b.tag != baseTag() && !imageExists(baseTag()) {
-		err = s.runBuild(baseTag(), baseContainerfile, "", dir, b.logPath)
-	}
-	if err == nil && !imageExists(b.tag) {
-		unit := "offload-build-" + hash12(b.tag, time.Now().String()) + ".service"
+	// Every phase runs in a unit of its own, registered on the build before it starts, so a build
+	// every job has left can be stopped whichever phase it is in (see leaveBuildsLocked).
+	phase := func(kind, tag string, run func(unit string) error) error {
+		unit := "offload-" + kind + "-" + hash12(tag, time.Now().String()) + ".service"
 		s.mu.Lock()
 		b.unit = unit
 		abandoned := b.abandoned
 		s.mu.Unlock()
 		if abandoned {
-			err = errors.New("abandoned: no job wants it any more")
-		} else {
-			err = s.runBuildUnit(unit, b.tag, cf, ctxDir, dir, b.logPath)
+			return errors.New("abandoned: no job wants it any more")
 		}
+		return run(unit)
+	}
+	buildBase := func(unit string) error {
+		return s.runBuildUnit(unit, baseTag(), baseContainerfile, "", dir, b.logPath)
+	}
+	if err == nil && strings.Contains(cf, baseTag()) && b.tag != baseTag() && !imageExists(baseTag()) {
+		err = phase("build", baseTag(), buildBase)
+	}
+	if err == nil && !imageExists(b.tag) {
+		err = phase("build", b.tag, func(unit string) error { return s.runBuildUnit(unit, b.tag, cf, ctxDir, dir, b.logPath) })
 	}
 	if err == nil && !s.bootstrapped(b.tag) {
 		// Never a project image's own bootstrap script: it would write the shared toolchains.
 		if !imageExists(baseTag()) {
-			err = s.runBuild(baseTag(), baseContainerfile, "", dir, b.logPath)
+			err = phase("build", baseTag(), buildBase)
 		}
 		if err == nil {
-			err = s.runBootstrap(baseTag(), b.logPath)
+			err = phase("bootstrap", baseTag(), func(unit string) error { return s.runBootstrap(unit, baseTag(), b.logPath) })
 		}
 	}
 	close(stop)
@@ -333,10 +340,6 @@ func (s *Server) build(b *envBuild, cf string) {
 		log.Printf("build %s: %v", b.tag, err)
 	}
 	s.kick()
-}
-
-func (s *Server) runBuild(tag, cf, ctxDir, dir, logPath string) error {
-	return s.runBuildUnit("offload-build-"+hash12(tag, time.Now().String())+".service", tag, cf, ctxDir, dir, logPath)
 }
 
 func (s *Server) runBuildUnit(unit, tag, cf, ctxDir, dir, logPath string) error {
@@ -442,7 +445,7 @@ func (s *Server) bootstrapped(string) bool {
 // runBootstrap runs the image's /etc/offload/bootstrap.sh (if any) with the shared volumes
 // mounted, in its own unit with the build memory limit, so toolchain installs never count
 // against (or get killed by) a small job's limit.
-func (s *Server) runBootstrap(tag, logPath string) error {
+func (s *Server) runBootstrap(unit, tag, logPath string) error {
 	// One at a time: two environment builds finishing together must not both install into the
 	// same shared volumes.
 	bootstrapMu.Lock()
@@ -452,7 +455,7 @@ func (s *Server) runBootstrap(tag, logPath string) error {
 	}
 	args := []string{
 		"--user", "--quiet", "--collect", "--wait",
-		"--unit=offload-bootstrap-" + hash12(tag, time.Now().String()) + ".service", "--slice=" + s.cfg.Slice,
+		"--unit=" + unit, "--slice=" + s.cfg.Slice,
 		"-p", "Delegate=yes", "-p", fmt.Sprintf("MemoryMax=%d", s.cfg.buildMem), "-p", "MemorySwapMax=0", "-p", "RuntimeMaxSec=3600",
 		"-p", "StandardOutput=append:" + logPath, "-p", "StandardError=append:" + logPath,
 		"--", "podman", "run", "--rm", "--cgroups=split", "--network=host", "--security-opt", "label=disable",
@@ -707,22 +710,46 @@ var basePathRE = regexp.MustCompile(`(?:^|\s)PATH=(\S+)`) // PATH=, not GOPATH=
 // none of GOPATH, GOBIN, CARGO_INSTALL_ROOT or PATH. The shared toolchain bins are read-only.
 // An image that decides for itself is left alone.
 func stockInstallEnv(def *api.EnvDef) map[string]string {
+	set := map[string]bool{}
 	if def != nil {
 		cf := def.Containerfile
 		if !strings.Contains(cf, imageRepo+"/base") && !strings.Contains(cf, "offload/base") {
 			return nil
 		}
-		for _, k := range []string{"GOPATH", "GOBIN", "CARGO_INSTALL_ROOT", "PATH"} {
-			if strings.Contains(cf, k) {
-				return nil
-			}
-		}
+		set = envKeys(cf)
 	}
 	m := basePathRE.FindStringSubmatch(baseContainerfile)
 	if m == nil || !strings.Contains(m[1], "/usr/bin") {
 		return nil // never hand a workload a PATH without the system directories
 	}
-	return map[string]string{"GOPATH": "/root/go", "PATH": "/root/go/bin:" + m[1], "CARGO_INSTALL_ROOT": "/usr/local"}
+	env := map[string]string{}
+	if !set["GOPATH"] && !set["GOBIN"] && !set["PATH"] { // each default only where the image is silent
+		env["GOPATH"], env["PATH"] = "/root/go", "/root/go/bin:"+m[1]
+	}
+	if !set["CARGO_INSTALL_ROOT"] {
+		env["CARGO_INSTALL_ROOT"] = "/usr/local"
+	}
+	return env
+}
+
+var envLineRE = regexp.MustCompile(`(?mi)^\s*ENV\s+(.+)$`)
+
+// envKeys are the variables a Containerfile's ENV instructions set ("ENV A=1 B=2", "ENV A 1").
+func envKeys(cf string) map[string]bool {
+	keys := map[string]bool{}
+	for _, m := range envLineRE.FindAllStringSubmatch(strings.Join(logicalLines(cf), "\n"), -1) {
+		f := strings.Fields(m[1])
+		if len(f) > 0 && !strings.Contains(f[0], "=") {
+			keys[f[0]] = true // legacy "ENV KEY value"
+			continue
+		}
+		for _, w := range f {
+			if k, _, ok := strings.Cut(w, "="); ok {
+				keys[k] = true
+			}
+		}
+	}
+	return keys
 }
 
 // leaveBuildsLocked takes a finished job off the builds it waited for. A build every job left

@@ -95,9 +95,11 @@ type JobSpec struct {
 	// GitTree says the manifest is git's view of the tree: then anything else in the slot that
 	// git wouldn't ignore was made by an earlier job and is removed before this one runs.
 	GitTree bool `json:"git_tree,omitempty"`
-	// IgnoreRules are the client's ignore rules that don't travel in the tree
-	// (.git/info/exclude, core.excludesFile), in gitignore syntax: pruning honors them too.
-	IgnoreRules string `json:"ignore_rules,omitempty"`
+	// IgnoreRules and IgnoreGlobal are the client's ignore rules that don't travel in the tree
+	// (.git/info/exclude; core.excludesFile), in gitignore syntax: pruning honors them too,
+	// ranked as git ranks them.
+	IgnoreRules  string `json:"ignore_rules,omitempty"`
+	IgnoreGlobal string `json:"ignore_global,omitempty"`
 }
 
 // Job is a job record as returned by the runner.

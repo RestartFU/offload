@@ -519,7 +519,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err == nil && j.Spec.GitTree {
-		s.pruneUntracked(gitCtx, sl, manifest, j.Spec.IgnoreRules)
+		s.pruneUntracked(gitCtx, sl, manifest, j.Spec.IgnoreRules, j.Spec.IgnoreGlobal)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1127,9 +1127,13 @@ func streamFile(w http.ResponseWriter, r *http.Request, path string, offset int6
 	// A follow ends after a while even if nothing does: the client reconnects from its offset,
 	// and every reconnect is authorized again (a reset pairing ends an idle bridge).
 	deadline := time.Now().Add(5 * time.Minute)
+	// A reader that stops reading can't pin the stream (and its authorization) past that.
+	if follow {
+		_ = http.NewResponseController(w).SetWriteDeadline(deadline.Add(time.Minute))
+	}
 	for {
 		finished := done()
-		for {
+		for time.Now().Before(deadline) || finished || !follow { // a growing log can't stretch it
 			n, err := f.Read(buf)
 			if n > 0 {
 				if _, werr := w.Write(buf[:n]); werr != nil {

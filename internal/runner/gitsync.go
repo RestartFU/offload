@@ -268,7 +268,7 @@ func validTagName(n string) bool {
 // pruneUntracked removes files a previous job created in the slot that git doesn't ignore and
 // the client didn't send (generated sources, say): they would otherwise survive into builds of
 // other branches. Ignored files (target/, node_modules/ …) stay; that's what keeps slots warm.
-func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.FileEntry, ignoreRules string) {
+func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.FileEntry, ignoreRules, ignoreGlobal string) {
 	// A scratch repository with an empty index: everything in the slot is "untracked", minus
 	// what the tree's .gitignore files ignore, whether or not this job gets a .git.
 	scratch, err := os.MkdirTemp("", "offload-prune-")
@@ -285,7 +285,9 @@ func (s *Server) pruneUntracked(ctx context.Context, sl *slot, manifest []api.Fi
 		_ = os.MkdirAll(filepath.Join(scratch, "info"), 0o755)
 		_ = os.WriteFile(filepath.Join(scratch, "info", "exclude"), []byte(ignoreRules), 0o644)
 	}
-	out, err := gitCmdCtx(ctx, sl.Dir, "--git-dir="+scratch, "--work-tree=.", "ls-files", "-z", "--others", "--exclude-standard", "--exclude=/.git")
+	excludes := filepath.Join(scratch, "global-excludes") // the client's, never the runner user's
+	_ = os.WriteFile(excludes, []byte(ignoreGlobal), 0o644)
+	out, err := gitCmdCtx(ctx, sl.Dir, "--git-dir="+scratch, "--work-tree=.", "-c", "core.excludesFile="+excludes, "ls-files", "-z", "--others", "--exclude-standard", "--exclude=/.git")
 	if err != nil || out == "" {
 		return
 	}

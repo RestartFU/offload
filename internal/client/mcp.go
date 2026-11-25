@@ -123,7 +123,11 @@ pick:
 		} else {
 			h, err = Pick(hosts, res, profile, "", "session")
 		}
-		busy := anyBusy(candidates(hosts, on, profile, api.JobSpec{Resources: res, Environment: spec.Environment, Runtime: "container"}, sc != nil))
+		wantRT := "container"
+		if o.Host {
+			wantRT = "host"
+		}
+		busy := anyBusy(candidates(hosts, on, profile, api.JobSpec{Resources: res, Environment: spec.Environment, Runtime: wantRT}, sc != nil))
 		if err != nil && len(excluded) == 0 && !busy && lastRefusal != "" {
 			return fmt.Errorf("%w (and %s)", err, lastRefusal)
 		}
@@ -454,6 +458,12 @@ func pumpOut(ctx context.Context, h *Host, id, stream string, w io.Writer) error
 		if err == nil {
 			var se api.Session
 			if gerr := h.do(ctx, "GET", "/v1/sessions/"+id, nil, &se); gerr == nil && api.Terminal(se.State) {
+				// Read what was written between the stream's end and the session's (the last
+				// reply), without following.
+				if resp, rerr := h.request(ctx, "GET", fmt.Sprintf("/v1/sessions/%s/%s?offset=%d", id, stream, offset), nil); rerr == nil {
+					_, _ = io.Copy(w, resp.Body)
+					resp.Body.Close()
+				}
 				if se.Reason != "" && stream == "stdout" {
 					fmt.Fprintf(os.Stderr, "offload: session ended: %s\n", se.Reason)
 				}

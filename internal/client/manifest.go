@@ -26,14 +26,15 @@ import (
 
 // Workspace is the local source tree a job runs against.
 type Workspace struct {
-	Root        string // absolute path of the tree's root (git toplevel or cwd)
-	Key         string // stable runner-side workspace name
-	Dir         string // cwd relative to Root
-	Manifest    []api.FileEntry
-	Git         *api.GitRef // HEAD and branch, nil outside git or before the first commit
-	GitTree     bool        // the manifest is git's view (tracked + untracked, minus ignored)
-	Submods     bool        // has submodules (synced as files; their own .git isn't recreated)
-	IgnoreRules string      // .git/info/exclude and core.excludesFile, concatenated
+	Root         string // absolute path of the tree's root (git toplevel or cwd)
+	Key          string // stable runner-side workspace name
+	Dir          string // cwd relative to Root
+	Manifest     []api.FileEntry
+	Git          *api.GitRef // HEAD and branch, nil outside git or before the first commit
+	GitTree      bool        // the manifest is git's view (tracked + untracked, minus ignored)
+	Submods      bool        // has submodules (synced as files; their own .git isn't recreated)
+	IgnoreRules  string      // .git/info/exclude
+	IgnoreGlobal string      // the user's excludes file (ranked below the repository's rules)
 }
 
 // skipDirs are never synced when the tree is not a git repository.
@@ -72,7 +73,7 @@ func LoadWorkspace(cwd string) (*Workspace, error) {
 		if err != nil {
 			return nil, err
 		}
-		ws.IgnoreRules = localIgnoreRules(ws.Root)
+		ws.IgnoreRules, ws.IgnoreGlobal = localIgnoreRules(ws.Root)
 		if staged, err := git(ws.Root, "ls-files", "--stage"); err == nil {
 			ws.Submods = strings.Contains("\n"+staged, "\n160000 ")
 		}
@@ -169,34 +170,32 @@ func gitFiles(root string) ([]string, error) {
 	return files, nil
 }
 
-// localIgnoreRules are the ignore rules that live outside the tree: .git/info/exclude and the
-// user's excludes file (core.excludesFile, or git's default ~/.config/git/ignore).
-func localIgnoreRules(root string) string {
-	var files []string
-	if p, err := git(root, "rev-parse", "--git-path", "info/exclude"); err == nil {
-		p = strings.TrimSpace(p)
+// localIgnoreRules are the ignore rules that live outside the tree, kept apart because git ranks
+// them: the repository's .git/info/exclude over the user's excludes file (core.excludesFile, or
+// git's default ~/.config/git/ignore).
+func localIgnoreRules(root string) (repo, global string) {
+	read := func(p string) string {
 		if !filepath.IsAbs(p) {
 			p = filepath.Join(root, p)
 		}
-		files = append(files, p)
+		if b, err := os.ReadFile(p); err == nil && len(b) < 256<<10 {
+			return string(b)
+		}
+		return ""
+	}
+	if p, err := git(root, "rev-parse", "--git-path", "info/exclude"); err == nil {
+		repo = read(strings.TrimSpace(p))
 	}
 	if p, err := git(root, "config", "--path", "core.excludesFile"); err == nil && strings.TrimSpace(p) != "" {
-		files = append(files, strings.TrimSpace(p))
+		global = read(strings.TrimSpace(p))
 	} else if home, err := os.UserHomeDir(); err == nil {
 		cfg := os.Getenv("XDG_CONFIG_HOME")
 		if cfg == "" {
 			cfg = filepath.Join(home, ".config")
 		}
-		files = append(files, filepath.Join(cfg, "git", "ignore"))
+		global = read(filepath.Join(cfg, "git", "ignore"))
 	}
-	var b strings.Builder
-	for _, f := range files {
-		if data, err := os.ReadFile(f); err == nil && b.Len()+len(data) < 256<<10 {
-			b.Write(data)
-			b.WriteString("\n")
-		}
-	}
-	return b.String()
+	return repo, global
 }
 
 // workspaceKey names the runner-side workspace: repo name plus a hash of its origin (or path),
@@ -456,7 +455,20 @@ func writeTar(w io.Writer, root string, manifest []api.FileEntry, needed []strin
 
 // gitBundle writes a bundle of HEAD minus the commits the runner already has (those we also
 // have locally) to a temp file and returns its path.
-func gitBundle(ctx context.Context, root string, have []string, tags map[string]string) (string, error) {
+func gitBundle(ctx context.Context, root, wantHead string, have []string, tags map[string]string) (string, error) {
+	// The bundle is made from refs as they are now; the job was described by HEAD as it was. If
+	// they differ (a branch switch while the job waited for a slot), say so instead of sending
+	// history that doesn't match.
+	if g := wantHead; g != "" {
+		if cur, err := git(root, "rev-parse", "--verify", "-q", "HEAD"); err != nil || strings.TrimSpace(cur) != g {
+			return "", fmt.Errorf("HEAD moved since the job was submitted; run it again")
+		}
+	}
+	for name, id := range tags { // a tag moved meanwhile isn't sent (the job sees the rest)
+		if cur, err := git(root, "rev-parse", "--verify", "-q", "refs/tags/"+name); err != nil || strings.TrimSpace(cur) != id {
+			delete(tags, name)
+		}
+	}
 	f, err := os.CreateTemp("", "offload-*.bundle")
 	if err != nil {
 		return "", err

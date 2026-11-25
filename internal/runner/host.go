@@ -229,13 +229,18 @@ func retryStops() {
 		}
 		pendingStops.Unlock()
 		for u, at := range units {
-			if active, known := unitActive(u); known && !active {
-				pendingStops.Lock()
-				delete(pendingStops.m, u)
-				pendingStops.Unlock()
+			active, known := unitActive(u)
+			if known && !active {
+				// Done, or not started yet: keep watching for a while, in case it was asked to
+				// stop just before it started.
+				if time.Since(at) > 30*time.Second {
+					pendingStops.Lock()
+					delete(pendingStops.m, u)
+					pendingStops.Unlock()
+				}
 				continue
 			}
-			if time.Since(at) > 5*time.Second {
+			if time.Since(at) > 5*time.Second || active {
 				_, _ = systemctl(context.Background(), "stop", "--no-block", u)
 			}
 		}
