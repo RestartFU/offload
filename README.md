@@ -134,6 +134,33 @@ Unpaired tailnet callers may only discover a runner (and pair the first client),
 the URL names it by IP address, its hostname or tailnet name. Add any other DNS name to `hostnames` in the runner's `runner.toml`.
 The runner API refuses requests made by web pages.
 
+## Dashboard
+
+```bash
+offload dashboard            # opens http://127.0.0.1:7421 in the browser
+```
+
+A local web page covering every runner:
+
+- **Overview.** Free and busy cores, and memory across all runners. CPU and memory over the
+  last hour to 7 days. Each runner's CPUs as a grid shaded by how busy they are, with the cores
+  pinned to jobs and the ones kept for the system marked. Jobs waiting and why. Warnings for
+  runners that are down, short on memory or disk, or on another version.
+- **Containers.** Every job and session with live CPU and memory against its guarantee and
+  limit. Open one to follow its logs, see its details, or cancel it.
+- **Activity.** Statistics on finished jobs: success rate, out-of-memory kills, wait times,
+  CPU time, warm-file rate, and per command its run times and how much of its guaranteed CPU it
+  really uses.
+
+It follows the system's light or dark setting; the switch at the top right picks one instead,
+remembered by the browser.
+
+The dashboard listens on loopback only and talks to runners with this machine's identity. The
+link it prints carries a per-run key, so other local users can't use it. Runners sample usage
+every 5 seconds and keep a week of it. They also keep a ledger of finished jobs
+(`storage.ledger.retain`, 30 days by default). A runner from before this version shows its
+status only; `offload host upgrade` brings it up to date.
+
 ## Agents
 
 - **Skill:** [`skill/offload/SKILL.md`](skill/offload/SKILL.md). Link it into `~/.claude/skills/`.
@@ -156,6 +183,7 @@ main.go                 CLI
 internal/client         discovery, host choice, run/attach, source sync, MCP bridge
 internal/runner         daemon: API, scheduler, workspaces, systemd units, install
 internal/hook           Claude Code guard
+internal/dashboard      offload dashboard: local web UI (embedded, no build step)
 internal/tsapi          tailscaled LocalAPI (whois, status)
 profiles/               default runner profiles (embedded)
 skill/offload           agent skill

@@ -149,6 +149,14 @@ type Job struct {
 	StopRequested bool `json:"stop_requested,omitempty"`
 	// MemFrom says where the memory limit came from: "requested", "learned", "profile", "default".
 	MemFrom string `json:"mem_from,omitempty"`
+	// Caller is the authenticated identity that created the job (tailnet login or tags, "token",
+	// or "local"), set by the runner. Spec.Client is the caller's own free-form label.
+	Caller string `json:"caller,omitempty"`
+	// Uploaded is how many of SyncFiles the client had to send (the rest were already warm),
+	// once the sync has succeeded. Absent before that, or from an older runner.
+	Uploaded *int `json:"uploaded,omitempty"`
+	// CPUSeconds is the CPU time the job used, once it has finished.
+	CPUSeconds float64 `json:"cpu_seconds,omitempty"`
 	// Needed lists the manifest paths the client must upload. Only set in the create response.
 	Needed []string `json:"needed,omitempty"`
 	// Manifest stats, for the create response.
@@ -242,6 +250,8 @@ type Session struct {
 	State         string     `json:"state"`
 	Resources     Resources  `json:"resources"`
 	Unit          string     `json:"unit,omitempty"`
+	Client        string     `json:"client,omitempty"` // the caller's free-form label
+	Caller        string     `json:"caller,omitempty"` // authenticated identity, as in Job
 	CreatedAt     time.Time  `json:"created_at"`
 	LastSeen      time.Time  `json:"last_seen"`
 	Attached      int        `json:"attached"`
@@ -254,6 +264,8 @@ type Session struct {
 	ExitCode      *int       `json:"exit_code,omitempty"`
 	Reason        string     `json:"reason,omitempty"`
 	DataSets      []string   `json:"data_sets,omitempty"` // data sets it has mounted (never changed under it)
+	PeakMem       int64      `json:"peak_mem,omitempty"`  // once finished: cgroup memory.peak
+	CPUSeconds    float64    `json:"cpu_seconds,omitempty"`
 }
 
 // ProfileInfo summarizes a runner profile in /v1/status.
@@ -291,6 +303,9 @@ type Status struct {
 	Accepting    bool                   `json:"accepting"`
 	Proto        int                    `json:"proto"`
 	Reason       string                 `json:"reason,omitempty"`
+	Started      time.Time              `json:"started"`             // when this runner process started
+	HostCPUs     int                    `json:"host_cpus,omitempty"` // every CPU on the host, offload's or not
+	Metrics      bool                   `json:"metrics,omitempty"`   // serves /v1/metrics and /v1/ledger
 }
 
 // Error is the JSON body of a non-2xx response.

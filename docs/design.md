@@ -154,6 +154,60 @@ environment starts a system D-Bus for `flatpak run`. The updates mod's Google cr
 consent window is approved by mcpelauncher-agent itself (its `src/consent.ts`, via xdotool), so
 the session needs no laptop-side help.
 
+## Usage metrics and the ledger
+
+The runner samples CPU and memory every 5 seconds, per CPU and per workload unit cgroup. Offload's
+CPU total comes from the slice's own counter, because jobs shorter than a sample never show up
+in two unit readings. It
+keeps an hour at full resolution and a week of one-minute averages in `metrics.json`. The
+sampler snapshots the scheduler's state under `s.mu`, then reads `/proc` and cgroups without
+it. `finishLocked` takes the metrics lock while holding `s.mu`, so the sampler must never wait on
+I/O while holding either lock.
+
+A workload's CPU time and peak memory come from its wrapper's exit record, read just before the
+cgroup goes away. The last sample is only a fallback: a short workload can start and end
+between two samples.
+
+`ledger.jsonl` keeps one line per finished job or session. It outlives `storage.jobs.retain`,
+so statistics can cover weeks. It is append-only, and appends hold a ledger lock that is a leaf
+in the lock order. A crash between the append and saving the job's terminal state finishes the
+job again after the restart, with the restart's time, so readers and GC keep the *first*
+entry for each ID, even when it falls outside the range asked for. A torn last line from a crash would swallow the next append, so an append starts a
+fresh line when the file doesn't end in one. GC runs off the scheduler loop.
+
+The job's `caller` comes from how `auth` admitted the request: `local` (the socket), `token`
+(a paired client), or the tailnet identity. It is separate from the free-form `client` label,
+which clients set themselves.
+
+## Dashboard
+
+`offload dashboard` runs on the laptop, talks to runners with the laptop's own credentials, and
+serves a page with no build step (plain JS and SVG, embedded in the binary).
+
+Because it acts with those credentials, it guards them:
+
+- It listens on loopback only and checks `Host` (no DNS rebinding).
+- Every API request carries a per-run key in an `X-Offload-Key` header. The key isn't a cookie,
+  because cookies are shared by every port on `127.0.0.1`: any other local web server the
+  browser visited would receive it. The printed link carries the key in its fragment
+  (`#key=…`), which browsers never send to a server, and the page keeps it in its own origin's
+  storage.
+- The browser is opened on a private (0600) HTML file that redirects to the link, never on the
+  link itself: command lines are visible to other users in `ps`.
+- Changes (cancel, stop) also need an `X-Offload-Dashboard` header and a same-origin request.
+- A strict CSP forbids inline script and style, and runner data goes into the page as text
+  nodes only.
+
+The dashboard reads session output through `/v1/sessions/{id}/observe/{stream}`, which doesn't
+count as an attached client. The client streams count as attached, which keeps an idle session
+alive. It is a separate route rather than a flag so that an older runner refuses the request
+instead of treating the viewer as a client.
+
+Runner follows end every few minutes, so the dashboard reconnects from its offset like the CLI
+does. Runners are keyed by their status ID, so one reachable at two addresses (pinned and
+discovered) is counted once. A second runner reporting a taken name is shown with its address
+added, because names identify runners in the page's requests.
+
 ## Keeping the host alive
 
 - One physical core (the siblings of the highest-numbered CPU) is left out of `capacity.cpus`.

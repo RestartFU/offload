@@ -16,6 +16,7 @@ import (
 
 	"github.com/RestartFU/offload/internal/api"
 	"github.com/RestartFU/offload/internal/client"
+	"github.com/RestartFU/offload/internal/dashboard"
 	"github.com/RestartFU/offload/internal/hook"
 	"github.com/RestartFU/offload/internal/runner"
 	"github.com/RestartFU/offload/internal/units"
@@ -74,6 +75,9 @@ Client:
   offload get ID [DIR]               download a job's --get artifacts
   offload ps [--all]                 jobs and sessions on every runner
   offload hosts                      runners, capacity and load
+  offload dashboard [--port N] [--no-open]
+                                     web dashboard on this machine (127.0.0.1 only): runners,
+                                     cores, memory, jobs and sessions, logs, statistics
   offload mcp PROFILE [--on NAME] [--with SET] [--secret NAME[=SRC]]
                                      stdio MCP server backed by a runner session; PROFILE is a
                                      runner profile or ~/.config/offload/sessions/PROFILE.toml
@@ -142,6 +146,8 @@ func main() {
 		err = client.Ps(*all)
 	case "hosts":
 		err = client.Hosts()
+	case "dashboard":
+		err = cmdDashboard(args)
 	case "mcp":
 		err = cmdMCP(args)
 		var ee *client.ExitError
@@ -280,6 +286,16 @@ func cmdMCP(args []string) error {
 		return err
 	}
 	return client.MCP(client.MCPOptions{Profile: profile, On: *on, Resources: r, With: with, Secrets: secrets, Environment: *environment, Host: *host, Prepare: *prepare})
+}
+
+func cmdDashboard(args []string) error {
+	fs := flag.NewFlagSet("dashboard", flag.ExitOnError)
+	port := fs.Int("port", 7421, "loopback port (another free one is used if it's taken)")
+	noOpen := fs.Bool("no-open", false, "don't open the browser")
+	_ = fs.Parse(args)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return dashboard.Run(ctx, dashboard.Options{Addr: fmt.Sprintf("127.0.0.1:%d", *port), Open: !*noOpen, Version: versionString()})
 }
 
 func cmdHost(args []string) error {

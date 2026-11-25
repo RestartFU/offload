@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -49,6 +51,7 @@ type job struct {
 // exitRecord is written by the unit wrapper when the command ends.
 type exitRecord struct {
 	Code             int            `json:"code"`
+	CPUUsec          int64          `json:"cpu_usec,omitempty"` // the unit's CPU time (cpu.stat usage_usec)
 	Signal           string         `json:"signal,omitempty"`
 	OOM              bool           `json:"oom,omitempty"`
 	Error            string         `json:"error,omitempty"`
@@ -273,6 +276,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if spec.Client == "" {
 		spec.Client = r.Header.Get("X-Offload-Caller")
 	}
+	caller := callerOf(r)
 	if err := validSecrets(spec.Secrets, spec.SecretFiles); err != nil {
 		out.err(400, err.Error())
 		return
@@ -303,7 +307,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j := &job{Job: api.Job{
-		ID: newID("j-"), Runner: s.cfg.Name, State: api.StateUploading, Spec: spec,
+		ID: newID("j-"), Runner: s.cfg.Name, State: api.StateUploading, Spec: spec, Caller: caller,
 		Resources: s.cfg.effective(spec.Resources, prof), CreatedAt: time.Now(), Runtime: rt,
 	}}
 	if rt == "container" {
@@ -629,6 +633,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j.State, j.queuedAt = api.StateQueued, time.Now()
+	up := len(j.planNeeded)
+	j.Uploaded = &up // only once the sync is done: a cancelled upload sent nothing
 	j.planNeeded, j.planHave = nil, nil
 	if e := j.Spec.Environment; e != nil {
 		ctx := contextRel(e.ContextDir)
@@ -1037,6 +1043,7 @@ func (s *Server) checkRunning() {
 			if state == api.StateCancelled {
 				j.WriteBack = nil // a cancelled job's half-done edits are never written back
 			}
+			j.CPUSeconds = float64(rec.CPUUsec) / 1e6
 			s.learn(j, rec)
 			s.finishLocked(j, state, &code, reason)
 		case active:
@@ -1076,6 +1083,10 @@ func (s *Server) finishLocked(j *job, state string, code *int, reason string) {
 	j.State, j.ExitCode, j.Reason, j.FinishedAt = state, code, reason, &now
 	j.Spec.Manifest, j.planNeeded, j.planHave, j.Needed, j.GitHave = nil, nil, nil, nil, nil // upload-only state
 	s.leaveBuildsLocked(j)
+	if cpu := s.takeCPUSeconds(j.ID); j.CPUSeconds == 0 {
+		j.CPUSeconds = cpu // from the last sample: an older wrapper, or no exit record
+	}
+	s.recordJobLocked(j)
 	s.cleanupCredentials(j)
 	s.releaseCPUsLocked(j.cpus)
 	j.cpus = nil
@@ -1205,7 +1216,8 @@ func (s *Server) handleJobLogs(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("stream") == "stderr" {
 		file = "stderr.log"
 	}
-	streamFile(w, r, filepath.Join(j.dir, file), offset, follow, done)
+	path := filepath.Join(j.dir, file)
+	streamFile(w, r, path, tailOffset(r, path, offset), follow, done)
 }
 
 func (s *Server) handleWriteBack(w http.ResponseWriter, r *http.Request) {
@@ -1225,6 +1237,33 @@ func (s *Server) handleWriteBack(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, p)
 }
 
+// tailOffset applies ?tail=N: start N bytes before the end (for a log viewer). streamFile
+// reports the offset it starts from in X-Offload-Offset, so the caller knows what it skipped.
+func tailOffset(r *http.Request, path string, offset int64) int64 {
+	var tail int64
+	fmt.Sscan(r.URL.Query().Get("tail"), &tail)
+	if tail <= 0 {
+		return offset
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return offset
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Size() <= tail {
+		return 0
+	}
+	offset = fi.Size() - tail
+	// Start at the next line, unless that is far off (one huge line): then mid-line it is.
+	buf := make([]byte, 64<<10)
+	n, _ := f.ReadAt(buf, offset-1)
+	if i := bytes.IndexByte(buf[:n], '\n'); i >= 0 {
+		offset += int64(i)
+	}
+	return offset
+}
+
 // streamFile copies path from offset to the response, polling for growth while follow is set
 // and done() is false. It always drains the file after done() turns true.
 func streamFile(w http.ResponseWriter, r *http.Request, path string, offset int64, follow bool, done func() bool) {
@@ -1240,6 +1279,7 @@ func streamFile(w http.ResponseWriter, r *http.Request, path string, offset int6
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("X-Offload-Offset", strconv.FormatInt(offset, 10))
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 64<<10)
 	// A follow ends after a while even if nothing does: the client reconnects from its offset,
@@ -1298,6 +1338,9 @@ func (s *Server) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 
 // gc drops finished jobs past retention and workspace slots unused for too long.
 func (s *Server) gc() {
+	if s.ledgerGCing.CompareAndSwap(false, true) { // it can read a large file: not on the scheduler loop
+		go func() { defer s.ledgerGCing.Store(false); s.gcLedger() }()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcContainersLocked()

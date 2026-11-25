@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -63,6 +64,12 @@ type Server struct {
 	whois   map[string]whoisEntry
 
 	ownNames selfNames // our own DNS names, for the Host check
+
+	started     time.Time
+	metrics     metricsState  // usage samples (metrics.go)
+	samplerDone chan struct{} // closed once the sampler has saved its last minute averages
+	ledgerMu    sync.Mutex    // serializes ledger appends with the ledger GC's swap (ledger.go)
+	ledgerGCing atomic.Bool   // a ledger GC is running
 }
 
 type whoisEntry struct {
@@ -91,6 +98,8 @@ func New(cfg *Config, version string) (*Server, error) {
 		}
 	}
 	s.loadHistory()
+	s.loadMetrics()
+	s.started = time.Now()
 	s.loadImageUse()
 	// Held for the daemon's lifetime: `runner reset-pairing` resets the file directly only when
 	// no runner holds it.
@@ -154,6 +163,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/sessions/{id}/stdin", s.handleSessionStdin)
 	mux.HandleFunc("GET /v1/sessions/{id}/stdout", s.handleSessionStdout)
 	mux.HandleFunc("GET /v1/sessions/{id}/stderr", s.handleSessionStderr)
+	mux.HandleFunc("GET /v1/sessions/{id}/observe/{stream}", s.handleSessionObserve)
 	mux.HandleFunc("DELETE /v1/sessions/{id}", s.handleStopSession)
 	mux.HandleFunc("POST /v1/data/{name}", s.handleDataPlan)
 	mux.HandleFunc("PUT /v1/data/{name}", s.handleDataUpload)
@@ -161,6 +171,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/estimate", s.handleEstimate)
 	mux.HandleFunc("POST /v1/admin/reset-pairing-checked", s.handleResetPairing)
 	mux.HandleFunc("POST /v1/admin/pair", s.handlePair)
+	mux.HandleFunc("GET /v1/metrics", s.handleMetrics)
+	mux.HandleFunc("GET /v1/metrics/series", s.handleSeries)
+	mux.HandleFunc("GET /v1/ledger", s.handleLedger)
 
 	handler := s.auth(mux)
 	errc := make(chan error, len(s.cfg.Listen))
@@ -169,6 +182,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	go s.loop(ctx)
 	go s.prebuildBase()
+	sctx, stopSampler := context.WithCancel(ctx)
+	s.samplerDone = make(chan struct{})
+	go s.sampleLoop(sctx)
+	defer func() { stopSampler(); <-s.samplerDone }() // its final save, however Serve returns
 	select {
 	case <-ctx.Done():
 		return nil
@@ -482,6 +499,18 @@ func (s *Server) tokensPath() string {
 
 const pairByCodeHeader = "X-Offload-Pair-By-Code"
 
+// callerOf names how a request was admitted, for the job's record: "local" (the unix socket),
+// "token" (a paired client), or the tailnet identity. auth strips the headers it relies on.
+func callerOf(r *http.Request) string {
+	switch {
+	case r.Context().Value(unixMarker{}) != nil:
+		return "local"
+	case r.Header.Get(callerTokenHeader) != "":
+		return "token"
+	}
+	return r.Header.Get("X-Offload-Caller")
+}
+
 // callerTokenHeader carries the sha256 of the token a request authenticated with (set by auth).
 const callerTokenHeader = "X-Offload-Caller-Token"
 
@@ -689,6 +718,7 @@ func (s *Server) status() api.Status {
 		Profiles: map[string]api.ProfileInfo{}, Persistent: s.cfg.persistent, Accepting: true,
 	}
 	st.Hostname, _ = os.Hostname()
+	st.Started, st.HostCPUs, st.Metrics = s.started, runtime.NumCPU(), true
 	st.Proto = api.Proto
 	st.OS, st.Arch, st.Runtime = runtime.GOOS, runtime.GOARCH, "host"
 	if s.containersAvailable() {
@@ -874,7 +904,11 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]string{"status": "upgraded; restarting"})
 	log.Printf("binary replaced; exiting so systemd restarts the new version")
-	go func() { time.Sleep(300 * time.Millisecond); os.Exit(0) }()
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		s.saveMetrics() // os.Exit skips Serve's shutdown, and with it the sampler's final save
+		os.Exit(0)
+	}()
 }
 
 // allocatedBusyLocked counts running jobs and live sessions.
