@@ -680,6 +680,7 @@ func stopUnitConfirmed(unit string) error {
 func (s *Server) admit() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.expireBuildsLocked()
 	if s.retireErr != "" || s.upgrading {
 		return // workloads of an older version may still run: start nothing until they're gone
 	}

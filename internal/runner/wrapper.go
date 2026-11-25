@@ -130,9 +130,6 @@ func collectWriteBack(dir, recordPath, dest string) (*api.WriteBack, error) {
 	sort.Strings(paths)
 	for _, p := range paths {
 		ent := rec.Files[p]
-		if ent.Link != "" {
-			continue
-		}
 		// Through real directories only: a parent the job replaced with a symlink would make
 		// this read some other file's bytes for p. Behind such a parent, p is gone.
 		if parentsState(root, p) != parentsReal {
@@ -144,20 +141,39 @@ func collectWriteBack(dir, recordPath, dest string) (*api.WriteBack, error) {
 			wb.Deleted = append(wb.Deleted, p)
 			continue
 		}
-		if !fi.Mode().IsRegular() || (fi.Size() == ent.Size && fi.ModTime().UnixNano() == ent.MTime && ctimeOf(fi) == ent.CTime) {
+		if fi.Mode()&fs.ModeSymlink != 0 { // a symlink now: retargeted, or a file that became one
+			target, err := root.Readlink(p)
+			if err == nil && target != ent.Link {
+				c := api.ChangedFile{Path: p, Link: target, BaseLink: ent.Link}
+				if ent.Link == "" {
+					c.BaseHash = ent.Hash
+				}
+				wb.Modified = append(wb.Modified, c)
+				rec.Files[p] = slotEntry{Link: target}
+			}
+			continue
+		}
+		if !fi.Mode().IsRegular() {
+			continue
+		}
+		if ent.Link == "" && fi.Size() == ent.Size && fi.ModTime().UnixNano() == ent.MTime && ctimeOf(fi) == ent.CTime {
 			continue
 		}
 		h, err := fileHash(root, p)
 		if err != nil {
 			continue
 		}
-		if h != ent.Hash || os.FileMode(ent.Mode).Perm() != fi.Mode().Perm() { // content, or just chmod
+		if ent.Link != "" || h != ent.Hash || os.FileMode(ent.Mode).Perm() != fi.Mode().Perm() { // content, chmod, or a link that became a file
 			if total += fi.Size(); total > writeBackLimit {
 				return nil, fmt.Errorf("edited files exceed %d MiB; not sending them back", writeBackLimit>>20)
 			}
-			wb.Modified = append(wb.Modified, api.ChangedFile{Path: p, Hash: h, BaseHash: ent.Hash, Mode: uint32(fi.Mode().Perm()), Size: fi.Size()})
+			c := api.ChangedFile{Path: p, Hash: h, BaseHash: ent.Hash, Mode: uint32(fi.Mode().Perm()), Size: fi.Size()}
+			if ent.Link != "" {
+				c.BaseHash, c.BaseLink = "", ent.Link
+			}
+			wb.Modified = append(wb.Modified, c)
 		}
-		ent.Hash, ent.Size, ent.MTime, ent.CTime, ent.Mode = h, fi.Size(), fi.ModTime().UnixNano(), ctimeOf(fi), uint32(fi.Mode().Perm())
+		ent.Hash, ent.Size, ent.MTime, ent.CTime, ent.Mode, ent.Link = h, fi.Size(), fi.ModTime().UnixNano(), ctimeOf(fi), uint32(fi.Mode().Perm()), ""
 		rec.Files[p] = ent
 	}
 	if len(wb.Modified) > 0 {
@@ -196,6 +212,9 @@ func packFiles(dest string, root *os.Root, files []api.ChangedFile) error {
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)
 	for _, c := range files {
+		if c.Link != "" {
+			continue // a symlink: described in the record, no content
+		}
 		src, err := root.Open(c.Path)
 		if err != nil {
 			return err

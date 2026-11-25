@@ -743,6 +743,22 @@ func checkTarGz(f *os.File) error {
 	return err
 }
 
+// linkIs reports whether rel is a symlink pointing at target.
+func linkIs(tree *os.Root, rel, target string) bool {
+	fi, err := tree.Lstat(rel)
+	if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+		return false
+	}
+	cur, err := tree.Readlink(rel)
+	return err == nil && cur == target
+}
+
+func randomName() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 // verifyArchive checks a downloaded write-back archive is complete and intact (every entry's
 // hash) before anything from it is applied.
 func verifyArchive(f *os.File, want map[string]api.ChangedFile) error {
@@ -873,7 +889,13 @@ func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string,
 	if err != nil {
 		return fmt.Errorf("downloading the job's edits: %w", err)
 	}
-	if err := verifyArchive(archive, byPath); err != nil {
+	content := map[string]api.ChangedFile{} // symlinks carry no content
+	for p, c := range byPath {
+		if c.Link == "" {
+			content[p] = c
+		}
+	}
+	if err := verifyArchive(archive, content); err != nil {
 		return fmt.Errorf("downloading the job's edits: %w", err)
 	}
 	gz, err := gzip.NewReader(archive)
@@ -927,11 +949,16 @@ func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string,
 		orig, known := base[c.Path]
 		if realParents(tree, c.Path) {
 			cur, before, herr := hashFileIn(tree, c.Path)
-			unchanged := known && orig.Link == "" && orig.Hash == c.BaseHash && herr == nil && cur == orig.Hash &&
-				before.Mode().Perm() == os.FileMode(orig.Mode).Perm()
-			if unchanged {
-				h, now, err := hashFileIn(tree, c.Path)
-				unchanged = err == nil && os.SameFile(before, now) && now.Mode() == before.Mode() && h == orig.Hash
+			var unchanged bool
+			if c.BaseLink != "" { // it was a symlink: still the one the job was sent?
+				unchanged = known && orig.Link == c.BaseLink && linkIs(tree, c.Path, c.BaseLink)
+			} else {
+				unchanged = known && orig.Link == "" && orig.Hash == c.BaseHash && herr == nil && cur == orig.Hash &&
+					before.Mode().Perm() == os.FileMode(orig.Mode).Perm()
+				if unchanged {
+					h, now, err := hashFileIn(tree, c.Path)
+					unchanged = err == nil && os.SameFile(before, now) && now.Mode() == before.Mode() && h == orig.Hash
+				}
 			}
 			if unchanged && tree.Rename(tmp, c.Path) == nil {
 				wrote = append(wrote, c.Path)
@@ -960,6 +987,52 @@ func applyWriteBackLocked(ctx context.Context, h *Host, j *api.Job, root string,
 			return fmt.Errorf("%s: saving the job's version: %w (it is in %s)", c.Path, err, tmp)
 		}
 		skipped = append(skipped, c.Path+" (job's version: "+saved+")")
+	}
+	for _, c := range wb.Modified { // symlinks the job retargeted (or files it made links)
+		if c.Link == "" {
+			continue
+		}
+		if err := checkRel(c.Path); err != nil {
+			return err
+		}
+		orig, known := base[c.Path]
+		if linkIs(tree, c.Path, c.Link) {
+			wrote = append(wrote, c.Path) // already applied
+			continue
+		}
+		var unchanged bool
+		if realParents(tree, c.Path) {
+			if c.BaseLink != "" {
+				unchanged = known && orig.Link == c.BaseLink && linkIs(tree, c.Path, c.BaseLink)
+			} else if cur, fi, err := hashFileIn(tree, c.Path); err == nil {
+				unchanged = known && orig.Link == "" && orig.Hash == c.BaseHash && cur == orig.Hash && fi.Mode().Perm() == os.FileMode(orig.Mode).Perm()
+			}
+		}
+		if unchanged {
+			tmp := path.Join(path.Dir(c.Path), ".offload-"+randomName())
+			if tree.Symlink(c.Link, tmp) == nil {
+				if tree.Rename(tmp, c.Path) == nil {
+					wrote = append(wrote, c.Path)
+					continue
+				}
+				_ = tree.Remove(tmp)
+			}
+		}
+		saved := ""
+		for i := 0; i < 100 && saved == "" && realParents(tree, c.Path); i++ {
+			cand := c.Path + ".offload-incoming"
+			if i > 0 {
+				cand = fmt.Sprintf("%s.%d", cand, i)
+			}
+			if tree.Symlink(c.Link, cand) == nil {
+				saved = cand
+			}
+		}
+		if saved == "" {
+			skipped = append(skipped, c.Path+" (the job made it a link to "+c.Link+")")
+		} else {
+			skipped = append(skipped, c.Path+" (job's version: "+saved+")")
+		}
 	}
 	if len(wrote) > 0 {
 		logf(quiet, "wrote back %d file(s) the job changed: %s", len(wrote), strings.Join(firstN(wrote, 8), ", "))

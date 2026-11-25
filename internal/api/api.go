@@ -185,6 +185,10 @@ type ChangedFile struct {
 	BaseHash string `json:"base_hash,omitempty"`
 	Mode     uint32 `json:"mode"`
 	Size     int64  `json:"size"`
+	// Link is set when the job left a symlink here (pointing at Link; no content in the
+	// archive); BaseLink when the path was a symlink before the job (BaseHash otherwise).
+	Link     string `json:"link,omitempty"`
+	BaseLink string `json:"base_link,omitempty"`
 }
 
 // SessionSpec is the body of POST /v1/sessions.

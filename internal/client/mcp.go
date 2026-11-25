@@ -81,6 +81,9 @@ func MCP(o MCPOptions) error {
 	} else if o.Prepare {
 		return fmt.Errorf("--prepare needs a session definition in %s", filepath.Join(configDir(), "sessions", profile+".toml"))
 	}
+	if o.Host && sc != nil && len(sc.Data) > 0 {
+		return fmt.Errorf("session %s mounts data sets, which only container sessions get; run it without --host", profile)
+	}
 	if o.Host { // runs on the runner itself: no environment to load at all
 		spec.Runtime, spec.Environment = "host", nil
 	} else if o.Environment != "" {
@@ -228,15 +231,19 @@ pick:
 	out := &activityWriter{w: os.Stdout, started: time.Now()}
 	done := make(chan error, 2)
 	inDone := make(chan error, 1)
-	errDone := make(chan struct{})
+	errDone := make(chan error, 1)
 	go func() { done <- pumpOut(ctx, h, se.ID, "stdout", out) }()
-	go func() { _ = pumpOut(ctx, h, se.ID, "stderr", os.Stderr); close(errDone) }()
-	// When the session ends, let stderr catch up (its last lines are often the diagnostic),
-	// but not forever.
+	go func() { errDone <- pumpOut(ctx, h, se.ID, "stderr", os.Stderr) }()
+	// When the session ends, stderr is read to its end too (its last lines are often the
+	// diagnostic), within a bound; a failure there is reported, not swallowed.
 	drainStderr := func() {
 		select {
-		case <-errDone:
-		case <-time.After(5 * time.Second):
+		case err := <-errDone:
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "offload: the session's stderr didn't arrive completely: %v\n", err)
+			}
+		case <-time.After(30 * time.Second):
+			fmt.Fprintf(os.Stderr, "offload: gave up waiting for the rest of the session's stderr\n")
 		}
 	}
 	if o.Prepare {

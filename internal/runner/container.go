@@ -56,6 +56,7 @@ type envBuild struct {
 	hadWaiters   bool      // jobs asked for it (a build only sessions asked for has none)
 	sessionAsked time.Time // last time a session launch asked for it
 	abandoned    bool      // every job that wanted it left: stopped, not an error to report
+	prebuild     bool      // the runner's own base prebuild: nobody needs to keep asking
 }
 
 func hash12(parts ...string) string {
@@ -690,7 +691,7 @@ func (s *Server) prebuildBase() {
 		s.mu.Unlock()
 		return // no room now; the first job that needs it builds it once there is
 	}
-	b := &envBuild{tag: baseTag(), waiters: map[string]*job{}}
+	b := &envBuild{tag: baseTag(), waiters: map[string]*job{}, prebuild: true}
 	s.builds[baseTag()] = b
 	s.mu.Unlock()
 	log.Printf("building base environment %s", baseTag())
@@ -725,11 +726,12 @@ var basePathRE = regexp.MustCompile(`(?:^|\s)PATH=(\S+)`) // PATH=, not GOPATH=
 func stockInstallEnv(def *api.EnvDef) map[string]string {
 	set := map[string]bool{}
 	if def != nil {
-		cf := def.Containerfile
-		if !strings.Contains(cf, imageRepo+"/base") && !strings.Contains(cf, "offload/base") {
+		// The final stage (and those it builds on) must come from offload/base: a builder stage
+		// on it says nothing about an image whose final stage is Debian with its own rustc.
+		cf := finalStage(def.Containerfile)
+		if !fromBaseRE.MatchString(cf) && !strings.Contains(cf, imageRepo+"/base") {
 			return nil
 		}
-		cf = finalStage(cf)
 		set = envKeys(cf)
 	}
 	m := basePathRE.FindStringSubmatch(baseContainerfile)
@@ -802,6 +804,23 @@ func envKeys(cf string) map[string]bool {
 		}
 	}
 	return keys
+}
+
+// expireBuildsLocked stops builds only session launches asked for once those stopped asking
+// (the client polls every few seconds while it waits; Ctrl-C ends that).
+func (s *Server) expireBuildsLocked() {
+	for _, b := range s.builds {
+		if b.prebuild || b.done || b.abandoned || len(b.waiters) > 0 || b.sessionAsked.IsZero() {
+			continue
+		}
+		if time.Since(b.sessionAsked) > 2*time.Minute {
+			b.abandoned = true
+			if b.unit != "" {
+				log.Printf("build %s: no launch is waiting for it any more; stopping it", b.tag)
+				stopUnit(b.unit)
+			}
+		}
+	}
 }
 
 // leaveBuildsLocked takes a finished job off the builds it waited for. A build every job left

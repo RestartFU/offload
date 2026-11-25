@@ -224,11 +224,10 @@ func (s *Server) gitCheckout(ctx context.Context, sl *slot, key string, g *api.G
 		_ = os.MkdirAll(filepath.Join(gitDir, "info"), 0o755)
 		_ = os.WriteFile(filepath.Join(gitDir, "info", "exclude"), []byte(ignoreRules), 0o644)
 	}
-	if ignoreGlobal != "" {
-		global := filepath.Join(gitDir, "offload-global-excludes")
-		if os.WriteFile(global, []byte(ignoreGlobal), 0o644) == nil {
-			_, _ = gitCmdCtx(ctx, sl.Dir, "config", "core.excludesFile", global)
-		}
+	// Always set, even empty: the runner user's own global excludes must not apply.
+	global := filepath.Join(gitDir, "offload-global-excludes")
+	if os.WriteFile(global, []byte(ignoreGlobal), 0o644) == nil {
+		_, _ = gitCmdCtx(ctx, sl.Dir, "config", "core.excludesFile", global)
 	}
 	// The client's tags (those reachable from HEAD), for `git describe`; ones whose objects
 	// never arrived are left out rather than failing the checkout.

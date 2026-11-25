@@ -344,6 +344,10 @@ func SyncData(ctx context.Context, h *Host, name string, cfg DataSetConfig, quie
 		if resp.StatusCode == http.StatusConflict && attempt < 3 {
 			continue
 		}
+		if resp.StatusCode == http.StatusLocked { // a session started using it meanwhile
+			logf(false, "data set %s is in use by a session on %s; using the runner's copy (not synced)", name, h.Name)
+			return nil
+		}
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("data set %s: %w", name, &APIError{Code: resp.StatusCode, Msg: apiMessage(b)})
 		}

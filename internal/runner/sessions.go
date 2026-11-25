@@ -103,11 +103,23 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		}
 		prof = &Profile{Name: spec.Profile, Kind: "session", Command: spec.Def.Command, Env: spec.Def.Env,
 			Devices: spec.Def.Devices, Runtime: "container", NestedSandbox: spec.Def.NestedSandbox, Network: spec.Def.Network}
-		for name, ctr := range spec.Def.Data {
+		// The data sets stay locked until the session is registered as using them: an upload
+		// can't replace files between that check and the session opening them.
+		names := make([]string, 0, len(spec.Def.Data))
+		for name := range spec.Def.Data {
 			if !validKey(name) {
 				out.err(400, "invalid data set name "+strconv.Quote(name))
 				return
 			}
+			names = append(names, name)
+		}
+		sort.Strings(names) // one order everywhere: no deadlock between two launches
+		for _, name := range names {
+			m := dataLock(name)
+			m.Lock()
+			defer m.Unlock()
+		}
+		for name, ctr := range spec.Def.Data {
 			if _, err := os.Stat(s.dataPath(name)); err != nil {
 				out.err(400, "data set "+name+" was never synced to this runner")
 				return
@@ -209,7 +221,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		ID: newID("s-"), Runner: s.cfg.Name, Profile: spec.Profile, State: api.StateRunning,
 		Resources: res, CreatedAt: now, LastSeen: now, Runtime: rt, Image: image, Proto: api.Proto,
 	}}
-	if spec.Def != nil {
+	if spec.Def != nil && rt == "container" { // only container sessions mount them
 		for name := range spec.Def.Data {
 			se.DataSets = append(se.DataSets, name)
 		}
