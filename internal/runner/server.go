@@ -822,7 +822,9 @@ func (s *Server) cpuIdleLocked() (float64, bool) {
 		return 0, false
 	}
 	idle := s.cfg.Capacity.CPU - math.Float64frombits(s.poolBusy.Load())
-	since := time.Unix(0, at).Add(-time.Second) // a sample spans the step before it
+	// A sample averages the step before it: work that started during that step shows only in
+	// part, so its whole guarantee counts as busy.
+	since := time.Unix(0, at).Add(-api.MetricsStep - time.Second)
 	for _, j := range s.jobs {
 		if j.State == api.StateRunning && j.StartedAt != nil && j.StartedAt.After(since) {
 			idle -= j.Resources.CPU

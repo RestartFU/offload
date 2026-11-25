@@ -665,8 +665,12 @@ func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []s
 		r.Mem = min(r.Mem, st.Capacity.Mem)
 		f := h.free()
 		score := float64(h.Priority) * 1000
+		unbooked := st.Capacity.CPU - st.Allocated.CPU - st.Pending.CPU
 		if f.CPU >= r.CPU && f.Mem >= r.Mem {
-			score += 500 // can start right away
+			score += 400 // can start right away
+			if unbooked >= r.CPU {
+				score += 100 // without overbooking: its guarantee really is free there
+			}
 		}
 		if key != "" {
 			for _, k := range st.WarmKeys {
@@ -675,7 +679,7 @@ func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []s
 				}
 			}
 		}
-		score += f.CPU - st.Load1/4
+		score += min(f.CPU, max(unbooked, 0)+f.CPU/4) - st.Load1/4
 		if st.OS == goruntime.GOOS && st.Arch == goruntime.GOARCH {
 			score += 50
 		}

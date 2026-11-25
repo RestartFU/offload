@@ -46,3 +46,14 @@ func TestPickOverbookedIdleRunner(t *testing.T) {
 		t.Fatalf("free %.1f with only 5 idle cores", f.CPU)
 	}
 }
+
+// A runner with unbooked room beats one that could only take the job by overbooking.
+func TestPickPrefersUnbookedRoom(t *testing.T) {
+	want := api.Resources{CPU: 8, Mem: 1 << 30}
+	vps := testHost("vps", 30, api.Resources{CPU: 24}, api.Resources{})
+	vps.Status.CPUOvercommit, vps.Status.CPUIdle = 2, 20
+	zeno := testHost("zeno", 22, api.Resources{CPU: 12}, api.Resources{})
+	if h, _ := pick([]*Host{vps, zeno}, want, "", "", "job", nil); h.Name != "zeno" {
+		t.Fatalf("picked %s; want zeno, which has 10 unbooked cores", h.Name)
+	}
+}
