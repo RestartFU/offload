@@ -20,7 +20,8 @@ offload run --get target/release/app -- cargo build --release   # bring a file/d
 You never choose where or how big. Offload picks the runner (warm workspace, free capacity,
 load), the profile (from the command: cargo, go, …), and the memory limit (learned from earlier
 runs of the same command). If that guess runs out of memory, the job is retried once with twice
-the memory. Override only when you know better: `--mem 16G`, `--cpu 8`, `--on NAME`.
+the memory. Don't pass `--mem` unless a job ran out of memory even after that retry: an explicit
+limit replaces the learned one. `--cpu 8` and `--on NAME` are there when you know better.
 
 What the job sees on the runner:
 - The repository as it is here: tracked files plus untracked files that aren't ignored, including

@@ -76,3 +76,17 @@ func TestPickSpreadsToIdleRunner(t *testing.T) {
 		t.Fatalf("picked %s; want the warm vps", h.Name)
 	}
 }
+
+// A runner reporting its memory room is taken at its word: its limits may add up past capacity
+// because it books jobs at their usual peak.
+func TestFreeUsesMemRoom(t *testing.T) {
+	vps := testHost("vps", 30, api.Resources{Mem: 32 << 30}, api.Resources{Mem: 2 << 30})
+	if f := vps.free(); f.Mem > 0 {
+		t.Fatalf("older runner, fully allocated: free %d", f.Mem)
+	}
+	room := int64(12 << 30)
+	vps.Status.MemRoom = &room
+	if f := vps.free(); f.Mem != 10<<30 {
+		t.Fatalf("free %d; want room less pending, 10G", f.Mem)
+	}
+}

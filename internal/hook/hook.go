@@ -45,7 +45,7 @@ func Claude(in io.Reader, out io.Writer) int {
 	}
 	reason := fmt.Sprintf("Heavy commands run on offload runners, not this machine. Run it as:\n"+
 		"  offload run -- %s\n"+
-		"Use a profile for sensible limits (offload run --profile cargo -- …), --mem 16G for big links, "+
+		"Memory limits are learned from earlier runs, so leave out --mem unless a job ran out of memory. "+
 		"--get <path> to bring build outputs back. Run it in the background and use `offload attach <id>` if it takes a while. "+
 		"If it truly must run locally, prefix the command with OFFLOAD_GUARD=off.", cmd)
 	if strings.HasPrefix(strings.TrimSpace(cmd), "OFFLOAD_GUARD=off") {

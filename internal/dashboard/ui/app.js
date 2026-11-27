@@ -396,7 +396,7 @@ function renderKPIs(runners) {
       `Guaranteed CPU not yet handed to jobs or sessions (${fmtCores(t.allocCPU)} is)`, null, true),
     kpi("Busy right now", t.busy == null ? "–" : h("span", {}, fmtCores(t.busy), " ", h("small", {}, "cores")),
       t.busy == null ? "Runners need an upgrade for live usage" : `${pct(t.hostCPUs ? t.busy / t.hostCPUs : 0)} of ${t.hostCPUs} CPUs, whole hosts`),
-    kpi("Memory free", fmtBytes(t.freeMem), `of ${fmtBytes(t.capMem)} not yet allocated · hosts have ${fmtBytes(t.memAvail)} available`),
+    kpi("Memory free", fmtBytes(t.freeMem), `of ${fmtBytes(t.capMem)} not yet booked · hosts have ${fmtBytes(t.memAvail)} available`),
     kpi("Workloads", h("span", {}, String(t.running), " ", h("small", {}, "running")), `${t.queued} queued · ${t.sessions} session${t.sessions === 1 ? "" : "s"}`),
     kpi("Runners", h("span", {}, String(t.online), " ", h("small", {}, "of " + t.runners)), t.online === t.runners ? "All answering" : `${t.runners - t.online} not answering`),
   );
@@ -455,7 +455,7 @@ function runnerCard(r) {
     h("div", { class: "meter-row" }, h("span", { class: "k" }, "CPU"), meter(st.capacity.cpu ? st.allocated.cpu / st.capacity.cpu : 0),
       h("span", { class: "v num" }, `${fmtCores(st.allocated.cpu)} of ${fmtCores(st.capacity.cpu)} cores guaranteed to work · load ${st.load1.toFixed(1)}`)),
     h("div", { class: "meter-row" }, h("span", { class: "k" }, "Memory"), meter(memFrac, memFrac > 0.9 ? "warn" : ""),
-      h("span", { class: "v num" }, `${fmtBytes(st.allocated.mem)} of ${fmtBytes(st.capacity.mem)} allocated · host ${fmtBytes(st.mem_available)} available, reserve ${fmtBytes(st.mem_reserve)}`)),
+      h("span", { class: "v num" }, `${fmtBytes(st.allocated.mem)} of ${fmtBytes(st.capacity.mem)} booked · host ${fmtBytes(st.mem_available)} available, reserve ${fmtBytes(st.mem_reserve)}`)),
   ];
   for (const d of m?.disk || []) {
     const used = d.total ? 1 - d.free / d.total : 0;
@@ -491,7 +491,7 @@ function renderQueue(runners) {
 // ---------- charts ----------
 const SERIES = {
   cpu: [["cpu_busy", "Whole host busy", "--series-1"], ["cpu_used", "Used by offload", "--series-2"], ["cpu_alloc", "Guaranteed to work", "--series-3"]],
-  mem: [["mem_used", "Whole host in use", "--series-1"], ["mem_work", "Used by offload", "--series-2"], ["mem_alloc", "Allocated limits", "--series-3"]],
+  mem: [["mem_used", "Whole host in use", "--series-1"], ["mem_work", "Used by offload", "--series-2"], ["mem_alloc", "Booked", "--series-3"]],
 };
 
 // combine sums every runner's series into one, aligned on step buckets. Within a runner, points

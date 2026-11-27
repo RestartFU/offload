@@ -44,7 +44,7 @@ func TestStatusCountsPendingJobs(t *testing.T) {
 // beyond the overcommit limit.
 func TestCPUOvercommit(t *testing.T) {
 	cfg := &Config{memCap: 64 << 30}
-	cfg.Capacity.CPU, cfg.Policy.CPUOvercommit = 30, 2
+	cfg.Capacity.CPU, cfg.Policy.CPUOvercommit, cfg.Policy.MemOvercommit = 30, 2, 2
 	long := time.Now().Add(-time.Hour)
 	run := &job{}
 	run.ID, run.State, run.StartedAt, run.Resources = "j-1", api.StateRunning, &long, api.Resources{CPU: 16}
@@ -56,15 +56,15 @@ func TestCPUOvercommit(t *testing.T) {
 	}
 
 	setBusy(2, time.Now()) // the running job's 16 are mostly unused
-	if ok, why := s.fitsLocked(want); !ok {
+	if ok, why := s.fitsLocked(want, want.Mem); !ok {
 		t.Fatalf("idle cores: refused (%s)", why)
 	}
 	setBusy(20, time.Now())
-	if ok, _ := s.fitsLocked(want); ok {
+	if ok, _ := s.fitsLocked(want, want.Mem); ok {
 		t.Fatal("busy host: admitted past capacity")
 	}
 	setBusy(0, time.Now().Add(-time.Minute))
-	if ok, _ := s.fitsLocked(want); ok {
+	if ok, _ := s.fitsLocked(want, want.Mem); ok {
 		t.Fatal("stale sample: admitted past capacity")
 	}
 	// Work started since the sample counts as busy: it can't show in the sample yet.
@@ -74,20 +74,92 @@ func TestCPUOvercommit(t *testing.T) {
 	fresh := &job{}
 	fresh.ID, fresh.State, fresh.StartedAt, fresh.Resources = "j-2", api.StateRunning, &now, api.Resources{CPU: 16}
 	s.jobs["j-2"] = fresh
-	if ok, _ := s.fitsLocked(api.Resources{CPU: 14, Mem: 1 << 20}); ok { // 30 - 2 busy - 16 just started = 12 idle
+	if ok, _ := s.fitsLocked(api.Resources{CPU: 14, Mem: 1 << 20}, 1<<20); ok { // 30 - 2 busy - 16 just started = 12 idle
 		t.Fatal("admitted on cores a just-started job holds")
 	}
 	// Never past capacity × overcommit, however idle.
 	delete(s.jobs, "j-2")
 	run.Resources.CPU = 50
 	setBusy(0, time.Now())
-	if ok, _ := s.fitsLocked(want); ok {
+	if ok, _ := s.fitsLocked(want, want.Mem); ok {
 		t.Fatal("admitted past the overcommit limit")
 	}
 	// Within capacity nothing changes: no sample needed.
 	run.Resources.CPU = 4
 	s.poolBusyAt.Store(0)
-	if ok, why := s.fitsLocked(want); !ok {
+	if ok, why := s.fitsLocked(want, want.Mem); !ok {
 		t.Fatalf("within capacity: refused (%s)", why)
+	}
+}
+
+// Jobs are booked at their usual peak, so limits may add up past capacity; bookings, the
+// overcommit limit and what the host has left once running jobs grow still bound admission.
+func TestMemOverbooking(t *testing.T) {
+	cfg := &Config{memCap: 20 << 30}
+	cfg.Capacity.CPU, cfg.Policy.CPUOvercommit, cfg.Policy.MemOvercommit = 30, 2, 2
+	run := &job{memNow: 2 << 30}
+	run.ID, run.State, run.Resources, run.MemBooked = "j-1", api.StateRunning, api.Resources{CPU: 1, Mem: 16 << 30}, 2<<30
+	s := &Server{cfg: cfg, jobs: map[string]*job{"j-1": run}}
+	want := api.Resources{CPU: 1, Mem: 16 << 30}
+
+	if ok, why := s.fitsLocked(want, 2<<30); !ok { // 32G of limits on a 20G runner
+		t.Fatalf("booked 4 of 20G: refused (%s)", why)
+	}
+	run.MemBooked, run.memNow = 16<<30, 16<<30
+	if ok, _ := s.fitsLocked(want, 5<<30); ok {
+		t.Fatal("admitted past the booked capacity")
+	}
+	run.MemBooked, run.memNow, run.Resources.Mem = 2<<30, 2<<30, 30<<30
+	if ok, _ := s.fitsLocked(want, 2<<30); ok {
+		t.Fatal("admitted with limits past capacity × mem_overcommit")
+	}
+	if got := run.booked(); got != 2<<30 {
+		t.Fatalf("booked %d", got)
+	}
+
+	// A running job that hasn't reached its booking yet will take the rest: MemAvailable can't
+	// show that, so the host check counts it.
+	cfg.memCap = 1 << 40
+	run.Resources.Mem, run.MemBooked, run.memNow = 16<<30, 8<<30, 8<<30
+	cfg.memReserve = memAvailable() - 2<<30 - 4<<30 // room for the new booking plus 4G
+	if ok, why := s.fitsLocked(want, 2<<30); !ok {
+		t.Fatalf("running job at its booking: refused (%s)", why)
+	}
+	run.memNow = 0 // just started: 8G still to come
+	if ok, _ := s.fitsLocked(want, 2<<30); ok {
+		t.Fatal("admitted on memory a just-started job is about to use")
+	}
+}
+
+func TestBookMemFromHistory(t *testing.T) {
+	s := &Server{cfg: &Config{memCap: 64 << 30}, history: map[string]*histEntry{}}
+	spec := api.JobSpec{WorkspaceKey: "repo", Argv: []string{"go", "test", "./..."}}
+	if got := s.bookMemLocked(spec, 16<<30); got != 16<<30 {
+		t.Fatalf("no history: booked %d; want the limit", got)
+	}
+	s.history[histKey(spec)] = &histEntry{Peaks: []int64{1 << 30, 3<<30 - 5, 2 << 30}}
+	if got := s.bookMemLocked(spec, 16<<30); got != 3<<30 {
+		t.Fatalf("booked %d; want the largest peak, 3G", got)
+	}
+	if got := s.bookMemLocked(spec, 2<<30); got != 2<<30 {
+		t.Fatalf("booked %d; never more than the limit", got)
+	}
+}
+
+// A kill for the job's own limit is its OOM; a kill for offload.slice or the host filling up
+// is the runner's, which must not grow the job's learned limit.
+func TestParseOOMEvents(t *testing.T) {
+	for _, c := range []struct {
+		events    string
+		own, host bool
+	}{
+		{"low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n", false, false},
+		{"low 0\nhigh 0\nmax 12\noom 1\noom_kill 1\noom_group_kill 0\n", true, false},
+		{"low 0\nhigh 0\nmax 0\noom 0\noom_kill 2\noom_group_kill 0\n", false, true},
+		{"oom 3\noom_kill 0\n", false, false},
+	} {
+		if own, host := parseOOMEvents(c.events); own != c.own || host != c.host {
+			t.Errorf("%q: own %v host %v; want %v %v", c.events, own, host, c.own, c.host)
+		}
 	}
 }

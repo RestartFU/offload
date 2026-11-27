@@ -149,6 +149,9 @@ type Job struct {
 	StopRequested bool `json:"stop_requested,omitempty"`
 	// MemFrom says where the memory limit came from: "requested", "learned", "profile", "default".
 	MemFrom string `json:"mem_from,omitempty"`
+	// MemBooked is the memory admission counts for the job: the most its command used in recent
+	// runs, at most its limit. 0 means the whole limit (no history, or an older runner).
+	MemBooked int64 `json:"mem_booked,omitempty"`
 	// Caller is the authenticated identity that created the job (tailnet login or tags, "token",
 	// or "local"), set by the runner. Spec.Client is the caller's own free-form label.
 	Caller string `json:"caller,omitempty"`
@@ -283,35 +286,38 @@ type Status struct {
 	Version   string    `json:"version"`
 	Hostname  string    `json:"hostname"`
 	Capacity  Resources `json:"capacity"`  // CPU and Mem the runner hands out
-	Allocated Resources `json:"allocated"` // sum of running jobs' and sessions' guarantees
+	Allocated Resources `json:"allocated"` // guarantees of running work; Mem is booked, not limits
 	Pending   Resources `json:"pending"`   // guarantees of jobs still uploading or queued
 	Requeue   bool      `json:"requeue,omitempty"`
 	// CPU overbooking: guarantees may add up to Capacity.CPU*CPUOvercommit, but past capacity a
 	// job only starts while CPUIdle (the cores really idle now) covers its guarantee.
-	CPUOvercommit float64                `json:"cpu_overcommit,omitempty"`
-	CPUIdle       float64                `json:"cpu_idle,omitempty"` // DELETE /v1/jobs/{id}?moved=1 cancels only a queued job
-	Defaults      Resources              `json:"defaults"`
-	MemAvailable  int64                  `json:"mem_available"` // host MemAvailable right now
-	MemReserve    int64                  `json:"mem_reserve"`   // never admit below this MemAvailable
-	Load1         float64                `json:"load1"`
-	Running       int                    `json:"running"`
-	Queued        int                    `json:"queued"`
-	Sessions      int                    `json:"sessions"`
-	WarmKeys      []string               `json:"warm_keys"`           // workspace keys with a persistent slot
-	DataSets      []string               `json:"data_sets,omitempty"` // data sets synced to this runner
-	Profiles      map[string]ProfileInfo `json:"profiles"`
-	Persistent    bool                   `json:"persistent"`
-	OS            string                 `json:"os"`
-	Arch          string                 `json:"arch"`
-	Runtime       string                 `json:"runtime"` // default runtime: "container" or "host"
-	Images        int                    `json:"images,omitempty"`
-	Features      []string               `json:"features"` // cgroup controllers in use: cpuset, io…
-	Accepting     bool                   `json:"accepting"`
-	Proto         int                    `json:"proto"`
-	Reason        string                 `json:"reason,omitempty"`
-	Started       time.Time              `json:"started"`             // when this runner process started
-	HostCPUs      int                    `json:"host_cpus,omitempty"` // every CPU on the host, offload's or not
-	Metrics       bool                   `json:"metrics,omitempty"`   // serves /v1/metrics and /v1/ledger
+	CPUOvercommit float64 `json:"cpu_overcommit,omitempty"`
+	CPUIdle       float64 `json:"cpu_idle,omitempty"` // DELETE /v1/jobs/{id}?moved=1 cancels only a queued job
+	// MemRoom is the memory a job could be given now: by bookings, the limit on overbooking and
+	// what the host has left once running jobs grow to their bookings. Pending jobs not counted.
+	MemRoom      *int64                 `json:"mem_room,omitempty"`
+	Defaults     Resources              `json:"defaults"`
+	MemAvailable int64                  `json:"mem_available"` // host MemAvailable right now
+	MemReserve   int64                  `json:"mem_reserve"`   // never admit below this MemAvailable
+	Load1        float64                `json:"load1"`
+	Running      int                    `json:"running"`
+	Queued       int                    `json:"queued"`
+	Sessions     int                    `json:"sessions"`
+	WarmKeys     []string               `json:"warm_keys"`           // workspace keys with a persistent slot
+	DataSets     []string               `json:"data_sets,omitempty"` // data sets synced to this runner
+	Profiles     map[string]ProfileInfo `json:"profiles"`
+	Persistent   bool                   `json:"persistent"`
+	OS           string                 `json:"os"`
+	Arch         string                 `json:"arch"`
+	Runtime      string                 `json:"runtime"` // default runtime: "container" or "host"
+	Images       int                    `json:"images,omitempty"`
+	Features     []string               `json:"features"` // cgroup controllers in use: cpuset, io…
+	Accepting    bool                   `json:"accepting"`
+	Proto        int                    `json:"proto"`
+	Reason       string                 `json:"reason,omitempty"`
+	Started      time.Time              `json:"started"`             // when this runner process started
+	HostCPUs     int                    `json:"host_cpus,omitempty"` // every CPU on the host, offload's or not
+	Metrics      bool                   `json:"metrics,omitempty"`   // serves /v1/metrics and /v1/ledger
 }
 
 // Error is the JSON body of a non-2xx response.

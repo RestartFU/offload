@@ -43,11 +43,23 @@
   against a reserve. Past capacity, CPU guarantees may add up to `cpu_overcommit` (default 2)
   times it, but such a job starts only while the last 5s sample shows its guarantee's worth of
   idle cores (less guarantees of work started since that sample). The guarantee stays its
-  `CPUWeight`, so under contention every job still gets its share. Memory is never
-  overbooked. Runners report jobs still uploading or queued (`pending`) so routing counts them,
+  `CPUWeight`, so under contention every job still gets its share. Runners report jobs still uploading or queued (`pending`) so routing counts them,
   and an attached `offload run` moves a job queued for 10s to a runner that can start it now
   (`DELETE /v1/jobs/{id}?moved=1` cancels it only while it is still queued). Smaller jobs may skip ahead in the queue unless the job at the head has
   waited more than two minutes.
+- Memory is booked, not reserved by limit: a job counts the largest peak of its command's
+  history (its whole limit without history), sessions and environment builds their whole
+  limit. Agents ask for far more than they use and learned limits carry 25% headroom, so
+  booking limits left most of a runner's memory idle while jobs queued. Limits may add up to
+  `mem_overcommit` (default 2) times capacity. The host check subtracts what running jobs
+  have yet to grow into, from the last sample to their bookings, because `MemAvailable` can't
+  show it.
+- Overbooked memory fails differently from CPU: when bets lose, `offload.slice` reaches its
+  `MemoryMax` and the kernel kills a job, never the host. That kill is the runner's fault, so
+  it must not count as the job's OOM, which doubles its learned limit and its retry.
+  `memory.events` tells them apart: `oom_kill` counts kills in the cgroup for any reason, but
+  `oom` counts only limits hit by the cgroup itself or below it, never by an ancestor. A kill
+  without `oom` fails as "host memory pressure", which clients retry once at the same size.
 
 ## Source sync
 

@@ -53,7 +53,7 @@ type MetricPoint struct {
 	CPUAlloc float64 `json:"cpu_alloc"`
 	MemUsed  int64   `json:"mem_used"`  // host MemTotal - MemAvailable
 	MemWork  int64   `json:"mem_work"`  // offload workloads' memory.current
-	MemAlloc int64   `json:"mem_alloc"` // their limits
+	MemAlloc int64   `json:"mem_alloc"` // what they booked (a job its usual peak, others their limit)
 	Running  float64 `json:"running"`
 	Queued   float64 `json:"queued"`
 	Sessions float64 `json:"sessions"`

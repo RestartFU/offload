@@ -99,6 +99,7 @@ session_grace = "5m"   # stop a session this long after its last client left
 io_weight = 50
 oom_score_adjust = 900 # the kernel kills offload work before anything else
 cpu_overcommit = 2     # guarantees may add up to 2x the cpus while those cores are really idle
+mem_overcommit = 2     # limits may add up to 2x the memory; jobs are booked at their usual peak
 
 [env]
 PATH = "~/.cargo/bin:~/go/bin:~/.local/go/bin:~/.bun/bin:~/.local/bin:/usr/local/bin:/usr/bin:/bin"

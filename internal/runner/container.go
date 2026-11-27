@@ -238,7 +238,7 @@ func (s *Server) ensureImageLocked(j *job) bool {
 		s.touchImage(tag)
 		return true
 	}
-	if ok, _ := s.fitsLocked(api.Resources{Mem: s.cfg.buildMem}); !ok {
+	if ok, _ := s.fitsLocked(api.Resources{Mem: s.cfg.buildMem}, s.cfg.buildMem); !ok {
 		j.Reason = "waiting: memory for the environment build"
 		return false // builds take their memory from the same budget as jobs
 	}
@@ -698,7 +698,7 @@ func (s *Server) prebuildBase() {
 		s.mu.Unlock()
 		return
 	}
-	if ok, _ := s.fitsLocked(api.Resources{Mem: s.cfg.buildMem}); !ok {
+	if ok, _ := s.fitsLocked(api.Resources{Mem: s.cfg.buildMem}, s.cfg.buildMem); !ok {
 		s.mu.Unlock()
 		return // no room now; the first job that needs it builds it once there is
 	}
@@ -979,7 +979,7 @@ func (s *Server) sessionImageLocked(def *api.EnvDef) (string, bool, error) {
 		s.readyImages[tag] = true
 		return tag, true, nil
 	}
-	if ok, _ := s.fitsLocked(api.Resources{Mem: s.cfg.buildMem}); !ok {
+	if ok, _ := s.fitsLocked(api.Resources{Mem: s.cfg.buildMem}, s.cfg.buildMem); !ok {
 		return tag, false, nil // not yet: the client retries
 	}
 	b := &envBuild{tag: tag, waiters: map[string]*job{}, sessionAsked: time.Now()}

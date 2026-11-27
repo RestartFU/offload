@@ -291,15 +291,23 @@ type stopRecord struct {
 	// OOM: the unit's cgroup counted OOM kills (the hook runs in it, before it's removed). With
 	// OOMPolicy=continue systemd keeps the result "signal" for those, so this is what tells.
 	OOM bool `json:"oom,omitempty"`
+	// HostOOM: the kernel killed in it for memory above its own limit (see parseOOMEvents).
+	HostOOM bool `json:"host_oom,omitempty"`
 	// OOMD: systemd-oomd killed the unit for host memory pressure (it marks the cgroup).
 	OOMD bool `json:"oomd,omitempty"`
 }
 
 // RunStopped is "offload runner stopped PATH", the ExecStopPost hook of job and session units.
 func RunStopped(path string) int {
-	_ = writeFileJSON(path, stopRecord{Result: os.Getenv("SERVICE_RESULT"), Code: os.Getenv("EXIT_CODE"), Status: os.Getenv("EXIT_STATUS"), OOM: oomKilled(), OOMD: oomdKilled()})
+	rec := stopRecord{Result: os.Getenv("SERVICE_RESULT"), Code: os.Getenv("EXIT_CODE"), Status: os.Getenv("EXIT_STATUS"), OOMD: oomdKilled()}
+	rec.OOM, rec.HostOOM = oomKills()
+	_ = writeFileJSON(path, rec)
 	return 0
 }
+
+// hostOOMReason is a workload killed because the runner ran out of memory, not for its own
+// limit. Clients retry a job failed with a reason starting "host memory pressure", same size.
+const hostOOMReason = "host memory pressure: the runner ran out of memory and the kernel killed it"
 
 // killedReason explains a unit that ended without its wrapper's exit record.
 func killedReason(dir string, mem int64) string {
@@ -308,8 +316,11 @@ func killedReason(dir string, mem int64) string {
 		if rec.OOMD {
 			return "host memory pressure: systemd-oomd killed it (it is retried once the pressure eases)"
 		}
+		if rec.HostOOM {
+			return hostOOMReason
+		}
 		if rec.Result == "oom-kill" || rec.OOM {
-			return fmt.Sprintf("out of memory (limit %s; the whole unit was killed, by its limit or host memory pressure)", units.FormatSize(mem))
+			return fmt.Sprintf("out of memory (limit %s; the whole unit was killed)", units.FormatSize(mem))
 		}
 		if rec.Result != "" && rec.Result != "success" {
 			return "killed before it could report an exit status (systemd: " + rec.Result + ")"

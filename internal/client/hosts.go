@@ -532,7 +532,11 @@ func (h *Host) free() api.Resources {
 		// As the runner admits: past capacity, up to the overbooking limit while cores are idle.
 		cpu = max(cpu, min(st.Capacity.CPU*st.CPUOvercommit-used.CPU, st.CPUIdle-st.Pending.CPU))
 	}
-	return api.Resources{CPU: cpu, Mem: min(st.Capacity.Mem-used.Mem, st.MemAvailable-st.MemReserve-st.Pending.Mem)}
+	mem := min(st.Capacity.Mem-used.Mem, st.MemAvailable-st.MemReserve-st.Pending.Mem)
+	if st.MemRoom != nil { // the runner's own count: bookings, overbooking limit, host memory
+		mem = *st.MemRoom - st.Pending.Mem
+	}
+	return api.Resources{CPU: cpu, Mem: mem}
 }
 
 // PickFor chooses a runner for a job spec: like Pick, plus platform and runtime constraints.

@@ -215,7 +215,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		out.err(http.StatusServiceUnavailable, fmt.Sprintf("session limit reached (%d)", live))
 		return
 	}
-	if ok, why := s.fitsLocked(res); !ok {
+	if ok, why := s.fitsLocked(res, res.Mem); !ok {
 		out.err(http.StatusServiceUnavailable, "no capacity: "+why)
 		return
 	}
@@ -656,8 +656,11 @@ func (s *Server) checkSessions() {
 			code := rec.Code
 			reason := se.Reason
 			se.PeakMem, se.CPUSeconds = rec.PeakMem, float64(rec.CPUUsec)/1e6
-			if rec.OOM {
+			switch {
+			case rec.OOM:
 				reason = fmt.Sprintf("out of memory (limit %s)", units.FormatSize(se.Resources.Mem))
+			case rec.HostOOM:
+				reason = hostOOMReason
 			}
 			s.finishSessionLocked(se, &code, reason)
 		case !active:

@@ -63,7 +63,8 @@ func loadSecrets(dir string) error {
 }
 
 // RunExec is "offload runner exec": run argv, then record its exit status, peak memory and
-// whether the cgroup OOM killer fired, pack requested artifacts, and collect write-back files.
+// whether the OOM killer fired (for its own limit or the runner's), pack requested artifacts,
+// and collect write-back files.
 func RunExec(o ExecOptions) int {
 	if o.Secrets != "" {
 		if err := loadSecrets(o.Secrets); err != nil {
@@ -74,7 +75,8 @@ func RunExec(o ExecOptions) int {
 		}
 	}
 	code, sig, runErr := runChild(o.Argv, nil, os.Stdout)
-	rec := exitRecord{Code: code, Signal: sig, OOM: oomKilled(), PeakMem: cgroupInt("memory.peak")}
+	rec := exitRecord{Code: code, Signal: sig, PeakMem: cgroupInt("memory.peak")}
+	rec.OOM, rec.HostOOM = oomKills()
 	if usec, ok := cgroupCPUUsec(unitCgroup()); ok {
 		rec.CPUUsec = int64(usec)
 	}
@@ -381,7 +383,8 @@ func RunPipe(dir, sock, secrets string, noStdin bool, argv []string) int {
 	ended = true
 	close(frames) // the writer finishes (or drains) and closes the pipe
 	mu.Unlock()
-	rec := exitRecord{Code: code, Signal: sig, OOM: oomKilled(), PeakMem: cgroupInt("memory.peak")}
+	rec := exitRecord{Code: code, Signal: sig, PeakMem: cgroupInt("memory.peak")}
+	rec.OOM, rec.HostOOM = oomKills()
 	if usec, ok := cgroupCPUUsec(unitCgroup()); ok {
 		rec.CPUUsec = int64(usec)
 	}
@@ -444,19 +447,29 @@ func unitCgroup() string {
 	return dir
 }
 
-// oomKilled reports whether the OOM killer fired anywhere in this job's unit.
-func oomKilled() bool {
+// oomKills reads the OOM kills in this job's unit (see parseOOMEvents).
+func oomKills() (own, host bool) {
 	b, err := os.ReadFile(filepath.Join(unitCgroup(), "memory.events"))
 	if err != nil {
-		return false
+		return false, false
 	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if v, ok := strings.CutPrefix(line, "oom_kill "); ok {
-			n, _ := strconv.Atoi(strings.TrimSpace(v))
-			return n > 0
+	return parseOOMEvents(string(b))
+}
+
+// parseOOMEvents tells a unit's memory.events apart: own when the unit hit its own limit, host
+// when the kernel killed in it for a limit above it (offload.slice, full because memory is
+// overbooked) or for the whole host. Only a limit's own cgroup and its ancestors count "oom".
+func parseOOMEvents(events string) (own, host bool) {
+	n := map[string]int{}
+	for _, line := range strings.Split(events, "\n") {
+		if k, v, ok := strings.Cut(line, " "); ok {
+			n[k], _ = strconv.Atoi(strings.TrimSpace(v))
 		}
 	}
-	return false
+	if n["oom_kill"] == 0 {
+		return false, false
+	}
+	return n["oom"] > 0, n["oom"] == 0
 }
 
 // packArtifacts tars the given paths (files or directories, relative to the working directory).

@@ -40,6 +40,7 @@ type job struct {
 	secretFiles map[string][]byte
 	queuedAt    time.Time
 	inactive    int         // consecutive checks the unit was gone without an exit record
+	memNow      int64       // memory.current at the last metrics sample (0 before the first)
 	checked     time.Time   // last time systemd was asked whether the unit is active
 	cancelled   atomic.Bool // set by DELETE; read by uploads without taking s.mu
 	abortUpload func()      // interrupts the upload being read right now (set while syncing)
@@ -48,12 +49,21 @@ type job struct {
 	planHave    []string
 }
 
+// booked is the memory admission counts for the job.
+func (j *job) booked() int64 {
+	if j.MemBooked > 0 {
+		return min(j.MemBooked, j.Resources.Mem)
+	}
+	return j.Resources.Mem
+}
+
 // exitRecord is written by the unit wrapper when the command ends.
 type exitRecord struct {
 	Code             int            `json:"code"`
 	CPUUsec          int64          `json:"cpu_usec,omitempty"` // the unit's CPU time (cpu.stat usage_usec)
 	Signal           string         `json:"signal,omitempty"`
-	OOM              bool           `json:"oom,omitempty"`
+	OOM              bool           `json:"oom,omitempty"`      // the job hit its own memory limit
+	HostOOM          bool           `json:"host_oom,omitempty"` // killed because the runner ran out
 	Error            string         `json:"error,omitempty"`
 	PeakMem          int64          `json:"peak_mem,omitempty"`
 	Artifact         bool           `json:"artifacts,omitempty"`
@@ -335,17 +345,18 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	j.MemFrom = "requested"
+	s.mu.Lock()
 	if spec.Resources.Mem == 0 {
 		j.AutoMem, j.MemFrom = true, "default"
 		if prof != nil && prof.Resources.Mem != "" {
 			j.MemFrom = "profile " + prof.Name
 		}
-		s.mu.Lock()
 		if m := s.suggestMemLocked(spec); m > 0 {
 			j.Resources.Mem, j.MemFrom = m, "learned"
 		}
-		s.mu.Unlock()
 	}
+	j.MemBooked = s.bookMemLocked(spec, j.Resources.Mem)
+	s.mu.Unlock()
 	if j.Resources.Mem > s.cfg.memCap {
 		out.err(400, fmt.Sprintf("job asks for %s memory; this runner hands out at most %s", units.FormatSize(j.Resources.Mem), units.FormatSize(s.cfg.memCap)))
 		return
@@ -817,7 +828,7 @@ func (s *Server) admit() {
 			}
 			continue // a build never blocks other jobs
 		}
-		ok, why := s.fitsLocked(j.Resources)
+		ok, why := s.fitsLocked(j.Resources, j.booked())
 		if !ok {
 			if j.Reason != "waiting: "+why {
 				j.Reason = "waiting: " + why
@@ -827,7 +838,8 @@ func (s *Server) admit() {
 			// Only when it could start once running jobs finish: if sessions or builds hold what
 			// it needs, holding everyone else back would only stall the queue.
 			held := s.heldLocked()
-			canFitLater := held.CPU+j.Resources.CPU <= s.cfg.Capacity.CPU+1e-9 && held.Mem+j.Resources.Mem <= s.cfg.memCap
+			canFitLater := held.CPU+j.Resources.CPU <= s.cfg.Capacity.CPU+1e-9 && held.Mem+j.booked() <= s.cfg.memCap &&
+				float64(held.Mem+j.Resources.Mem) <= float64(s.cfg.memCap)*s.cfg.Policy.MemOvercommit
 			if time.Since(j.queuedAt) > 2*time.Minute && canFitLater && !strings.Contains(why, "MemAvailable") {
 				return
 			}
@@ -1031,8 +1043,11 @@ func (s *Server) checkRunning() {
 			// systemd didn't answer, or the wrapper is still exiting: no conclusion yet.
 		case err == nil:
 			state, reason := api.StateExited, rec.Error
-			if rec.OOM {
+			switch {
+			case rec.OOM:
 				state, reason = api.StateFailed, fmt.Sprintf("out of memory (limit %s)", units.FormatSize(j.Resources.Mem))
+			case rec.HostOOM && rec.Code != 0:
+				state, reason = api.StateFailed, hostOOMReason
 			}
 			if j.cancel {
 				state, reason = api.StateCancelled, "cancelled"

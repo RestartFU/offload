@@ -75,6 +75,9 @@ type Config struct {
 		// CPUOvercommit lets guarantees add up to this many times the CPU capacity, for work
 		// that starts while its share of cores is really idle (default 2; 1 turns it off).
 		CPUOvercommit float64 `toml:"cpu_overcommit"`
+		// MemOvercommit lets the memory limits of running work add up to this many times the
+		// memory capacity; jobs are booked at their usual peak (default 2; 1 turns it off).
+		MemOvercommit float64 `toml:"mem_overcommit"`
 	} `toml:"policy"`
 
 	// Derived values.
@@ -251,6 +254,10 @@ func (c *Config) finish() error {
 		c.Policy.CPUOvercommit = 2
 	}
 	c.Policy.CPUOvercommit = max(c.Policy.CPUOvercommit, 1)
+	if c.Policy.MemOvercommit == 0 {
+		c.Policy.MemOvercommit = 2
+	}
+	c.Policy.MemOvercommit = max(c.Policy.MemOvercommit, 1)
 	if c.Policy.OOMScoreAdj == 0 {
 		c.Policy.OOMScoreAdj = 900
 	}

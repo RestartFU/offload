@@ -733,6 +733,8 @@ func (s *Server) status() api.Status {
 	}
 	st.Allocated = s.allocatedLocked()
 	st.CPUOvercommit = s.cfg.Policy.CPUOvercommit
+	room := s.memRoomLocked()
+	st.MemRoom = &room
 	if idle, ok := s.cpuIdleLocked(); ok {
 		st.CPUIdle = max(idle, 0)
 	}
@@ -744,7 +746,7 @@ func (s *Server) status() api.Status {
 			st.Queued++
 			if !j.StopRequested { // claimed already: routing counts it as taken
 				st.Pending.CPU += j.Resources.CPU
-				st.Pending.Mem += j.Resources.Mem
+				st.Pending.Mem += j.booked()
 			}
 		}
 	}
@@ -784,19 +786,52 @@ func (s *Server) status() api.Status {
 	return st
 }
 
-// allocatedLocked sums the guarantees of running jobs and live sessions.
+// allocatedLocked sums the guarantees of running jobs and live sessions. Mem is what they
+// booked: a job's usual peak, a session's or build's whole limit.
 func (s *Server) allocatedLocked() api.Resources {
 	var a api.Resources
 	for _, j := range s.jobs {
 		if j.State == api.StateRunning {
 			a.CPU += j.Resources.CPU
-			a.Mem += j.Resources.Mem
+			a.Mem += j.booked()
 		}
 	}
 	held := s.heldLocked()
 	a.CPU += held.CPU
 	a.Mem += held.Mem
 	return a
+}
+
+// memLimitsLocked sums the memory limits of running work, which mem_overcommit caps.
+func (s *Server) memLimitsLocked() int64 {
+	n := s.heldLocked().Mem
+	for _, j := range s.jobs {
+		if j.State == api.StateRunning {
+			n += j.Resources.Mem
+		}
+	}
+	return n
+}
+
+// memGrowthLocked is how much more memory running jobs are expected to take: up to their
+// bookings, from what the last sample saw them use. MemAvailable can't show it yet, so a
+// just-started job counts in full.
+func (s *Server) memGrowthLocked() int64 {
+	var n int64
+	for _, j := range s.jobs {
+		if j.State == api.StateRunning {
+			n += max(j.booked()-j.memNow, 0)
+		}
+	}
+	return n
+}
+
+// memRoomLocked is the most memory a job could be given now (see fitsLocked).
+func (s *Server) memRoomLocked() int64 {
+	room := s.cfg.memCap - s.allocatedLocked().Mem
+	room = min(room, int64(float64(s.cfg.memCap)*s.cfg.Policy.MemOvercommit)-s.memLimitsLocked())
+	room = min(room, memAvailable()-s.memGrowthLocked()-s.cfg.memReserve)
+	return max(room, 0)
 }
 
 // heldLocked is what live sessions and environment builds hold: capacity that doesn't come back
@@ -833,7 +868,6 @@ func (s *Server) cpuIdleLocked() (float64, bool) {
 	return idle, true
 }
 
-// fitsLocked reports whether r can start now, or why not.
 // neverFitsLocked says why a request can't run here even on an idle runner ("" if it can).
 func (s *Server) neverFitsLocked(r api.Resources) string {
 	if r.CPU > s.cfg.Capacity.CPU+1e-9 {
@@ -848,7 +882,9 @@ func (s *Server) neverFitsLocked(r api.Resources) string {
 	return ""
 }
 
-func (s *Server) fitsLocked(r api.Resources) (bool, string) {
+// fitsLocked reports whether work with these guarantees and memory limit can start now, or why
+// not. book is the memory counted against capacity: a job's usual peak, otherwise r.Mem.
+func (s *Server) fitsLocked(r api.Resources, book int64) (bool, string) {
 	a := s.allocatedLocked()
 	if capCPU := s.cfg.Capacity.CPU; a.CPU+r.CPU > capCPU+1e-9 {
 		// Past capacity, guarantees are overbooked: a guarantee is a share under contention, and
@@ -861,10 +897,15 @@ func (s *Server) fitsLocked(r api.Resources) (bool, string) {
 			return false, fmt.Sprintf("cpu: %.1f of %.1f allocated and only %.1f cores idle", a.CPU, capCPU, max(idle, 0))
 		}
 	}
-	if a.Mem+r.Mem > s.cfg.memCap {
-		return false, "memory: runner capacity allocated"
+	// Memory is booked at a job's usual peak, so limits may add up past capacity. Losing that bet
+	// costs a job (the kernel kills one when offload.slice is full; it is retried), never the host.
+	if a.Mem+book > s.cfg.memCap {
+		return false, fmt.Sprintf("memory: %s of %s booked", units.FormatSize(a.Mem), units.FormatSize(s.cfg.memCap))
 	}
-	if memAvailable()-r.Mem < s.cfg.memReserve {
+	if limit, lim := int64(float64(s.cfg.memCap)*s.cfg.Policy.MemOvercommit), s.memLimitsLocked(); lim+r.Mem > limit {
+		return false, fmt.Sprintf("memory: limits of running work add up to %s of %s", units.FormatSize(lim), units.FormatSize(limit))
+	}
+	if memAvailable()-s.memGrowthLocked()-book < s.cfg.memReserve {
 		return false, "memory: host MemAvailable would drop below the reserve"
 	}
 	return true, ""

@@ -243,6 +243,11 @@ func (s *Server) sample(ctx context.Context) (save bool) {
 	defer s.mu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for _, w := range work {
+		if j := s.jobs[w.ID]; j != nil && w.Kind == "job" && j.State == api.StateRunning {
+			j.memNow = w.Mem
+		}
+	}
 	for id, v := range cpuSecs {
 		if j := s.jobs[id]; j != nil && j.State == api.StateRunning {
 			m.cpuSecs[id] = v

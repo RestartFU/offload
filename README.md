@@ -18,8 +18,11 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
 - **Sliced, not exclusive.** Every job asks for a guaranteed CPU share, a burst ceiling and a
   hard memory limit. Jobs are packed onto runners and queue when nothing fits. CPU guarantees
   are overbooked up to 2x a runner's cores (`[policy] cpu_overcommit`) while the cores are
-  really idle, since most jobs use far less than they reserve; memory is never overbooked. A
-  queued job moves to another runner that can start it now. Tools see their
+  really idle, since most jobs use far less than they reserve. Memory is booked at the most a
+  command used in its last runs rather than its limit, so limits may add up to 2x the memory
+  capacity (`[policy] mem_overcommit`). A job the kernel kills because the runner ran out (not
+  for its own limit) is retried once at the same size. A queued job moves to another runner
+  that can start it now. Tools see their
   real core count through cpusets plus `CARGO_BUILD_JOBS`, `GOMAXPROCS`, `MAKEFLAGS` and similar.
 - **Warm by default.** Each repository gets persistent workspace slots on the runner. Only
   changed files are uploaded (content hashes), and ignored build output such as `target/` stays
@@ -99,7 +102,7 @@ Minecraft MCP session.
 CGO_ENABLED=0 go build -o ~/.local/bin/offload .   # static: the same binary runs inside job containers
 offload hosts
 offload run -- cargo test
-offload run --profile cargo --mem 16G --get target/release/app -- cargo build --release
+offload run --profile cargo --get target/release/app -- cargo build --release
 offload mcp echo            # stdio MCP bridge to a runner session
 ```
 
