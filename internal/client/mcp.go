@@ -110,6 +110,7 @@ func MCP(o MCPOptions) error {
 		var se api.Session
 		excluded := map[string]bool{}
 		refused := map[string]bool{} // answered 403/422 (not paired, can never fit): skipped this launch
+		synced := map[string]bool{}  // data sets already sent there: waiting for a free slot doesn't rescan them
 		lastRefusal := ""
 	pick:
 		for {
@@ -172,7 +173,7 @@ func MCP(o MCPOptions) error {
 			if err != nil {
 				return nil, se, err
 			}
-			if sc != nil {
+			if sc != nil && !synced[h.URL] {
 				names := make([]string, 0, len(sc.Data))
 				for name := range sc.Data {
 					names = append(names, name)
@@ -193,6 +194,7 @@ func MCP(o MCPOptions) error {
 						return nil, se, err
 					}
 				}
+				synced[h.URL] = true
 			}
 			for announced := false; ; {
 				err := h.do(ctx, "POST", "/v1/sessions", spec, &se)
