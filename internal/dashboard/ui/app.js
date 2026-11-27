@@ -98,6 +98,11 @@ function stateChip(state, reason) {
   }
 }
 function exitChip(w) {
+  if (stale(w)) {
+    const c = chip("neutral", "Unknown");
+    c.title = `${w.runner} isn't answering. This is what it last reported` + (w.host.last_seen ? `, ${ago(w.host.last_seen)}` : "") + ".";
+    return c;
+  }
   if (w.state === "exited" && w.exit_code != null && w.exit_code !== 0) return chip("serious", "Exit " + w.exit_code);
   return stateChip(w.state, w.reason);
 }
@@ -469,7 +474,7 @@ function runnerCard(r) {
 function renderQueue(runners) {
   const el = $("#ov-queue");
   const waiting = [];
-  for (const r of runners) for (const j of r.jobs) if (j.state === "queued" || j.state === "uploading") waiting.push([r, j]);
+  for (const r of runners) if (r.online) for (const j of r.jobs) if (j.state === "queued" || j.state === "uploading") waiting.push([r, j]);
   if (!waiting.length) { el.replaceChildren(); return; }
   waiting.sort((a, b) => new Date(a[1].created_at) - new Date(b[1].created_at));
   el.replaceChildren(
@@ -760,6 +765,8 @@ function compactCPUs(list) {
   return parts.join(",");
 }
 const isActive = (w) => !["exited", "failed", "cancelled"].includes(w.state);
+const stale = (w) => isActive(w) && !w.host.online;
+const live = (w) => isActive(w) && w.host.online;
 
 let ctFiltersKey = "";
 function renderContainers() {
@@ -814,14 +821,14 @@ function renderTable() {
     h("thead", {}, h("tr", {}, ["Workload", "Command", showRunner && "Runner", "State", "CPU used (cores)", "Memory", showCPUs && "Pinned CPUs", "Repository", "Caller", "Time"].filter(Boolean).map((t) => h("th", {}, t)))),
     h("tbody", {}, list.map((w) => {
       const open = () => (location.hash = `#/containers/${encodeURIComponent(w.runner)}/${w.id}`);
-      const t = w.finished ? `ended ${ago(w.finished)}` : w.started && w.state === "running" ? `for ${fmtDur(since(w.started))}` : `waiting ${fmtDur(since(w.created))}`;
+      const t = stale(w) ? (w.host.last_seen ? `as of ${ago(w.host.last_seen)}` : "") : w.finished ? `ended ${ago(w.finished)}` : w.started && w.state === "running" ? `for ${fmtDur(since(w.started))}` : `waiting ${fmtDur(since(w.created))}`;
       return h("tr", { class: "click" + (sel && sel.id === w.id && sel.runner === w.runner ? " sel" : ""), tabindex: 0, onclick: open, onkeydown: (e) => { if (e.key === "Enter") open(); } },
         h("td", { class: "nowrap" }, h("span", { class: "kind" }, w.kind === "job" ? "Job" : "Session"), h("span", { class: "mono" }, w.id)),
         h("td", {}, h("span", { class: "cmd mono", title: w.cmd }, w.cmd)),
         showRunner && h("td", { class: "nowrap" }, w.runner),
         h("td", {}, exitChip(w)),
-        h("td", {}, isActive(w) ? usageCell(w.use?.cpu, w.res.cpu, fmtCores, " guaranteed") : h("span", { class: "muted num" }, w.raw.cpu_seconds ? fmtDur(w.raw.cpu_seconds) + " CPU" : "–")),
-        h("td", {}, isActive(w) ? usageCell(w.use?.mem, w.res.mem, fmtBytes, " limit", true) : h("span", { class: "muted num" }, w.raw.peak_mem ? "peak " + fmtBytes(w.raw.peak_mem) : "–")),
+        h("td", {}, live(w) ? usageCell(w.use?.cpu, w.res.cpu, fmtCores, " guaranteed") : h("span", { class: "muted num" }, w.raw.cpu_seconds ? fmtDur(w.raw.cpu_seconds) + " CPU" : "–")),
+        h("td", {}, live(w) ? usageCell(w.use?.mem, w.res.mem, fmtBytes, " limit", true) : h("span", { class: "muted num" }, w.raw.peak_mem ? "peak " + fmtBytes(w.raw.peak_mem) : "–")),
         showCPUs && h("td", { class: "mono nowrap" }, w.cpus || "–"),
         h("td", { class: "nowrap" }, w.repo ? truncate(w.repo, 28) : h("span", { class: "muted" }, "–")),
         h("td", { class: "nowrap" }, w.caller || h("span", { class: "muted" }, "–")),
@@ -867,7 +874,7 @@ function renderDrawer() {
   }
   head.replaceChildren(
     h("div", { class: "row" }, h("span", { class: "kind" }, w.kind === "job" ? "Job" : "Session"), h("h2", { class: "mono" }, w.id), exitChip(w),
-      isActive(w) ? stopBtn(w) : null, closeBtn()),
+      live(w) ? stopBtn(w) : null, closeBtn()),
     h("div", { class: "cmdline mono" }, w.kind === "job" ? w.cmd : "profile " + w.cmd));
   const err = state.stopping.get(w.runner + "/" + w.id);
   $("#dr-info").replaceChildren(err ? h("div", { class: "alert critical", role: "alert", style: { marginBottom: "14px" } }, icon("critical"), h("div", {}, err)) : "", ...drawerInfo(w));
@@ -907,7 +914,7 @@ function sparkline(points, key, color, fmt, max) {
 function drawerInfo(w) {
   const r = w.raw, res = w.res || {};
   const out = [];
-  if (isActive(w) && w.state === "running") {
+  if (live(w) && w.state === "running") {
     const hist = state.usage.get(w.runner + "/" + w.id) || [];
     out.push(h("div", { class: "sparks" },
       h("div", { class: "spark" }, h("div", { class: "k" }, "CPU now"), h("div", { class: "v num" }, w.use ? fmtCores(w.use.cpu) + (fmtCores(w.use.cpu) === "1" ? " core" : " cores") : "–", h("span", { class: "muted", style: { fontSize: "12px", fontWeight: 400 } }, `  of ${fmtCores(res.cpu)} guaranteed, ${fmtCores(res.cpu_max)} max`)),
@@ -917,7 +924,7 @@ function drawerInfo(w) {
   }
   const rows = [];
   const add = (k, v) => { if (v != null && v !== "" && v !== false) rows.push(h("dt", {}, k), h("dd", {}, v)); };
-  add("Runner", w.runner);
+  add("Runner", stale(w) ? `${w.runner} (not answering${w.host.last_seen ? ", last seen " + ago(w.host.last_seen) : ""}: this is its last report)` : w.runner);
   if (r.reason) add("Reason", r.reason.replace(/^waiting: /, "Waiting: "));
   if (w.kind === "job") {
     const sp = r.spec;
@@ -941,7 +948,7 @@ function drawerInfo(w) {
   add("Created", fmtTime(w.created) + " (" + ago(w.created) + ")");
   if (w.kind === "job" && r.started_at) add("Waited", fmtDur((new Date(r.started_at) - new Date(r.created_at)) / 1000));
   if (w.finished && w.started) add("Ran for", fmtDur((new Date(w.finished) - new Date(w.started)) / 1000));
-  else if (w.started && w.state === "running") add("Running for", fmtDur(since(w.started)));
+  else if (w.started && live(w) && w.state === "running") add("Running for", fmtDur(since(w.started)));
   if (r.exit_code != null) add("Exit code", String(r.exit_code) + (r.signal ? " (" + r.signal + ")" : ""));
   if (r.peak_mem) add("Peak memory", fmtBytes(r.peak_mem) + (res.mem ? ` (${pct(r.peak_mem / res.mem)} of the limit)` : ""));
   if (r.cpu_seconds) add("CPU time", fmtDur(r.cpu_seconds));
