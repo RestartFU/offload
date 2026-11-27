@@ -398,10 +398,10 @@ func clientLabel() string {
 	return host
 }
 
-func cancelJob(h *Host, id string) {
+func cancelJob(h *Host, id string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = h.do(ctx, "DELETE", "/v1/jobs/"+id, nil, nil)
+	return h.do(ctx, "DELETE", "/v1/jobs/"+id, nil, nil)
 }
 
 // errMoved: the queued job was cancelled so it can be resubmitted to a runner that can start it.
@@ -523,7 +523,9 @@ func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bo
 	if ctx.Err() != nil {
 		if cancelOnInterrupt {
 			logf(quiet, "cancelling %s:%s", h.Name, id)
-			cancelJob(h, id)
+			if err := cancelJob(h, id); err != nil {
+				logf(false, "couldn't cancel %s:%s (%v); it may still run there: offload cancel %s:%s", h.Name, id, err, h.Name, id)
+			}
 		}
 		return 130, nil, nil
 	}
