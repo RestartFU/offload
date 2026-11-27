@@ -138,6 +138,14 @@ socket. The client shim posts stdin lines with sequence numbers, which makes ret
 idempotent, and streams stdout from a byte offset, which makes reconnects lossless. A session
 with no attached client for `session_grace` is stopped.
 
+That grace alone doesn't free much: MCP clients start every configured server when a
+conversation opens and keep it until the conversation closes, so an attached client says
+nothing about use. The client shim therefore stops its own session once every request has been
+answered and none arrived for `--idle` (15 minutes). The next request starts a new session,
+which first gets the MCP client's original `initialize` (under a reserved id whose answer the
+shim swallows) and `notifications/initialized`. Pings are answered locally while stopped, so a
+keepalive doesn't wake it. Server state, such as a running game, doesn't survive this.
+
 ## Client networking
 
 A job or session with network "client" runs with `--network=none --device /dev/net/tun

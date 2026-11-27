@@ -70,6 +70,9 @@ A runner profile of kind `session` can be used as a stdio MCP server:
 { "mcpServers": { "minecraft": { "command": "offload", "args": ["mcp", "minecraft-bedrock"] } } }
 ```
 
+After 15 minutes without a tool call the runner session is stopped to free the runner; the next
+call starts a fresh server, so state such as a running game client has to be set up again.
+
 ## Rules
 
 - Prefer `offload run` for anything that compiles, links, runs test suites or burns CPU for

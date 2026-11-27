@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/RestartFU/offload/internal/api"
 	"github.com/RestartFU/offload/internal/client"
@@ -81,7 +82,9 @@ Client:
   offload mcp PROFILE [--on NAME] [--with SET] [--secret NAME[=SRC]]
                                      stdio MCP server backed by a runner session; PROFILE is a
                                      runner profile or ~/.config/offload/sessions/PROFILE.toml
-                                     (its data sets are synced first; --prepare runs its setup)
+                                     (its data sets are synced first; --prepare runs its setup;
+                                     --idle 15m stops it after that long without requests and
+                                     starts it again on the next one, 0 never)
 
 Secrets can also come from the environment (e.g. an MCP entry's "env"):
   OFFLOAD_SECRET_<NAME>=<source>   OFFLOAD_SECRET_FILE_<NAME>=<path>   OFFLOAD_WITH=set1,set2
@@ -268,7 +271,7 @@ func cmdRun(args []string) (int, error) {
 
 func cmdMCP(args []string) error {
 	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
-		die("usage: offload mcp PROFILE [--on NAME] [--cpu N] [--mem SIZE]")
+		die("usage: offload mcp PROFILE [--on NAME] [--cpu N] [--mem SIZE] [--idle 15m]")
 	}
 	profile := args[0]
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
@@ -280,12 +283,13 @@ func cmdMCP(args []string) error {
 	environment := fs.String("environment", "", "named environment")
 	host := fs.Bool("host", false, "run on the runner host")
 	prepare := fs.Bool("prepare", false, "run the session's prepare step and exit")
+	idle := fs.Duration("idle", 15*time.Minute, "stop the session after this long without requests (0: never)")
 	_ = fs.Parse(args[1:])
 	r, err := res()
 	if err != nil {
 		return err
 	}
-	return client.MCP(client.MCPOptions{Profile: profile, On: *on, Resources: r, With: with, Secrets: secrets, Environment: *environment, Host: *host, Prepare: *prepare})
+	return client.MCP(client.MCPOptions{Profile: profile, On: *on, Resources: r, With: with, Secrets: secrets, Environment: *environment, Host: *host, Prepare: *prepare, Idle: *idle})
 }
 
 func cmdDashboard(args []string) error {

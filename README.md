@@ -177,7 +177,9 @@ status only; `offload host upgrade` brings it up to date.
 
   Set `OFFLOAD_GUARD=off` (env, or as a command prefix) to let a command run locally.
 - **MCP:** any `kind = "session"` profile works as a stdio MCP server:
-  `{"command": "offload", "args": ["mcp", "<profile>"]}`.
+  `{"command": "offload", "args": ["mcp", "<profile>"]}`. The session is stopped after 15
+  minutes without requests and started again on the next one (its state starts over); set
+  `"--idle", "1h"` to change that, or `"--idle", "0"` to keep it for the client's lifetime.
 
 ## Layout
 
