@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -29,7 +28,8 @@ type MCPOptions struct {
 	Resources                api.Resources
 	With, Secrets            []string
 	Host                     bool
-	Prepare                  bool // run the session definition's prepare command and exit
+	Prepare                  bool          // run the session definition's prepare command and exit
+	Idle                     time.Duration // stop the session after this long without requests (0: never)
 }
 
 func MCP(o MCPOptions) error {
@@ -105,221 +105,174 @@ func MCP(o MCPOptions) error {
 			}
 		}
 	}
-	var h *Host
-	var se api.Session
-	excluded := map[string]bool{}
-	refused := map[string]bool{} // answered 403/422 (not paired, can never fit): skipped this launch
-	lastRefusal := ""
-pick:
-	for {
-		hosts := Discover(ctx, cfg)
-		var avail []*Host
-		for _, x := range hosts {
-			if !excluded[x.URL] && !refused[x.URL] {
-				avail = append(avail, x)
+	launch := func() (*Host, api.Session, error) {
+		var h *Host
+		var se api.Session
+		excluded := map[string]bool{}
+		refused := map[string]bool{} // answered 403/422 (not paired, can never fit): skipped this launch
+		lastRefusal := ""
+	pick:
+		for {
+			hosts := Discover(ctx, cfg)
+			var avail []*Host
+			for _, x := range hosts {
+				if !excluded[x.URL] && !refused[x.URL] {
+					avail = append(avail, x)
+				}
 			}
-		}
-		hosts = avail
-		if pinned != nil {
-			h, err = pinned, nil
-			if len(probe(ctx, []*Host{pinned})) == 0 { // fresh status for every attempt
-				err = fmt.Errorf("the runner session %s was prepared on (%s) went away", profile, pinned.URL)
+			hosts = avail
+			if pinned != nil {
+				h, err = pinned, nil
+				if len(probe(ctx, []*Host{pinned})) == 0 { // fresh status for every attempt
+					err = fmt.Errorf("the runner session %s was prepared on (%s) went away", profile, pinned.URL)
+				}
+			} else if on != "" {
+				h, err = FindHost(hosts, on)
+			} else if sc != nil {
+				// Client-defined sessions run in a container unless --host: only runners that can
+				// start one are candidates, warm data sets decide among those.
+				want := api.JobSpec{Resources: res, Environment: spec.Environment, Runtime: "container", Network: sc.Network}
+				if o.Host {
+					want.Runtime = "host"
+				}
+				fit, _ := eligible(hosts, want)
+				if len(fit) == 0 {
+					fit = hosts // PickFor explains why none fits
+				}
+				// Warm data wins among runners that can take the session now; otherwise any that can.
+				if h, err = PickFor(preferData(fit, sc.Data), want, ""); err != nil {
+					h, err = PickFor(fit, want, "")
+				}
+			} else {
+				h, err = Pick(hosts, res, profile, "", "session")
 			}
-		} else if on != "" {
-			h, err = FindHost(hosts, on)
-		} else if sc != nil {
-			// Client-defined sessions run in a container unless --host: only runners that can
-			// start one are candidates, warm data sets decide among those.
-			want := api.JobSpec{Resources: res, Environment: spec.Environment, Runtime: "container", Network: sc.Network}
+			wantRT := "container"
 			if o.Host {
-				want.Runtime = "host"
+				wantRT = "host"
 			}
-			fit, _ := eligible(hosts, want)
-			if len(fit) == 0 {
-				fit = hosts // PickFor explains why none fits
+			busy := anyBusy(candidates(hosts, on, profile, api.JobSpec{Resources: res, Environment: spec.Environment, Runtime: wantRT}, sc != nil))
+			if err != nil && len(excluded) == 0 && !busy && lastRefusal != "" {
+				return nil, se, fmt.Errorf("%w (and %s)", err, lastRefusal)
 			}
-			// Warm data wins among runners that can take the session now; otherwise any that can.
-			if h, err = PickFor(preferData(fit, sc.Data), want, ""); err != nil {
-				h, err = PickFor(fit, want, "")
-			}
-		} else {
-			h, err = Pick(hosts, res, profile, "", "session")
-		}
-		wantRT := "container"
-		if o.Host {
-			wantRT = "host"
-		}
-		busy := anyBusy(candidates(hosts, on, profile, api.JobSpec{Resources: res, Environment: spec.Environment, Runtime: wantRT}, sc != nil))
-		if err != nil && len(excluded) == 0 && !busy && lastRefusal != "" {
-			return fmt.Errorf("%w (and %s)", err, lastRefusal)
-		}
-		if err != nil && (len(excluded) > 0 || busy) {
-			// Every runner that can take it is full or under memory pressure right now: wait,
-			// then a fresh round.
-			fmt.Fprintf(os.Stderr, "offload: every runner that fits is full right now; waiting\n")
-			select {
-			case <-ctx.Done():
-				return interrupted(o)
-			case <-time.After(5 * time.Second):
-			}
-			excluded = map[string]bool{}
-			continue
-		}
-		if err == nil {
-			err = checkProto(h)
-		}
-		if err != nil {
-			return err
-		}
-		if sc != nil {
-			names := make([]string, 0, len(sc.Data))
-			for name := range sc.Data {
-				names = append(names, name)
-			}
-			sort.Strings(names)
-			for _, name := range names {
-				dc, ok := cfg.Data[name]
-				if !ok {
-					return fmt.Errorf("session %s uses data set %q, which client.toml doesn't define ([data.%s])", profile, name, name)
-				}
-				if err := SyncData(ctx, h, name, dc, false); err != nil {
-					var ae *APIError
-					if errors.As(err, &ae) && ae.Code == 403 && on == "" && pinned == nil {
-						fmt.Fprintf(os.Stderr, "offload: %s: %s; trying another runner\n", h.Name, ae.Msg)
-						refused[h.URL] = true
-						continue pick
-					}
-					return err
-				}
-			}
-		}
-		for announced := false; ; {
-			err := h.do(ctx, "POST", "/v1/sessions", spec, &se)
-			var ae *APIError
-			if errors.As(err, &ae) && ae.Code == 409 { // the environment is being built
-				if !announced {
-					fmt.Fprintf(os.Stderr, "offload: %s: %s\n", h.Name, ae.Msg)
-					announced = true
-				}
+			if err != nil && (len(excluded) > 0 || busy) {
+				// Every runner that can take it is full or under memory pressure right now: wait,
+				// then a fresh round.
+				fmt.Fprintf(os.Stderr, "offload: every runner that fits is full right now; waiting\n")
 				select {
 				case <-ctx.Done():
-					return interrupted(o)
-				case <-time.After(3 * time.Second):
+					return nil, se, ctx.Err()
+				case <-time.After(5 * time.Second):
 				}
+				excluded = map[string]bool{}
 				continue
 			}
-			if errors.As(err, &ae) && (ae.Code == 403 || ae.Code == 422) && on == "" && pinned == nil {
-				// Not paired any more, or the session can never fit there: another runner.
-				fmt.Fprintf(os.Stderr, "offload: %s: %s; trying another runner\n", h.Name, ae.Msg)
-				refused[h.URL] = true
-				lastRefusal = h.Name + ": " + ae.Msg
-				continue pick
-			}
-			if errors.As(err, &ae) && ae.Code == 503 {
-				// Full right now (capacity, session limit, upgrading): try the next runner, or
-				// with --on wait for this one.
-				fmt.Fprintf(os.Stderr, "offload: %s: %s\n", h.Name, ae.Msg)
-				if on == "" && pinned == nil {
-					excluded[h.URL] = true
-				} else {
-					select {
-					case <-ctx.Done():
-						return interrupted(o)
-					case <-time.After(5 * time.Second):
-					}
-				}
-				continue pick
+			if err == nil {
+				err = checkProto(h)
 			}
 			if err != nil {
-				return fmt.Errorf("%s: %w", h.Name, err)
+				return nil, se, err
+			}
+			if sc != nil {
+				names := make([]string, 0, len(sc.Data))
+				for name := range sc.Data {
+					names = append(names, name)
+				}
+				sort.Strings(names)
+				for _, name := range names {
+					dc, ok := cfg.Data[name]
+					if !ok {
+						return nil, se, fmt.Errorf("session %s uses data set %q, which client.toml doesn't define ([data.%s])", profile, name, name)
+					}
+					if err := SyncData(ctx, h, name, dc, false); err != nil {
+						var ae *APIError
+						if errors.As(err, &ae) && ae.Code == 403 && on == "" && pinned == nil {
+							fmt.Fprintf(os.Stderr, "offload: %s: %s; trying another runner\n", h.Name, ae.Msg)
+							refused[h.URL] = true
+							continue pick
+						}
+						return nil, se, err
+					}
+				}
+			}
+			for announced := false; ; {
+				err := h.do(ctx, "POST", "/v1/sessions", spec, &se)
+				var ae *APIError
+				if errors.As(err, &ae) && ae.Code == 409 { // the environment is being built
+					if !announced {
+						fmt.Fprintf(os.Stderr, "offload: %s: %s\n", h.Name, ae.Msg)
+						announced = true
+					}
+					select {
+					case <-ctx.Done():
+						return nil, se, ctx.Err()
+					case <-time.After(3 * time.Second):
+					}
+					continue
+				}
+				if errors.As(err, &ae) && (ae.Code == 403 || ae.Code == 422) && on == "" && pinned == nil {
+					// Not paired any more, or the session can never fit there: another runner.
+					fmt.Fprintf(os.Stderr, "offload: %s: %s; trying another runner\n", h.Name, ae.Msg)
+					refused[h.URL] = true
+					lastRefusal = h.Name + ": " + ae.Msg
+					continue pick
+				}
+				if errors.As(err, &ae) && ae.Code == 503 {
+					// Full right now (capacity, session limit, upgrading): try the next runner, or
+					// with --on wait for this one.
+					fmt.Fprintf(os.Stderr, "offload: %s: %s\n", h.Name, ae.Msg)
+					if on == "" && pinned == nil {
+						excluded[h.URL] = true
+					} else {
+						select {
+						case <-ctx.Done():
+							return nil, se, ctx.Err()
+						case <-time.After(5 * time.Second):
+						}
+					}
+					continue pick
+				}
+				if err != nil {
+					return nil, se, fmt.Errorf("%s: %w", h.Name, err)
+				}
+				break
 			}
 			break
 		}
-		break
-	}
-	fmt.Fprintf(os.Stderr, "offload: session %s:%s (%s)\n", h.Name, se.ID, profile)
-	if se.Network == "client" { // the runner says so, whether the profile is ours or the runner's
-		go serveCallbacks(ctx, h, "/v1/sessions/"+se.ID, cfg, true, map[string]bool{"dial": true})
-	}
-	defer func() {
-		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = h.do(c, "DELETE", "/v1/sessions/"+se.ID, nil, nil)
-	}()
-
-	out := &activityWriter{w: os.Stdout, started: time.Now()}
-	done := make(chan error, 2)
-	inDone := make(chan error, 1)
-	errDone := make(chan error, 1)
-	go func() { done <- pumpOut(ctx, h, se.ID, "stdout", out) }()
-	go func() { errDone <- pumpOut(ctx, h, se.ID, "stderr", os.Stderr) }()
-	// When the session ends, stderr is read to its end too (its last lines are often the
-	// diagnostic), within a bound; a failure there is reported, not swallowed.
-	// Reports are best-effort: if whoever reads our stderr stopped, writing must not hang us.
-	warn := func(msg string) { go fmt.Fprintln(os.Stderr, msg) }
-	drainStderr := func() {
-		select {
-		case err := <-errDone:
-			if err != nil {
-				warn("offload: the session's stderr didn't arrive completely: " + err.Error())
-			}
-		case <-ctx.Done():
-		case <-time.After(30 * time.Second):
-			warn("offload: gave up waiting for the rest of the session's stderr")
-		}
+		fmt.Fprintf(os.Stderr, "offload: session %s:%s (%s)\n", h.Name, se.ID, profile)
+		return h, se, nil
 	}
 	if o.Prepare {
 		_ = os.Stdin.Close() // nothing to send; wait for the prepare command to finish
-	} else {
-		go func() { inDone <- pumpIn(ctx, h, se.ID, os.Stdin) }()
-	}
-	select {
-	case <-ctx.Done():
-		return interrupted(o)
-	case err := <-done:
-		drainStderr()
-		if err == nil {
-			err = prepareResult(ctx, h, se.ID, o.Prepare) // the server's own exit status
-			if err == nil && o.Prepare && sc != nil && len(sc.Volumes) > 0 {
-				rememberPrepared(profile, h)
-			}
-		}
-		return err
-	case err := <-inDone:
-		var ended *remoteEnded
-		if err != nil && !errors.As(err, &ended) {
-			return err // a local input problem (a message over the limit, a read error): at once
-		}
+		h, se, err := launch()
 		if err != nil {
-			// The server closed its input, often on its way out: its exit status is the real
-			// result, if it arrives soon.
-			select {
-			case derr := <-done:
-				drainStderr()
-				if derr == nil {
-					if r := prepareResult(ctx, h, se.ID, o.Prepare); r == nil || errors.As(r, new(*ExitError)) {
-						return r
-					}
-				}
-			case <-time.After(10 * time.Second):
-				drainStderr()
-			case <-ctx.Done():
+			if ctx.Err() != nil {
+				return interrupted(o)
 			}
 			return err
 		}
-		// Input ended and the server's stdin is closed after it: answers still being worked on
-		// arrive until the server exits (or the caller gives up).
+		s := startSession(ctx, cfg, h, se, os.Stdout, true)
+		defer s.stop()
 		select {
 		case <-ctx.Done():
-			return nil
-		case err := <-done:
-			drainStderr()
-			if err == nil {
-				return prepareResult(ctx, h, se.ID, o.Prepare)
+			return interrupted(o)
+		case err := <-s.ended():
+			if err = s.finish(err); err == nil && sc != nil && len(sc.Volumes) > 0 {
+				rememberPrepared(profile, h)
 			}
 			return err
 		}
 	}
+	b := &bridge{idle: o.Idle, out: os.Stdout, open: func(stdout io.Writer) (mcpSession, error) {
+		h, se, err := launch()
+		if err != nil {
+			return nil, err
+		}
+		return startSession(ctx, cfg, h, se, stdout, false), nil
+	}}
+	if err := b.run(ctx, os.Stdin); err != nil && ctx.Err() == nil {
+		return err
+	}
+	return nil
 }
 
 // candidates are the runners that could ever take this launch (pinned name, profile of the
@@ -450,49 +403,64 @@ func preparedOn(profile string, hosts []*Host) *Host {
 	return nil
 }
 
-// activityWriter remembers when output last arrived.
-type activityWriter struct {
-	w       io.Writer
-	mu      sync.Mutex
-	at      time.Time
-	started time.Time
+// liveSession is one runner session: its stdout and stderr are followed until it ends.
+type liveSession struct {
+	h       *Host
+	id      string
+	seq     int64
+	prepare bool
+	ctx     context.Context
+	cancel  context.CancelFunc
+	out     chan error
+	errOut  chan error
 }
 
-func (a *activityWriter) Write(p []byte) (int, error) {
-	a.mu.Lock()
-	a.at = time.Now()
-	a.mu.Unlock()
-	return a.w.Write(p)
-}
-
-func (a *activityWriter) last() time.Time {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.at
-}
-
-func pumpIn(ctx context.Context, h *Host, id string, in io.Reader) error {
-	r := bufio.NewReaderSize(in, 1<<20)
-	var seq int64
-	for {
-		line, err := readLineMax(r, maxMessage)
-		if errors.Is(err, errTooLong) {
-			return fmt.Errorf("an MCP message is over the %d MiB a session accepts", maxMessage>>20)
-		}
-		if len(line) > 0 {
-			seq++
-			if serr := sendStdin(ctx, h, id, seq, line); serr != nil {
-				return serr
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				// The MCP client closed stdin: so does the server's, after everything sent.
-				return sendEOF(ctx, h, id, seq+1)
-			}
-			return err
-		}
+func startSession(ctx context.Context, cfg *Config, h *Host, se api.Session, stdout io.Writer, prepare bool) *liveSession {
+	ctx, cancel := context.WithCancel(ctx)
+	s := &liveSession{h: h, id: se.ID, prepare: prepare, ctx: ctx, cancel: cancel, out: make(chan error, 1), errOut: make(chan error, 1)}
+	if se.Network == "client" { // the runner says so, whether the profile is ours or the runner's
+		go serveCallbacks(ctx, h, "/v1/sessions/"+se.ID, cfg, true, map[string]bool{"dial": true})
 	}
+	go func() { s.out <- pumpOut(ctx, h, se.ID, "stdout", stdout) }()
+	go func() { s.errOut <- pumpOut(ctx, h, se.ID, "stderr", os.Stderr) }()
+	return s
+}
+
+func (s *liveSession) send(line []byte) error {
+	s.seq++
+	return sendStdin(s.ctx, s.h, s.id, s.seq, line)
+}
+
+func (s *liveSession) closeInput() error { return sendEOF(s.ctx, s.h, s.id, s.seq+1) }
+
+func (s *liveSession) ended() <-chan error { return s.out }
+
+func (s *liveSession) stop() {
+	c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = s.h.do(c, "DELETE", "/v1/sessions/"+s.id, nil, nil)
+	s.cancel()
+}
+
+// finish is the session's result once its stdout ended with err. The rest of stderr is read
+// first, within a bound (its last lines are often the diagnostic), and a failure there is
+// reported, not swallowed. Reports are best-effort: if whoever reads our stderr stopped,
+// writing must not hang us.
+func (s *liveSession) finish(err error) error {
+	warn := func(msg string) { go fmt.Fprintln(os.Stderr, msg) }
+	select {
+	case e := <-s.errOut:
+		if e != nil {
+			warn("offload: the session's stderr didn't arrive completely: " + e.Error())
+		}
+	case <-s.ctx.Done():
+	case <-time.After(30 * time.Second):
+		warn("offload: gave up waiting for the rest of the session's stderr")
+	}
+	if err != nil {
+		return err
+	}
+	return prepareResult(s.ctx, s.h, s.id, s.prepare) // the server's own exit status
 }
 
 // maxMessage is the largest stdin line a session accepts (the runner's frame limit).
