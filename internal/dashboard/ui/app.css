@@ -279,6 +279,8 @@ td.gh-job { min-width: 260px; }
 .gh-runner > .chip { justify-self: start; }
 .gh-runner .room { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; font-size: 12.5px; min-width: 0; }
 .crit-text { color: var(--critical-ink); }
+.runs-on-row { display: inline-flex; align-items: center; gap: 6px; }
+.runs-on-row code { background: var(--surface-2); padding: 2px 6px; border-radius: 5px; color: var(--ink); }
 .slots { display: flex; flex-wrap: wrap; gap: 3px; }
 .slots .cell { width: 14px; height: 14px; aspect-ratio: auto; border-radius: 3px; display: block; }
 .slots .cell:hover { box-shadow: none; }

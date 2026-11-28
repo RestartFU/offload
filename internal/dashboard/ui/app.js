@@ -972,8 +972,12 @@ function renderGitHubView() {
     $("#gh-jobs-body").replaceChildren(h("div", { class: "card empty-state" }, state.fleetErr || "Loading…"));
     return;
   }
-  const owners = new Map();
-  for (const r of state.fleet.runners) for (const p of r.github || []) (owners.get(p.owner) || owners.set(p.owner, []).get(p.owner)).push([r, p]);
+  const owners = new Map(), spelled = new Map(); // GitHub names ignore case: one card per owner
+  for (const r of state.fleet.runners) for (const p of r.github || []) {
+    const k = p.owner.toLowerCase();
+    if (!spelled.has(k)) { spelled.set(k, p.owner); owners.set(p.owner, []); }
+    owners.get(spelled.get(k)).push([r, p]);
+  }
   const alerts = [];
   if (state.ghNotice) alerts.push(ghAlert(state.ghNotice.kind, state.ghNotice.text));
   for (const [owner, list] of owners) for (const [r, p] of list) {
@@ -1019,7 +1023,7 @@ function renderGitHubJobs(owners) {
     " · room for ", h("b", {}, room), " more",
     done.length ? [" · ", h("b", {}, done.length), " finished in the last hour, ", h("b", {}, pct(ok / done.length)), " succeeded"] : "",
   ].flat());
-  const list = all.filter((w) => (f.state === "all" || (f.state === "active") === isActive(w)) && (!f.owner || w.github.owner === f.owner))
+  const list = all.filter((w) => (f.state === "all" || (f.state === "active") === isActive(w)) && (!f.owner || (w.github.owner || "").toLowerCase() === f.owner.toLowerCase()))
     .sort((a, b) => (isActive(b) - isActive(a)) || new Date(b.created) - new Date(a.created));
   let body;
   if (!list.length) {
@@ -1086,6 +1090,7 @@ function ghNotice(kind, text) {
 function ownerCard(owner, list) {
   const first = list[0][1];
   const snippet = "runs-on: " + runsOn(first.labels);
+  const sameLabels = list.every(([, p]) => runsOn(p.labels) === runsOn(first.labels));
   const finished = sum(list, ([, p]) => p.runs);
   const last = list.map(([, p]) => p.last_run).filter(Boolean).sort().pop();
   const per = first.resources;
@@ -1096,12 +1101,14 @@ function ownerCard(owner, list) {
     h("div", { class: "gh-owner-head" },
       h("h3", {}, owner),
       h("a", { class: "subtle-link", href: ghSettings(owner), target: "_blank", rel: "noopener noreferrer" }, "Runner settings", extIcon()),
-      h("div", { class: "runs-on" }, h("code", {}, snippet), copyBtn(snippet, snippet))),
+      sameLabels ? h("div", { class: "runs-on" }, h("code", {}, snippet), copyBtn(snippet, snippet))
+        : h("div", { class: "runs-on muted" }, "Runners match different labels")),
     h("div", { class: "gh-runners", role: "list" }, list.sort((a, b) => a[0].name.localeCompare(b[0].name)).map(([r, p]) =>
       h("div", { class: "gh-runner", role: "listitem" },
         h("span", { class: "n" }, r.name),
         poolChip(p),
-        h("div", { class: "room" }, slots(p), h("span", { class: p.state === "failed" ? "crit-text" : "muted" }, roomText(p)))))),
+        h("div", { class: "room" }, slots(p), h("span", { class: p.state === "failed" ? "crit-text" : "muted" }, roomText(p)),
+          sameLabels ? null : h("span", { class: "runs-on-row" }, h("code", {}, "runs-on: " + runsOn(p.labels)), copyBtn("runs-on: " + runsOn(p.labels))))))),
     h("div", { class: "runner-foot gh-foot" },
       h("span", {}, "Each job ", h("b", {}, `${fmtCores(per.cpu)}–${fmtCores(per.cpu_max)} cores`), " · ", h("b", {}, fmtBytes(per.mem))),
       h("span", {}, h("b", {}, finished), " finished", last ? " · last one " + agoCoarse(last) : ""),
@@ -1138,7 +1145,7 @@ function ghFormEl() {
     return [input, h("label", { class: "choice" }, input, h("span", {}, h("b", {}, label), desc ? h("span", { class: "muted" }, desc) : null))];
   };
   f.owner = h("input", { type: "text", id: "gh-f-owner", placeholder: "ORG or ORG/REPO", autocomplete: "off", spellcheck: "false", "aria-describedby": "gh-f-owner-hint", oninput: () => renderGhForm() });
-  f.labels = h("input", { type: "text", id: "gh-f-labels", value: "offload", autocomplete: "off", spellcheck: "false", oninput: () => renderGhForm() });
+  f.labels = h("input", { type: "text", id: "gh-f-labels", value: "offload", autocomplete: "off", spellcheck: "false", oninput: () => { f.labelsEdited = true; renderGhForm(); } });
   f.preview = h("code", {});
   let c;
   [f.cacheClean, c] = radio("gh-cache", "clean", "Clean for every job", " Each job starts empty. Safe when the repositories don't all trust each other.", true);
@@ -1175,7 +1182,7 @@ function ghFormEl() {
 
 function openGhForm() {
   state.ghFormOpen = true; state.ghFormMsg = null;
-  if (ghForm) { ghForm.picks = null; ghForm.runnerKey = null; ghForm.lastOwner = null; ghForm.cacheClean.checked = true; }
+  if (ghForm) { ghForm.picks = null; ghForm.runnerKey = null; ghForm.lastOwner = null; ghForm.cacheClean.checked = true; ghForm.labelsEdited = false; }
   render();
   ghForm.root.scrollIntoView({ block: "nearest", behavior: "smooth" });
   ghForm.owner.focus();
@@ -1210,14 +1217,17 @@ function renderGhForm() {
   const holderNames = existing ? owners.get(existing).map(([r]) => r.name) : [];
   const repo = owner.includes("/");
   f.cacheChoices.hidden = repo;
-  const policy = existing ? !!owners.get(existing)[0][1].shared : null; // more runners follow the one it has
-  f.cacheClean.disabled = f.cacheShared.disabled = policy !== null;
-  if (policy !== null) { f.cacheShared.checked = policy; f.cacheClean.checked = !policy; }
+  const pools = existing ? owners.get(existing).map(([, p]) => p) : [];
   f.cacheNote.textContent = repo ? "A repository's jobs keep warm caches: they are all the same repository's code."
-    : policy !== null ? `As ${existing} has on its other runners.` : "";
+    : pools.length ? `${existing} has ${pools.some((p) => p.shared) ? "shared" : "clean"} caches on its other runners; these runners get what you choose here.` : "";
+  if (!f.labelsEdited) { // workflows already target a connected owner's labels: new runners should match them
+    f.labels.value = pools.length ? (pools[0].labels || ["offload"]).join(", ") : "offload";
+    f.preview.textContent = "runs-on: " + runsOn(f.labels.value.split(",").map((x) => x.trim()).filter(Boolean));
+  }
   f.exists.hidden = !existing;
   if (existing) {
-    const cmd = `offload github add ${existing} --on ${holderNames.join(",")}`;
+    const ids = owners.get(existing).map(([r]) => r.status?.id).filter(Boolean);
+    const cmd = `offload github add ${existing} --on ${ids.join(",")}`;
     f.exists.replaceChildren(ghAlert("info", h("div", {}, `${existing} is already connected on ${holderNames.join(", ")}; you can add it to other runners here. `,
       "To give it a new token or change its settings, run this with the new values (or remove it below and add it again):"), h("div", { class: "snippet" }, h("code", {}, cmd), copyBtn(cmd))));
   }
