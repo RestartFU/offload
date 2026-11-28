@@ -1091,6 +1091,7 @@ function ownerCard(owner, list) {
   const first = list[0][1];
   const snippet = "runs-on: " + runsOn(first.labels);
   const sameLabels = list.every(([, p]) => runsOn(p.labels) === runsOn(first.labels));
+  const sameCaches = list.every(([, p]) => !!p.shared === !!first.shared);
   const finished = sum(list, ([, p]) => p.runs);
   const last = list.map(([, p]) => p.last_run).filter(Boolean).sort().pop();
   const per = first.resources;
@@ -1108,11 +1109,12 @@ function ownerCard(owner, list) {
         h("span", { class: "n" }, r.name),
         poolChip(p),
         h("div", { class: "room" }, slots(p), h("span", { class: p.state === "failed" ? "crit-text" : "muted" }, roomText(p)),
-          sameLabels ? null : h("span", { class: "runs-on-row" }, h("code", {}, "runs-on: " + runsOn(p.labels)), copyBtn("runs-on: " + runsOn(p.labels))))))),
+          sameLabels ? null : h("span", { class: "runs-on-row" }, h("code", {}, "runs-on: " + runsOn(p.labels)), copyBtn("runs-on: " + runsOn(p.labels))),
+          sameCaches ? null : h("span", { class: p.shared ? "" : "muted" }, p.shared ? "shared caches" : "clean caches"))))),
     h("div", { class: "runner-foot gh-foot" },
       h("span", {}, "Each job ", h("b", {}, `${fmtCores(per.cpu)}–${fmtCores(per.cpu_max)} cores`), " · ", h("b", {}, fmtBytes(per.mem))),
       h("span", {}, h("b", {}, finished), " finished", last ? " · last one " + agoCoarse(last) : ""),
-      h("span", {}, first.shared ? "Warm caches shared by its jobs" : "Clean caches every job"),
+      sameCaches ? h("span", {}, first.shared ? "Warm caches shared by its jobs" : "Clean caches every job") : h("span", {}, "Cache policy differs by runner"),
       h("span", {}, first.token_from === "gh" ? "With your gh login" : "With a token"),
       h("span", { class: "gh-actions" },
         stuck.length ? armedBtn("forget:" + owner, "Remove here only", `Confirm: GitHub keeps ${stuckRows.map(([r]) => r.name).join(", ")}'s scale set`, () => ghRemove(owner, true, stuck)) : null,
@@ -1221,15 +1223,19 @@ function renderGhForm() {
   f.cacheNote.textContent = repo ? "A repository's jobs keep warm caches: they are all the same repository's code."
     : pools.length ? `${existing} has ${pools.some((p) => p.shared) ? "shared" : "clean"} caches on its other runners; these runners get what you choose here.` : "";
   if (!f.labelsEdited) { // workflows already target a connected owner's labels: new runners should match them
-    f.labels.value = pools.length ? (pools[0].labels || ["offload"]).join(", ") : "offload";
+    if (pools.length) { f.labels.value = (pools[0].labels || ["offload"]).join(", "); f.inherited = owner.toLowerCase(); }
+    else if (f.inherited !== owner.toLowerCase()) { f.labels.value = "offload"; f.inherited = null; } // a refresh that briefly loses the pool keeps them
     f.preview.textContent = "runs-on: " + runsOn(f.labels.value.split(",").map((x) => x.trim()).filter(Boolean));
   }
   f.exists.hidden = !existing;
   if (existing) {
-    const ids = owners.get(existing).map(([r]) => r.status?.id).filter(Boolean);
-    const cmd = `offload github add ${existing} --on ${ids.join(",")}`;
+    // Runners report these values, so the command is offered only when nothing in it needs quoting.
+    const ids = owners.get(existing).map(([r]) => r.status?.id || "");
+    const safe = /^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)?$/.test(existing) && ids.every((id) => /^[0-9a-f]{6,64}$/.test(id));
+    const cmd = safe ? `offload github add ${existing} --on ${ids.join(",")}` : "";
     f.exists.replaceChildren(ghAlert("info", h("div", {}, `${existing} is already connected on ${holderNames.join(", ")}; you can add it to other runners here. `,
-      "To give it a new token or change its settings, run this with the new values (or remove it below and add it again):"), h("div", { class: "snippet" }, h("code", {}, cmd), copyBtn(cmd))));
+      "To give it a new token or change its settings, run offload github add with the new values and --on its runners, or remove it below and add it again."),
+      cmd ? h("div", { class: "snippet" }, h("code", {}, cmd), copyBtn(cmd)) : null));
   }
   f.tokenRow.hidden = !f.authToken.checked;
   // Runners are chosen by their ID for as long as the form is open: a runner that drops out and
