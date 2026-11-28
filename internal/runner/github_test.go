@@ -319,3 +319,20 @@ func TestGitHubClaimsWithCurrentCount(t *testing.T) {
 		t.Fatalf("claimed %v: %v", f.acquired, err)
 	}
 }
+
+// Scale sets carry GitHub's default self-hosted labels too, once each.
+func TestGitHubScaleSetLabels(t *testing.T) {
+	got := scaleSetLabels([]string{"offload", "Linux", "zeno"})
+	if len(got) != 5 || got[0] != "self-hosted" || got[1] != "linux" || got[3] != "offload" || got[4] != "zeno" {
+		t.Fatalf("labels %v", got)
+	}
+}
+
+// Avatars come only from GitHub's avatar host, so a profile can't make the runner fetch anything else.
+func TestGitHubAvatarHost(t *testing.T) {
+	for _, u := range []string{"https://example.com/a.png", "http://avatars.githubusercontent.com/u/1", "https://avatars.githubusercontent.com.evil.example/u/1", "::"} {
+		if got := githubAvatar(context.Background(), u); got != "" {
+			t.Errorf("%q fetched: %.40s", u, got)
+		}
+	}
+}

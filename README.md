@@ -148,7 +148,9 @@ offload github ls
 offload github rm ZenoMCPE
 ```
 
-Workflows then use `runs-on: offload`. `add` uses your GitHub CLI login: GitHub wants the
+Workflows then use `runs-on: offload`. The runners also carry the labels GitHub gives every
+self-hosted runner (`self-hosted`, `linux` and the architecture, such as `x64`), so workflows
+written for ordinary self-hosted runners match too. `add` uses your GitHub CLI login: GitHub wants the
 `admin:org` scope to manage an organization's runners (`repo` for a repository), and `add` says
 how to grant it when it's missing (`gh auth refresh -h github.com -s admin:org`). For a narrower
 credential, pass `--token` a fine-grained token with only "Self-hosted runners: write", as a

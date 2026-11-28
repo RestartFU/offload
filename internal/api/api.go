@@ -309,24 +309,31 @@ const (
 // GitHubPool is one organization or repository a runner takes GitHub Actions jobs for: its own
 // runner scale set on GitHub, which tells GitHub how many jobs fit here right now.
 type GitHubPool struct {
-	Owner      string     `json:"owner"`     // "ORG" or "ORG/REPO"
-	URL        string     `json:"url"`       // https://github.com/<owner>
-	ScaleSet   string     `json:"scale_set"` // this runner's scale set name on GitHub
-	ScaleSetID int        `json:"scale_set_id,omitempty"`
-	Labels     []string   `json:"labels"`
-	Max        int        `json:"max,omitempty"`
-	Resources  Resources  `json:"resources"`
-	TokenFrom  string     `json:"token_from,omitempty"`
-	Shared     bool       `json:"shared"` // jobs reuse warm state (a repository, or --shared-cache)
-	CreatedAt  time.Time  `json:"created_at"`
-	State      string     `json:"state"`
-	Detail     string     `json:"detail,omitempty"` // what preparing waits for, or why it failed
-	Capacity   int        `json:"capacity"`         // GitHub jobs it accepts now, running ones included
-	Assigned   int        `json:"assigned"`         // jobs GitHub has given it, running ones included
-	Running    int        `json:"running"`          // its runners that are running a GitHub job
-	Starting   int        `json:"starting"`         // its runners waiting to start or for their job
-	Runs       int        `json:"runs"`             // GitHub jobs it has finished
-	LastRun    *time.Time `json:"last_run,omitempty"`
+	Owner string `json:"owner"`          // "ORG" or "ORG/REPO", spelled as on GitHub once known
+	Name  string `json:"name,omitempty"` // the organization's or account's display name on GitHub
+	// Avatar is the owner's GitHub avatar as a small data: URL (the dashboard loads nothing from
+	// elsewhere), once the runner has fetched it.
+	Avatar     string   `json:"avatar,omitempty"`
+	URL        string   `json:"url"`       // https://github.com/<owner>
+	ScaleSet   string   `json:"scale_set"` // this runner's scale set name on GitHub
+	ScaleSetID int      `json:"scale_set_id,omitempty"`
+	Labels     []string `json:"labels"`
+	// SystemLabels are the labels GitHub gives every self-hosted runner (self-hosted, linux, the
+	// architecture), which the scale set carries too, so workflows written for them match.
+	SystemLabels []string   `json:"system_labels,omitempty"`
+	Max          int        `json:"max,omitempty"`
+	Resources    Resources  `json:"resources"`
+	TokenFrom    string     `json:"token_from,omitempty"`
+	Shared       bool       `json:"shared"` // jobs reuse warm state (a repository, or --shared-cache)
+	CreatedAt    time.Time  `json:"created_at"`
+	State        string     `json:"state"`
+	Detail       string     `json:"detail,omitempty"` // what preparing waits for, or why it failed
+	Capacity     int        `json:"capacity"`         // GitHub jobs it accepts now, running ones included
+	Assigned     int        `json:"assigned"`         // jobs GitHub has given it, running ones included
+	Running      int        `json:"running"`          // its runners that are running a GitHub job
+	Starting     int        `json:"starting"`         // its runners waiting to start or for their job
+	Runs         int        `json:"runs"`             // GitHub jobs it has finished
+	LastRun      *time.Time `json:"last_run,omitempty"`
 }
 
 // GitHubJob is what a GitHub runner job is doing on GitHub, once its runner has taken a job.
