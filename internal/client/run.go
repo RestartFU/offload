@@ -2,7 +2,6 @@ package client
 
 import (
 	"archive/tar"
-	"cmp"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
@@ -50,7 +49,7 @@ type RunOptions struct {
 	Detach      bool
 	Quiet       bool
 	Shards      int    // run the command this many times, spread over runners (see asShard)
-	ArtifactDir string // where --get outputs land, relative to the working directory
+	ArtifactDir string // --get outputs land under this directory of the working directory
 	Argv        []string
 }
 
@@ -857,7 +856,7 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 	if len(o.Artifacts) > 0 && j.State == api.StateExited {
 		if !j.HasArtifact {
 			artErr = fmt.Errorf("the job produced none of the requested artifacts (%s)", strings.Join(o.Artifacts, ", "))
-		} else if kept, err := fetchArtifacts(ctx, h, j.ID, cmp.Or(o.ArtifactDir, "."), snap); err != nil {
+		} else if kept, err := fetchArtifacts(ctx, h, j.ID, ".", o.ArtifactDir, snap); err != nil {
 			artErr = fmt.Errorf("artifacts: %w", err)
 		} else if kept > 0 {
 			artErr = fmt.Errorf("%d artifact(s) not written over local changes (saved beside them)", kept)
@@ -979,20 +978,18 @@ func sigOf(root *os.Root, rel string, fi fs.FileInfo) fileSig {
 	return sig
 }
 
-// snapshotArtifacts records what the --get destinations look like before the job runs, so the
-// download never replaces anything that appeared or changed here meanwhile.
-func snapshotArtifacts(dir string, paths []string) map[string]fileSig {
+// snapshotArtifacts records what the --get destinations (under directory under) look like
+// before the job runs, so the download never replaces anything that appeared or changed here
+// meanwhile.
+func snapshotArtifacts(under string, paths []string) map[string]fileSig {
 	snap := map[string]fileSig{}
-	if dir == "" {
-		dir = "."
-	}
-	tree, err := os.OpenRoot(dir)
+	tree, err := os.OpenRoot(".")
 	if err != nil {
 		return snap
 	}
 	defer tree.Close()
 	for _, p := range paths {
-		p = path.Clean(filepath.ToSlash(p))
+		p = path.Join(under, path.Clean(filepath.ToSlash(p)))
 		if checkRel(p) != nil {
 			continue
 		}
@@ -1456,10 +1453,11 @@ func unchangedSinceSnap(tree *os.Root, rel string, snap map[string]fileSig) bool
 	return had && sigOf(tree, rel, fi) == before
 }
 
-// fetchArtifacts extracts a job's artifacts into dest. With a snapshot (see snapshotArtifacts),
+// fetchArtifacts extracts a job's artifacts into dest, under its directory under (still confined
+// to dest, through real directories only). With a snapshot (see snapshotArtifacts),
 // a path that appeared or changed here since it was taken is kept, and the artifact is saved
 // beside it as <file>.offload-incoming[.N]; kept counts those.
-func fetchArtifacts(ctx context.Context, h *Host, id, dest string, snap map[string]fileSig) (kept int, err error) {
+func fetchArtifacts(ctx context.Context, h *Host, id, dest, under string, snap map[string]fileSig) (kept int, err error) {
 	// The whole archive first, checked complete: a connection lost halfway must not leave new
 	// and old outputs mixed.
 	_ = os.MkdirAll(stateDir(), 0o700)
@@ -1508,6 +1506,7 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string, snap map[stri
 		if err := checkRel(name); err != nil {
 			return kept, fmt.Errorf("refusing artifact path %q", hd.Name)
 		}
+		name = path.Join(under, name)
 		// A directory deleted here while the job ran stays deleted: what the job put under it
 		// goes to .offload-incoming/<job>/ instead of recreating it.
 		relocated := false
@@ -1596,6 +1595,6 @@ func fetchArtifacts(ctx context.Context, h *Host, id, dest string, snap map[stri
 			}
 		}
 	}
-	logf(false, "downloaded %d artifact file(s) into %s", n, dest)
+	logf(false, "downloaded %d artifact file(s) into %s", n, filepath.Join(dest, under))
 	return kept, nil
 }

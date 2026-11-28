@@ -38,8 +38,9 @@ offload hosts / ps / attach                  ├─ sessions: long-lived stdio p
   runs the command four times, each a job of its own spread over runners, with `{shard}` and
   `{shards}` (and `OFFLOAD_SHARD`, `OFFLOAD_SHARDS` in the job) set per shard, counting from 1.
   Output lines are prefixed with the shard, and the exit code is the first failed shard's.
-  Shards write no edits back; `--get` outputs land in `shards/<i>/`. Each shard builds the code
-  again, so it pays off for suites that take far longer to run than to build.
+  Shards write no edits back; `--get` outputs land in `offload-shards/<i>/`, which is never
+  synced. Each shard builds the code again, so it pays off for suites that take far longer to
+  run than to build.
 - **Feels local.** The runner gets a real `.git` at your HEAD (only missing commits travel, as a
   bundle). Files the job edits are written back. stdout and stderr stay separate.
 - **Credentials without copying keys.** The job's `SSH_AUTH_SOCK` and git credential helper

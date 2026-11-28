@@ -72,7 +72,7 @@ Client:
       --shards N       run N copies spread over runners; each gets OFFLOAD_SHARD (1..N) and
                        OFFLOAD_SHARDS, and {shard} / {shards} in CMD are replaced: e.g.
                        --shards 4 -- cargo nextest run --partition count:{shard}/{shards}
-                       (no write-back; --get outputs land in shards/<i>/)
+                       (no write-back; --get outputs land in offload-shards/<i>/)
       --detach, -d     print the job id and return
       --quiet, -q      no offload status lines
   offload attach ID...               follow jobs to the end (Ctrl-C detaches)

@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -605,8 +606,19 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 
 // pick is Pick; with argv and no profile, each runner is judged by the profile it would match
 // for that command (as it will when it gets the job), not by its global defaults.
+// Earlier shards of the run on a runner count against it, unless that would leave a shard
+// queued that one of those runners could start now.
 func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []string) (*Host, error) {
+	h, startsNow, err := pickScored(hosts, want, profile, key, kind, argv, true)
+	if err == nil && !startsNow && slices.ContainsFunc(hosts, func(x *Host) bool { return x.placed > 0 }) {
+		h, _, err = pickScored(hosts, want, profile, key, kind, argv, false)
+	}
+	return h, err
+}
+
+func pickScored(hosts []*Host, want api.Resources, profile, key, kind string, argv []string, spread bool) (*Host, bool, error) {
 	var best *Host
+	bestNow := false
 	bestScore := -1e18
 	var reasons []string
 	for _, h := range hosts {
@@ -669,9 +681,13 @@ func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []s
 		}
 		r.Mem = min(r.Mem, st.Capacity.Mem)
 		f := h.free()
-		score := float64(h.Priority)*1000 - 400*float64(h.placed) // spread shards unless only this one can start now
+		score := float64(h.Priority) * 1000
+		if spread {
+			score -= 400 * float64(h.placed)
+		}
 		unbooked := st.Capacity.CPU - st.Allocated.CPU - st.Pending.CPU
-		if f.CPU >= r.CPU && f.Mem >= r.Mem {
+		now := f.CPU >= r.CPU && f.Mem >= r.Mem
+		if now {
 			score += 400 // can start right away
 			if unbooked >= r.CPU {
 				score += 100 // without overbooking: its guarantee really is free there
@@ -704,16 +720,16 @@ func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []s
 			score += 50
 		}
 		if score > bestScore {
-			best, bestScore = h, score
+			best, bestScore, bestNow = h, score, now
 		}
 	}
 	if best == nil {
 		if len(hosts) == 0 {
-			return nil, errors.New("no runners found (is tailscale up and a runner online?)")
+			return nil, false, errors.New("no runners found (is tailscale up and a runner online?)")
 		}
-		return nil, fmt.Errorf("no runner fits: %s", strings.Join(reasons, "; "))
+		return nil, false, fmt.Errorf("no runner fits: %s", strings.Join(reasons, "; "))
 	}
-	return best, nil
+	return best, bestNow, nil
 }
 
 // FindHost returns the named runner from hosts.

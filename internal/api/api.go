@@ -427,7 +427,7 @@ func AgentRequestAllowed(msg []byte) bool {
 // client never syncs (and the runner never prunes).
 func SkipDir(name string) bool {
 	switch name {
-	case ".git", "target", "node_modules", ".venv", "__pycache__", ".zig-cache", "zig-out", "build", "dist":
+	case ".git", "target", "node_modules", ".venv", "__pycache__", ".zig-cache", "zig-out", "build", "dist", "offload-shards":
 		return true
 	}
 	return strings.HasPrefix(name, ".cache")

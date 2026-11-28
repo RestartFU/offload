@@ -7,11 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 
 const (
 	MaxShards = 64
+	shardsDir = "offload-shards"
 	// Each shard is this same command line run again by a child process, which finds its shard
 	// here ("i/n") and reports on fd 3 which runner took its job.
 	shardOfEnv     = "OFFLOAD_SHARD_OF"
@@ -28,7 +30,7 @@ const (
 
 // asShard turns a run into shard i of n: OFFLOAD_SHARD and OFFLOAD_SHARDS in the job's
 // environment, {shard} and {shards} replaced in the command, no write-back (shards would edit
-// the same files), and --get outputs in shards/<i>/.
+// the same files), and --get outputs in offload-shards/<i>/.
 func asShard(o RunOptions, i, n int) RunOptions {
 	si, sn := strconv.Itoa(i), strconv.Itoa(n)
 	env := maps.Clone(o.Env)
@@ -43,7 +45,7 @@ func asShard(o RunOptions, i, n int) RunOptions {
 	}
 	o.Env, o.Argv, o.Shards, o.NoWriteBack = env, argv, 0, true
 	if n > 1 {
-		o.ArtifactDir = filepath.Join("shards", si)
+		o.ArtifactDir = path.Join(shardsDir, si)
 	}
 	return o
 }
@@ -109,6 +111,11 @@ func runShards(ctx context.Context, o RunOptions) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	if len(o.Artifacts) > 0 {
+		if err := makeShardsDir(); err != nil {
+			return 1, err
+		}
+	}
 	var children []child
 	for i := 1; i <= o.Shards; i++ {
 		children = append(children, child{
@@ -122,6 +129,31 @@ func runShards(ctx context.Context, o RunOptions) (int, error) {
 		return 1, err
 	}
 	return worst(codes, children), nil
+}
+
+// makeShardsDir creates offload-shards/ ignoring itself, so shards' outputs are never synced
+// to later jobs as source.
+func makeShardsDir() error {
+	tree, err := os.OpenRoot(".")
+	if err != nil {
+		return err
+	}
+	defer tree.Close()
+	if err := mkdirReal(tree, shardsDir); err != nil {
+		return fmt.Errorf("%s: %w (it must be a real directory here)", shardsDir, err)
+	}
+	f, err := tree.OpenFile(path.Join(shardsDir, ".gitignore"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if errors.Is(err, fs.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteString("*\n")
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // AttachAll follows several jobs at once, each line prefixed with its job. Ctrl-C detaches.
@@ -232,8 +264,9 @@ func fanOut(ctx context.Context, self string, children []child, out, errOut io.W
 		go func() {
 			defer wg.Done()
 			codes[k] = exitCode(cmd.Wait())
-			stdout.flush()
-			stderr.flush()
+			if err := errors.Join(stdout.flush(), stderr.flush()); err != nil && codes[k] == 0 {
+				codes[k] = 1 // its output didn't all arrive
+			}
 		}()
 		if report != nil {
 			line, _ := bufio.NewReader(report).ReadString('\n')
@@ -272,7 +305,7 @@ func exitCode(err error) int {
 }
 
 // lineWriter writes whole lines, each with a prefix, so children's output never interleaves
-// within a line.
+// within a line. A line longer than maxLine is written in pieces.
 type lineWriter struct {
 	w      io.Writer
 	mu     *sync.Mutex
@@ -280,35 +313,43 @@ type lineWriter struct {
 	buf    []byte
 }
 
+const maxLine = 64 << 10
+
 func (l *lineWriter) Write(p []byte) (int, error) {
-	l.buf = append(l.buf, p...)
-	end := bytes.LastIndexByte(l.buf, '\n')
-	if end < 0 {
-		return len(p), nil
+	n := len(p)
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		if i < 0 {
+			room := maxLine - len(l.buf)
+			if len(p) < room {
+				l.buf = append(l.buf, p...)
+				return n, nil
+			}
+			l.buf = append(l.buf, p[:room]...)
+			p = p[room:]
+		} else {
+			l.buf = append(l.buf, p[:i]...)
+			p = p[i+1:]
+		}
+		if err := l.emit(); err != nil {
+			return 0, err
+		}
 	}
-	if err := l.emit(l.buf[:end+1]); err != nil {
-		return 0, err
-	}
-	l.buf = append(l.buf[:0], l.buf[end+1:]...)
-	return len(p), nil
+	return n, nil
 }
 
-func (l *lineWriter) flush() {
-	if len(l.buf) > 0 {
-		_ = l.emit(append(l.buf, '\n'))
-		l.buf = nil
+func (l *lineWriter) flush() error {
+	if len(l.buf) == 0 {
+		return nil
 	}
+	return l.emit()
 }
 
-func (l *lineWriter) emit(lines []byte) error {
-	var out []byte
-	for len(lines) > 0 {
-		n := bytes.IndexByte(lines, '\n') + 1
-		out = append(append(out, l.prefix...), lines[:n]...)
-		lines = lines[n:]
-	}
+func (l *lineWriter) emit() error {
+	line := append(append([]byte(l.prefix), l.buf...), '\n')
+	l.buf = l.buf[:0]
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_, err := l.w.Write(out)
+	_, err := l.w.Write(line)
 	return err
 }

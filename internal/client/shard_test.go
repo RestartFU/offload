@@ -1,10 +1,16 @@
 package client
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -84,7 +90,7 @@ func TestAsShard(t *testing.T) {
 	if _, leaked := o.Env["OFFLOAD_SHARD"]; leaked {
 		t.Fatal("asShard changed the caller's env")
 	}
-	if !s.NoWriteBack || s.Shards != 0 || s.ArtifactDir != "shards/2" {
+	if !s.NoWriteBack || s.Shards != 0 || s.ArtifactDir != "offload-shards/2" {
 		t.Fatalf("got %+v", s)
 	}
 	if one := asShard(RunOptions{Argv: []string{"x"}}, 1, 1); one.ArtifactDir != "" {
@@ -107,6 +113,60 @@ func TestPickSpreadsShards(t *testing.T) {
 	zeno.Status.Allocated = api.Resources{CPU: 6}
 	if h, _ := pick([]*Host{vps, zeno}, want, "", "repo", "job", nil); h.Name != "vps" {
 		t.Fatalf("picked %s; zeno can't start it now", h.Name)
+	}
+	// However many shards it holds, a runner that can start one beats one that would queue it.
+	vps.placed = 3
+	if h, _ := pick([]*Host{vps, zeno}, want, "", "repo", "job", nil); h.Name != "vps" {
+		t.Fatalf("picked %s with 3 shards on vps; zeno would queue it", h.Name)
+	}
+}
+
+// Shard outputs go under offload-shards/<i> of the destination, never through a symlink there.
+func TestFetchArtifactsUnderStaysInside(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	tw.WriteHeader(&tar.Header{Name: "out.txt", Mode: 0o644, Size: 2, Typeflag: tar.TypeReg})
+	tw.Write([]byte("hi"))
+	tw.Close()
+	gz.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(buf.Bytes()) }))
+	defer srv.Close()
+	h := newHost("r", srv.URL, "tok", 0)
+
+	dest, outside := t.TempDir(), t.TempDir()
+	if _, err := fetchArtifacts(context.Background(), h, "j-1", dest, "offload-shards/1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dest, "offload-shards/1/out.txt")); err != nil || string(b) != "hi" {
+		t.Fatalf("got %q, %v", b, err)
+	}
+	dest = t.TempDir()
+	os.Symlink(outside, filepath.Join(dest, "offload-shards"))
+	fetchArtifacts(context.Background(), h, "j-2", dest, "offload-shards/1", nil)
+	if _, err := os.Stat(filepath.Join(outside, "1/out.txt")); err == nil {
+		t.Fatal("an artifact went through the symlink, outside the destination")
+	}
+}
+
+func TestLineWriterBoundsLongLines(t *testing.T) {
+	var buf bytes.Buffer
+	l := &lineWriter{w: &buf, mu: &sync.Mutex{}, prefix: "> "}
+	l.Write(bytes.Repeat([]byte("x"), maxLine+10))
+	if len(l.buf) != 10 || buf.Len() != len("> ")+maxLine+1 {
+		t.Fatalf("pending %d, written %d", len(l.buf), buf.Len())
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
+
+func TestLineWriterFlushReportsErrors(t *testing.T) {
+	l := &lineWriter{w: failingWriter{}, mu: &sync.Mutex{}}
+	l.Write([]byte("last line, no newline"))
+	if l.flush() == nil {
+		t.Fatal("a lost last line must be reported")
 	}
 }
 
