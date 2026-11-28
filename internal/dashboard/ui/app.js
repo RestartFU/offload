@@ -1135,7 +1135,7 @@ function ownerCard(owner, list) {
         h("span", { class: "n" }, r.name),
         poolChip(p),
         h("div", { class: "room" }, slots(p), h("span", { class: p.state === "failed" ? "crit-text" : "muted" }, roomText(p)),
-          sameLabels ? null : h("span", { class: "runs-on-row" }, ...labelChips(ghLabels(p)), copyBtn("runs-on: " + runsOn(p.labels))),
+          sameLabels ? null : h("span", { class: "runs-on-row" }, ...labelChips(ghLabels(p)), copyBtn("runs-on: " + runsOn(ghLabels(p)))),
           sameCaches ? null : h("span", { class: p.shared ? "" : "muted" }, p.shared ? "shared caches" : "clean caches"),
           null)))),
     sameLabels ? h("div", { class: "gh-also muted" }, "Labels ", ...labelChips(ghLabels(first)),
