@@ -94,6 +94,25 @@ everywhere else. Before you call a change done, walk this list and say which ent
 - When babysitting a PR, verify each review bot finding against the source. Fix the real ones
   and dismiss false positives with a written reason.
 
+### Codex review
+
+- Every change reaches `master` through a PR whose final head has a clean Codex review: no
+  P0, P1 or P2 findings. Only trivial changes, such as docs, comments or formatting, may skip it.
+- The review is repeated whenever the PR head changes. A later round reads the whole diff but
+  blocks only on code changed since the last reviewed head (not merged in from `master`), or
+  on earlier code those changes make reachable.
+- Severity bar: P0 to P2 need an input or sequence that real developers, agents, jobs or
+  runners plausibly produce, or a crossed trust boundary: a job, web page or tailnet peer
+  reaching the runner host, another client's work or the developer's credentials, or secrets
+  landing in job records or logs. Pathological input that only fails the job or session that
+  chose it is P3, and P3 doesn't block.
+- If a PR reaches a third review round, simplify or re-scope the design instead of patching
+  it again.
+- CodeRabbit is supplemental. Read its comments and weigh them as above, but don't wait for it
+  and don't require a clean CodeRabbit review.
+- A merge hold in the PR description or comments, such as "merge only when X", overrides a
+  clean review. Leave the PR open until its condition is met.
+
 ## Documentation
 
 Most code changes need no doc change. Agents can read the code.
