@@ -201,7 +201,19 @@ keepalive doesn't wake it. Server state, such as a running game, doesn't survive
   it forever, so `rm --forget` is the way out.
 - **Nested podman, not a docker daemon.** Inner containers share the job container's
   namespaces and cgroup, so offload's limits cover them and nothing needs real privileges. The
-  job container gets the `nested_sandbox` permissions, as flatpak sessions do.
+  job container gets the `nested_sandbox` permissions, as flatpak sessions do, plus SYS_PTRACE:
+  `docker exec` opens the inner container's namespaces, and when its PID 1 has dropped root
+  (postgres) that takes ptrace access. All rootless containers share one user namespace, where
+  those capabilities hold, and a separate PID namespace doesn't fence them: a unix socket peer
+  hands out a pidfd. So a GitHub job gets its own network namespace (rootless podman's pasta)
+  with outbound access only. Its abstract sockets, ports and broadcasts stay inside the job,
+  and so do its inner containers and build steps, which share it. That and the runner's loopback
+  being out of reach hold with podman's default settings (pasta can be set to forward ports or
+  map the host's loopback); services on its other addresses are reachable as from any machine on
+  its network. Which helper podman uses, and where it finds it, depend on its version and
+  configuration, so before a pool takes jobs the runner starts the GitHub image that way once, in
+  a user unit as jobs are started. If that fails, the pool offers no room, even to an offer
+  answering an earlier poll, and shows podman's error. The failure pause clears the result.
 
 ## Client networking
 
