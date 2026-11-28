@@ -1224,15 +1224,22 @@ function renderGhForm() {
   const pools = existing ? owners.get(existing).map(([, p]) => p) : [];
   f.cacheNote.textContent = repo ? "A repository's jobs keep warm caches: they are all the same repository's code."
     : pools.length ? `${existing} has ${pools.some((p) => p.shared) ? "shared" : "clean"} caches on its other runners; these runners get what you choose here.` : "";
-  // Workflows already target a connected owner's labels: different ones here would leave the new
-  // runners unused, so say so and offer the owner's, rather than filling them in unseen.
+  // Workflows already target a connected owner's labels (each runner's, which may differ): any set
+  // that differs from the one here would never reach the new runners, so name each and offer it.
+  // Rebuilt only when that changes, so a refresh never takes focus from its buttons.
   const mine = runsOn(f.labels.value.split(",").map((x) => x.trim()).filter(Boolean));
-  const theirs = pools.length ? runsOn(pools[0].labels) : null;
-  f.labelsNote.hidden = !theirs || theirs === mine;
-  if (theirs && theirs !== mine) {
-    f.labelsNote.replaceChildren(ghAlert("warning", h("div", {}, `${existing}'s other runners take workflows with `, h("code", {}, "runs-on: " + theirs),
-      ". With different labels, those workflows won't reach these runners."),
-      h("button", { type: "button", class: "btn", onclick: () => { f.labels.value = (pools[0].labels || ["offload"]).join(", "); renderGhForm(); } }, "Use runs-on: " + theirs)));
+  const others = new Map();
+  for (const p of pools) if (runsOn(p.labels) !== mine) others.set(runsOn(p.labels), p.labels || ["offload"]);
+  const noteKey = existing && others.size ? existing + "|" + [...others.keys()].sort().join("|") : "";
+  if (noteKey !== f.labelsNoteKey) {
+    f.labelsNoteKey = noteKey;
+    f.labelsNote.hidden = !noteKey;
+    f.labelsNote.replaceChildren(...(noteKey ? [ghAlert("warning",
+      h("div", {}, `${existing}'s other runners take workflows with ${others.size > 1 ? "these labels" : ""}`, ...[...others.keys()].map((l, i) => [i ? ", " : " ", h("code", {}, "runs-on: " + l)]).flat(),
+        ". Workflows with labels these runners don't have won't reach them."),
+      h("div", { class: "snippet" }, [...others].map(([l, labels]) => h("button", { type: "button", class: "btn", onclick: () => {
+        f.labels.value = labels.join(", "); renderGhForm(); f.labels.focus();
+      } }, "Use runs-on: " + l))))] : []));
   }
   f.exists.hidden = !existing;
   if (existing) {
