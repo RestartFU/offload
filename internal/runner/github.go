@@ -484,11 +484,17 @@ type githubNet struct {
 	running  bool
 }
 
-var githubNetProbe = func(ctx context.Context, name, label, tag string) error {
-	out, err := podman(ctx, "run", "--rm", "--name", name, "--label", label, "--pull=never",
-		"--network=private", "--entrypoint", "true", tag)
-	if err != nil && out != "" {
-		return errors.New(out)
+// githubNetProbe starts the image in a unit of the user manager, as job containers are started,
+// so podman sees the configuration and environment jobs get, not the runner daemon's.
+var githubNetProbe = func(ctx context.Context, name, label, slice, tag string) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "systemd-run", "--user", "--quiet", "--collect", "--wait", "--pipe",
+		"--unit="+name, "--slice="+slice, "-p", "Delegate=yes", "-p", "MemoryMax=512M", "-p", "RuntimeMaxSec=120",
+		"--", "podman", "run", "--rm", "--name", name, "--label", label, "--cgroups=split", "--pull=never",
+		"--network=private", "--entrypoint", "true", tag).CombinedOutput()
+	if msg := strings.TrimSpace(string(out)); err != nil && msg != "" {
+		return errors.New(msg)
 	}
 	return err
 }
@@ -508,7 +514,7 @@ func (s *Server) githubNetLocked(tag string) (ok bool, problem string) {
 }
 
 func (s *Server) checkGitHubNet(tag string) {
-	err := githubNetProbe(context.Background(), newID("offload-netcheck-"), s.ownerLabel(), tag)
+	err := githubNetProbe(context.Background(), newID("offload-netcheck-"), s.ownerLabel(), s.cfg.Slice, tag)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if n := &s.githubNet; n.tag == tag {
@@ -829,6 +835,7 @@ func (s *Server) githubFinishedLocked(j *job) {
 		p.failures++
 		if p.failures >= 3 {
 			p.pauseTil = time.Now().Add(min(time.Minute<<min(p.failures-3, 4), 15*time.Minute))
+			s.githubNet = githubNet{} // podman's setup may have changed since it was checked: check again
 			log.Printf("github %s: %d runners in a row ended without a job (last: %s, %s); pausing", p.Owner, p.failures, j.ID, j.Reason)
 		}
 	}
