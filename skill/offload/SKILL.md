@@ -50,6 +50,20 @@ What comes back:
 Needs the laptop's network (a service on its localhost, its LAN, its IP)? Add `--network client`:
 the job's connections then go out from this machine, and `laptop:PORT` reaches its localhost.
 
+A long test suite whose tool can take one slice of it can run as shards, each a job of its own,
+spread over runners: `{shard}` and `{shards}` in the command (and `$OFFLOAD_SHARD`,
+`$OFFLOAD_SHARDS` in the job) are replaced per shard, counting from 1.
+
+```bash
+offload run --shards 4 -- cargo nextest run --partition count:{shard}/{shards}
+offload run --shards 3 -- npx jest --shard={shard}/{shards}
+```
+
+Output lines are prefixed `[2/4]`, and the exit code is the first failed shard's. Every shard
+builds the code again, so shard only suites where running the tests takes far longer than
+building them. Shards write nothing back; each shard prints the `offload get` for its `--get`
+outputs.
+
 Long jobs: run the Bash call in the background, or `offload run -d -- …` and later
 `offload attach <runner:id>`. Killing `offload run` cancels the job; Ctrl-C on `attach` detaches.
 A script that calls `offload run` inside a job runs that command in place.

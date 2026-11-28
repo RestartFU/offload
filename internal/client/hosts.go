@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -80,6 +81,8 @@ type Host struct {
 	derived  bool           // Token is the one stored for this URL by `host pair`, not configured
 	named    bool           // Name comes from client.toml
 	estimate *api.Resources // what this runner said the job at hand would get (see estimate)
+	placed   int            // earlier shards of this run that went here (see markPlaced)
+	shard    bool           // choosing for a shard: a runner that can start it now comes first
 }
 
 // dialRaw opens a plain connection to the runner (for stream upgrades).
@@ -607,8 +610,27 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 
 // pick is Pick; with argv and no profile, each runner is judged by the profile it would match
 // for that command (as it will when it gets the job), not by its global defaults.
+// Earlier shards of the run on a runner count against it. A shard never queues while a runner
+// could start it now: then only those runners are considered, so one slow shard can't hold up
+// the whole run.
 func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []string) (*Host, error) {
+	h, ready, err := pickScored(hosts, want, profile, key, kind, argv)
+	if err == nil && !ready[h] && len(ready) > 0 && slices.ContainsFunc(hosts, func(x *Host) bool { return x.shard }) {
+		var now []*Host
+		for _, x := range hosts {
+			if ready[x] {
+				now = append(now, x)
+			}
+		}
+		h, _, err = pickScored(now, want, profile, key, kind, argv)
+	}
+	return h, err
+}
+
+// pickScored is pick by score alone; it also returns the runners that could start the job now.
+func pickScored(hosts []*Host, want api.Resources, profile, key, kind string, argv []string) (*Host, map[*Host]bool, error) {
 	var best *Host
+	ready := map[*Host]bool{}
 	bestScore := -1e18
 	var reasons []string
 	for _, h := range hosts {
@@ -671,9 +693,10 @@ func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []s
 		}
 		r.Mem = min(r.Mem, st.Capacity.Mem)
 		f := h.free()
-		score := float64(h.Priority) * 1000
+		score := float64(h.Priority)*1000 - 400*float64(h.placed)
 		unbooked := st.Capacity.CPU - st.Allocated.CPU - st.Pending.CPU
 		if f.CPU >= r.CPU && f.Mem >= r.Mem {
+			ready[h] = true
 			score += 400 // can start right away
 			if unbooked >= r.CPU {
 				score += 100 // without overbooking: its guarantee really is free there
@@ -711,11 +734,11 @@ func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []s
 	}
 	if best == nil {
 		if len(hosts) == 0 {
-			return nil, errors.New("no runners found (is tailscale up and a runner online?)")
+			return nil, nil, errors.New("no runners found (is tailscale up and a runner online?)")
 		}
-		return nil, fmt.Errorf("no runner fits: %s", strings.Join(reasons, "; "))
+		return nil, nil, fmt.Errorf("no runner fits: %s", strings.Join(reasons, "; "))
 	}
-	return best, nil
+	return best, ready, nil
 }
 
 // FindHost returns the named runner from hosts.

@@ -69,6 +69,10 @@ Client:
                        tailnet; "laptop" / 10.233.0.1 inside the job is this machine's localhost)
       --fresh          start from an empty workspace (cold build)
       --ephemeral      drop the workspace afterwards
+      --shards N       run N copies spread over runners; each gets OFFLOAD_SHARD (1..N) and
+                       OFFLOAD_SHARDS, and {shard} / {shards} in CMD are replaced: e.g.
+                       --shards 4 -- cargo nextest run --partition count:{shard}/{shards}
+                       (no write-back; --get outputs stay on the runner for offload get)
       --detach, -d     print the job id and return
       --quiet, -q      no offload status lines
   offload attach ID                  follow a job to the end (Ctrl-C detaches)
@@ -197,7 +201,7 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "offload: %v\n", err)
+		fmt.Fprintf(os.Stderr, client.OutPrefix()+"offload: %v\n", err)
 		if code == 0 {
 			code = 1
 		}
@@ -262,7 +266,13 @@ func cmdRun(args []string) (int, error) {
 	fs.BoolVar(&o.Detach, "d", false, "")
 	fs.BoolVar(&o.Quiet, "quiet", false, "")
 	fs.BoolVar(&o.Quiet, "q", false, "")
+	fs.IntVar(&o.Shards, "shards", 0, "")
 	_ = fs.Parse(fl)
+	shardsSet := false
+	fs.Visit(func(f *flag.Flag) { shardsSet = shardsSet || f.Name == "shards" })
+	if o.Shards < 0 || o.Shards > client.MaxShards || shardsSet && o.Shards == 0 {
+		return 2, fmt.Errorf("--shards wants 1 to %d", client.MaxShards)
+	}
 	if rest == nil {
 		rest = fs.Args()
 	}

@@ -48,12 +48,14 @@ type RunOptions struct {
 	Ephemeral   bool
 	Detach      bool
 	Quiet       bool
+	Shards      int  // run the command this many times, spread over runners (see asShard)
+	KeepOutputs bool // --get outputs stay on the runner, for `offload get`
 	Argv        []string
 }
 
 func logf(quiet bool, format string, args ...any) {
 	if !quiet {
-		fmt.Fprintf(os.Stderr, "offload: "+format+"\n", args...)
+		fmt.Fprintf(os.Stderr, outPrefix+"offload: "+format+"\n", args...)
 	}
 }
 
@@ -89,7 +91,20 @@ func runInPlace(argv []string, env map[string]string) (int, error) {
 // memory limit from earlier runs, and an out-of-memory kill is retried once with twice the memory.
 // Ctrl-C (or SIGTERM) cancels the remote job.
 func Run(o RunOptions) (int, error) {
+	shardSource := ""
+	if i, n, ok := shardChild(); ok {
+		shardSource = os.Getenv(shardSourceEnv)
+		if o.Platform == "" { // the first shard's: a suite's tests can differ by architecture
+			o.Platform = os.Getenv(shardPlatformEnv)
+		}
+		openShardPipes()
+		outPrefix = fmt.Sprintf("[%d/%d] ", i, n)
+		o = asShard(o, i, n)
+	}
 	if inJob() && o.On == "" {
+		if o.Shards > 0 { // all of it here, as the one and only shard
+			o = asShard(o, 1, 1)
+		}
 		return runInPlace(o.Argv, o.Env) // the command keeps normal SIGPIPE behavior
 	}
 	// A closed output (piped into `head`) must surface as a write error, which ends following
@@ -97,6 +112,9 @@ func Run(o RunOptions) (int, error) {
 	signal.Ignore(syscall.SIGPIPE)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
+	if outPrefix != "" {
+		ctx = watchDetach(ctx)
+	}
 	cfg, err := LoadConfig()
 	if err != nil {
 		return 1, err
@@ -105,6 +123,12 @@ func Run(o RunOptions) (int, error) {
 		if c := path.Clean(filepath.ToSlash(a)); c == "." || c == "/" || c == ".." || strings.HasPrefix(c, "../") || path.IsAbs(c) {
 			return 1, fmt.Errorf("--get %s: name the outputs, relative to the working directory and inside it (for example --get dist)", a)
 		}
+	}
+	if o.Shards > 1 {
+		return runShards(ctx, o)
+	}
+	if o.Shards == 1 {
+		o = asShard(o, 1, 1)
 	}
 	spec := api.JobSpec{Argv: o.Argv, Env: o.Env, Profile: o.Profile, Resources: o.Resources,
 		Artifacts: o.Artifacts, Fresh: o.Fresh, Ephemeral: o.Ephemeral, Client: clientLabel(), Detached: o.Detach}
@@ -136,6 +160,14 @@ func Run(o RunOptions) (int, error) {
 		start := time.Now()
 		if ws, err = LoadWorkspace(cwd); err != nil {
 			return 1, fmt.Errorf("reading workspace: %w", err)
+		}
+		if outPrefix != "" {
+			dropOutputs(ws)
+		}
+		if shardSource != "" {
+			if err := checkShardSource(shardSource, ws); err != nil {
+				return 1, err
+			}
 		}
 		spec.WorkspaceKey, spec.Manifest, spec.Dir = ws.Key, ws.Manifest, ws.Dir
 		spec.GitTree, spec.IgnoreRules, spec.IgnoreGlobal = ws.GitTree, ws.IgnoreRules, ws.IgnoreGlobal
@@ -174,14 +206,20 @@ func Run(o RunOptions) (int, error) {
 		}
 		h, j, err := submit(ctx, cfg, o, spec, ws, pendingBaseline)
 		if err != nil {
+			if errors.Is(context.Cause(ctx), errDetached) { // before it started: submit cancelled it
+				return 1, fmt.Errorf("%w; it hadn't started, so it was cancelled", errDetached)
+			}
 			if ctx.Err() != nil {
 				return 130, nil
 			}
 			return 1, err
 		}
+		if outPrefix != "" && spec.Platform == "" && h.Status != nil { // retries and moves too
+			spec.Platform = h.Status.OS + "/" + h.Status.Arch
+		}
 		ref := RefName(Discover(ctx, cfg), h) + ":" + j.ID
 		if o.Detach {
-			fmt.Println(ref)
+			fmt.Println(outPrefix + ref)
 			return 0, nil
 		}
 		var relocate func(api.Job) bool
@@ -189,6 +227,9 @@ func Run(o RunOptions) (int, error) {
 			relocate = func(q api.Job) bool { return moveQueued(ctx, cfg, h, spec, q, o.Quiet) }
 		}
 		code, done, err := follow(ctx, h, j.ID, o.Quiet, true, cfg, relocate)
+		if errors.Is(err, syscall.EPIPE) {
+			reportClosed() // the other shards share this output: they stop following too
+		}
 		if errors.Is(err, errMoved) {
 			_ = os.Remove(baselinePath(j.ID)) // never ran: nothing of it to write back
 			moves++
@@ -225,7 +266,7 @@ func Run(o RunOptions) (int, error) {
 				continue
 			}
 		}
-		if err := finish(ctx, h, &j, ws, o, snap); err != nil {
+		if err := finish(ctx, h, ref, &j, ws, o, snap); err != nil {
 			logf(false, "%v", err)
 			if code == 0 {
 				code = 1 // a build whose output didn't arrive must not look like a success
@@ -269,6 +310,9 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 				if !busy[x.URL] && !refused[x.URL] {
 					avail = append(avail, x)
 				}
+			}
+			if outPrefix != "" { // a shard
+				markPlaced(avail)
 			}
 			h, err = PickFor(avail, spec, "job")
 			if err != nil && len(busy) > 0 { // the runners left can't take it: wait for a busy one
@@ -319,6 +363,7 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 			return nil, j, fmt.Errorf("%s: %w", h.Name, err)
 		}
 		rememberJob(j.ID, h)
+		reportPlaced(h)
 		if !o.Detach {
 			// Before the upload that makes the job runnable: a job may ask for credentials or
 			// dial out the moment it starts, and the runner only waits briefly for a client.
@@ -337,6 +382,10 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 				if ctx.Err() != nil { // interrupted: give the reserved job back now
 					cancelJob(h, j.ID)
 					return nil, j, ctx.Err()
+				}
+				if outPrefix != "" { // a shard without it could test other code than the rest
+					cancelJob(h, j.ID)
+					return nil, j, fmt.Errorf("git history not sent: %w", err)
 				}
 				logf(false, "git history not sent (%v); the job runs without .git", err)
 			}
@@ -471,7 +520,14 @@ func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bo
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = streamLog(streamCtx, h, id, s.name, s.w, quiet && s.name == "stderr")
+			w, lw := s.w, &lineWriter{w: s.w, prefix: outPrefix, onErr: stopStreams}
+			if outPrefix != "" {
+				w = lw
+			}
+			errs[i] = streamLog(streamCtx, h, id, s.name, w, quiet && s.name == "stderr")
+			if err := lw.flush(); err != nil && errs[i] == nil {
+				errs[i] = fmt.Errorf("writing the job's %s: %w (it keeps running: offload attach %s)", s.name, err, id)
+			}
 			if errs[i] != nil {
 				stopStreams() // one stream's terminal error (not paired any more, gone, …) ends both
 			}
@@ -521,6 +577,9 @@ func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bo
 		return 0, nil, errMoved
 	}
 	if ctx.Err() != nil {
+		if errors.Is(context.Cause(ctx), errDetached) {
+			return 1, nil, fmt.Errorf("%w (it keeps running: offload attach %s:%s)", errDetached, h.Name, id)
+		}
 		if cancelOnInterrupt {
 			logf(quiet, "cancelling %s:%s", h.Name, id)
 			if err := cancelJob(h, id); err != nil {
@@ -803,7 +862,7 @@ func consumeWriteBack(ctx context.Context, h *Host, j *api.Job, checkoutLocked, 
 
 // finish applies write-back and artifacts and prints a one-line summary. Both run under the
 // checkout's lock. It returns an error when requested artifacts didn't all arrive.
-func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOptions, snap map[string]fileSig) error {
+func finish(ctx context.Context, h *Host, ref string, j *api.Job, ws *Workspace, o RunOptions, snap map[string]fileSig) error {
 	if ws != nil {
 		unlock, err := lockFile(checkoutLock(ws.Root))
 		if err != nil {
@@ -839,13 +898,19 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 	if len(o.Artifacts) > 0 && j.State == api.StateExited {
 		if !j.HasArtifact {
 			artErr = fmt.Errorf("the job produced none of the requested artifacts (%s)", strings.Join(o.Artifacts, ", "))
+		} else if o.KeepOutputs {
+			logf(false, "--get outputs are kept on %s: offload get %s DIR", h.Name, ref)
 		} else if kept, err := fetchArtifacts(ctx, h, j.ID, ".", snap); err != nil {
 			artErr = fmt.Errorf("artifacts: %w", err)
 		} else if kept > 0 {
 			artErr = fmt.Errorf("%d artifact(s) not written over local changes (saved beside them)", kept)
 		}
 		if len(j.ArtifactsMissing) > 0 && artErr == nil {
-			artErr = fmt.Errorf("the job didn't produce %s (the other artifacts were downloaded)", strings.Join(j.ArtifactsMissing, ", "))
+			got := "downloaded"
+			if o.KeepOutputs {
+				got = "kept"
+			}
+			artErr = fmt.Errorf("the job didn't produce %s (the other artifacts were %s)", strings.Join(j.ArtifactsMissing, ", "), got)
 		}
 	}
 	if j.StartedAt != nil && j.FinishedAt != nil && j.State == api.StateExited {

@@ -81,6 +81,28 @@ For each (workspace, "program subcommand") it keeps the last five peaks (`memory
 for the largest plus 25%. An OOM counts as twice its limit, and the client retries such a job
 once with double memory. A nested `offload run` (OFFLOAD_JOB is set) runs in place.
 
+### Shards
+
+A shard is the same `offload run` started again as a child process, which reads its index from
+the environment. Every child therefore keeps all of a single run's behavior (retries, moves,
+reattach, cancel on interrupt, credential relays) without a second copy of it. Children share
+the parent's stdout and stderr and prefix their own lines, each in one write of at most Linux's
+`PIPE_BUF`, so lines never mix there. A parent copying their output would keep following after
+its own output closed; instead a shard that meets a closed output reports it on fd 3, and the
+parent closes every shard's fd 4, which makes them stop following without cancelling their
+jobs (as they do when the parent dies).
+
+A child starts only once the previous one has created its job and reported the runner (by
+status ID, and its platform, which later shards must share) on fd 3. The runner counts that job
+as pending, and pick holds each earlier shard against a runner as much as the "can start now"
+bonus, but never so far that a shard queues while some runner could start it.
+
+Each child scans the tree itself, so the parent saves the source it found and a child that
+finds other source (a file edited, or a log written into the tree while they started) fails
+and names the files: count-based partitions of two different suites can skip tests while every
+shard passes. A shard also fails rather than run without the git history the others have.
+Shards' `--get` outputs stay on their runners, because downloads into one tree would collide.
+
 ## Git
 
 Each workspace key has a bare `shared.git` object store. Slots are ordinary repositories
