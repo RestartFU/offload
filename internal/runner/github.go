@@ -436,7 +436,10 @@ func (s *Server) tickGitHub() {
 			}
 		}
 		capNow := s.githubCapacityLocked(p)
+		netMissing := privateNetMissing()
 		switch {
+		case netMissing != "":
+			p.State, p.Detail, capNow = api.GitHubFailed, netMissing, p.Running+p.Starting
 		case p.envFail != "":
 			p.State, p.Detail, capNow = api.GitHubFailed, "building the GitHub runner environment failed (retrying in a few minutes): "+p.envFail, p.Running+p.Starting
 		case !ready:

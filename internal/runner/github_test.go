@@ -426,3 +426,23 @@ func TestGitHubRelabelDrains(t *testing.T) {
 		t.Fatalf("once it finished: drained %v, %v", p.drained, err)
 	}
 }
+
+// A runner whose podman can't give a job its own network says so instead of taking jobs it
+// can't start.
+func TestPrivateNetNeedsAHelper(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", t.TempDir())
+	defer func(d []string) { podmanHelperDirs = d }(podmanHelperDirs)
+	podmanHelperDirs = []string{dir}
+	if msg := privateNetMissing(); !strings.Contains(msg, "install passt") {
+		t.Fatalf("no pasta or slirp4netns, yet: %q", msg)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "pasta"), nil, 0o644)
+	if privateNetMissing() == "" {
+		t.Fatal("a pasta that isn't executable counted")
+	}
+	_ = os.Chmod(filepath.Join(dir, "pasta"), 0o755)
+	if msg := privateNetMissing(); msg != "" {
+		t.Fatalf("pasta in podman's helper directory: %q", msg)
+	}
+}
