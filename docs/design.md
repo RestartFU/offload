@@ -87,8 +87,11 @@ A shard is the same `offload run` started again as a child process, which reads 
 the environment. Every child therefore keeps all of a single run's behavior (retries, moves,
 reattach, cancel on interrupt, credential relays, a closed output ending only the following)
 without a second copy of it. Children share the parent's stdout and stderr and prefix their own
-lines, each written whole in one write; a parent copying their output would keep following
-after its own output closed. A child starts only once the previous one has created its job and
+lines, each in one write of at most `PIPE_BUF` so lines never mix; a parent copying their
+output would keep following after its own output closed. Each child scans the tree itself, so
+the parent passes a digest of the tree it saw and a child that sees other source fails:
+count-based partitions of two different suites can skip tests while every shard passes.
+Shards' `--get` outputs stay on their runners, because downloads into one tree would collide. A child starts only once the previous one has created its job and
 reported the runner (by status ID) on fd 3: the runner counts that job as pending, and pick
 holds each earlier shard against a runner as much as the "can start now" bonus, but never so
 far that a shard queues while some runner could start it.

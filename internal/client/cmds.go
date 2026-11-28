@@ -186,7 +186,7 @@ func Get(ref, dest string) error {
 		}
 		return fmt.Errorf("the job has no artifacts (did it run with --get, and has it finished?)")
 	}
-	if _, err := fetchArtifacts(ctx, h, id, dest, "", nil); err != nil {
+	if _, err := fetchArtifacts(ctx, h, id, dest, nil); err != nil {
 		return err
 	}
 	if len(j.ArtifactsMissing) > 0 {

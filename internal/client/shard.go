@@ -4,27 +4,31 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"maps"
 	"os"
 	"os/exec"
-	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
+
+	"github.com/RestartFU/offload/internal/api"
 )
 
 const (
 	MaxShards = 64
-	shardsDir = "offload-shards"
 	// Each shard is this same command line run again by a child process, which finds its shard
 	// here ("i/n") and reports on fd 3 which runner took its job.
 	shardOfEnv     = "OFFLOAD_SHARD_OF"
 	shardPlacedEnv = "OFFLOAD_SHARD_PLACED" // runners earlier shards went to, space separated
+	shardSourceEnv = "OFFLOAD_SHARD_SOURCE" // sourceDigest of the tree when the run started
 )
 
 // outPrefix is "[i/n] " in a shard's process: its job's output and its status lines carry it.
@@ -32,7 +36,8 @@ var outPrefix string
 
 // asShard turns a run into shard i of n: OFFLOAD_SHARD and OFFLOAD_SHARDS in the job's
 // environment, {shard} and {shards} replaced in the command, no write-back (shards would edit
-// the same files), and --get outputs in offload-shards/<i>/.
+// the same files), and --get outputs kept on the runner (shards would download them over each
+// other).
 func asShard(o RunOptions, i, n int) RunOptions {
 	si, sn := strconv.Itoa(i), strconv.Itoa(n)
 	env := maps.Clone(o.Env)
@@ -45,8 +50,7 @@ func asShard(o RunOptions, i, n int) RunOptions {
 	for k, a := range o.Argv {
 		argv[k] = r.Replace(a)
 	}
-	o.Env, o.Argv, o.Shards, o.NoWriteBack = env, argv, 0, true
-	o.ArtifactDir = path.Join(shardsDir, si)
+	o.Env, o.Argv, o.Shards, o.NoWriteBack, o.KeepOutputs = env, argv, 0, true, true
 	return o
 }
 
@@ -64,10 +68,20 @@ func shardChild() (i, n int, ok bool) {
 	return i, n, true
 }
 
-// inShardsDir reports whether a synced path is a shard's downloaded output, which is never
-// source for a later job.
-func inShardsDir(rel string) bool {
-	return strings.HasPrefix(rel, shardsDir+"/") || strings.Contains(rel, "/"+shardsDir+"/")
+// sourceDigest identifies the source a job would get: every shard must partition the same
+// suite, even if files change while they start.
+func sourceDigest(ws *Workspace) string {
+	files := slices.Clone(ws.Manifest)
+	slices.SortFunc(files, func(a, b api.FileEntry) int { return strings.Compare(a.Path, b.Path) })
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00", ws.Dir)
+	if ws.Git != nil {
+		fmt.Fprintf(h, "%s\x00", ws.Git.Head)
+	}
+	for _, f := range files {
+		fmt.Fprintf(h, "%s\x00%s\x00%o\x00%s\x00", f.Path, f.Hash, f.Mode, f.Link)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 var (
@@ -125,12 +139,16 @@ func runShards(ctx context.Context, o RunOptions) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	if len(o.Artifacts) > 0 {
-		if err := makeShardsDir(); err != nil {
-			return 1, err
+	var env []string
+	if !o.NoSync {
+		cwd, _ := os.Getwd()
+		ws, err := LoadWorkspace(cwd)
+		if err != nil {
+			return 1, fmt.Errorf("reading workspace: %w", err)
 		}
+		env = append(env, shardSourceEnv+"="+sourceDigest(ws))
 	}
-	codes, err := fanOut(ctx, self, os.Args[1:], o.Shards, os.Stdout, os.Stderr)
+	codes, err := fanOut(ctx, self, os.Args[1:], env, o.Shards, os.Stdout, os.Stderr)
 	if err != nil {
 		return 1, err
 	}
@@ -146,34 +164,10 @@ func runShards(ctx context.Context, o RunOptions) (int, error) {
 	return code, nil
 }
 
-// makeShardsDir creates offload-shards/, ignored by git so it stays out of `git status`.
-func makeShardsDir() error {
-	tree, err := os.OpenRoot(".")
-	if err != nil {
-		return err
-	}
-	defer tree.Close()
-	if err := mkdirReal(tree, shardsDir); err != nil {
-		return fmt.Errorf("%s: %w (it must be a real directory here)", shardsDir, err)
-	}
-	f, err := tree.OpenFile(path.Join(shardsDir, ".gitignore"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if errors.Is(err, fs.ErrExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	_, err = f.WriteString("*\n")
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	return err
-}
-
 // fanOut runs n children of this binary with args, child i as shard i. Each starts after the
 // previous one reported its runner on fd 3 (or exited) and learns where the earlier ones went.
 // An interrupt is passed on to every child, which cancels its own job.
-func fanOut(ctx context.Context, self string, args []string, n int, stdout, stderr *os.File) ([]int, error) {
+func fanOut(ctx context.Context, self string, args, env []string, n int, stdout, stderr *os.File) ([]int, error) {
 	var mu sync.Mutex
 	var started []*exec.Cmd
 	interrupt := func() {
@@ -200,7 +194,7 @@ func fanOut(ctx context.Context, self string, args []string, n int, stdout, stde
 			break
 		}
 		cmd := exec.Command(self, args...)
-		cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%d/%d", shardOfEnv, k+1, n), shardPlacedEnv+"="+strings.Join(placed, " "))
+		cmd.Env = append(append(os.Environ(), env...), fmt.Sprintf("%s=%d/%d", shardOfEnv, k+1, n), shardPlacedEnv+"="+strings.Join(placed, " "))
 		cmd.Stdout, cmd.Stderr, cmd.ExtraFiles = stdout, stderr, []*os.File{w}
 		mu.Lock()
 		err = cmd.Start()
@@ -252,24 +246,39 @@ func exitCode(err error) int {
 	return 0
 }
 
-// lineWriter writes whole lines, each with a prefix and in one write, so lines of shards sharing
-// an output don't interleave. A line longer than maxLine is written in pieces.
+// lineWriter writes whole lines, each with a prefix and in one write of at most pipeBuf, so
+// shards sharing a pipe never mix within a line. A longer line is written in pieces, and a
+// partial one after partialWait, so prompts and progress still show.
 type lineWriter struct {
 	w      io.Writer
 	prefix string
+	mu     sync.Mutex
 	buf    []byte
+	timer  *time.Timer
+	err    error // from a write the timer made
 }
 
-const maxLine = 64 << 10
+const (
+	pipeBuf     = 4096 // Linux's PIPE_BUF: writes up to it are atomic
+	partialWait = 300 * time.Millisecond
+)
 
 func (l *lineWriter) Write(p []byte) (int, error) {
-	n := len(p)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err != nil {
+		return 0, l.err
+	}
+	n, limit := len(p), pipeBuf-len(l.prefix)-1
 	for len(p) > 0 {
 		i := bytes.IndexByte(p, '\n')
 		if i < 0 {
-			room := maxLine - len(l.buf)
+			room := limit - len(l.buf)
 			if len(p) < room {
 				l.buf = append(l.buf, p...)
+				if l.timer == nil {
+					l.timer = time.AfterFunc(partialWait, l.flushPartial)
+				}
 				return n, nil
 			}
 			l.buf = append(l.buf, p[:room]...)
@@ -285,13 +294,29 @@ func (l *lineWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+func (l *lineWriter) flushPartial() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.timer = nil
+	if len(l.buf) > 0 && l.err == nil {
+		l.err = l.emit()
+	}
+}
+
 func (l *lineWriter) flush() error {
-	if len(l.buf) == 0 {
-		return nil
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.timer != nil {
+		l.timer.Stop()
+		l.timer = nil
+	}
+	if l.err != nil || len(l.buf) == 0 {
+		return l.err
 	}
 	return l.emit()
 }
 
+// emit writes the pending line; l.mu is held.
 func (l *lineWriter) emit() error {
 	line := append(append([]byte(l.prefix), l.buf...), '\n')
 	l.buf = l.buf[:0]

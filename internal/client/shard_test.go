@@ -1,19 +1,16 @@
 package client
 
 import (
-	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RestartFU/offload/internal/api"
 )
@@ -51,7 +48,7 @@ func TestFanOutPlacesShardsInTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	codes, err := fanOut(context.Background(), os.Args[0], []string{"-test.run=^$"}, 3, out, os.Stderr)
+	codes, err := fanOut(context.Background(), os.Args[0], []string{"-test.run=^$"}, nil, 3, out, os.Stderr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,16 +80,26 @@ func TestAsShard(t *testing.T) {
 	if _, leaked := o.Env["OFFLOAD_SHARD"]; leaked {
 		t.Fatal("asShard changed the caller's env")
 	}
-	if !s.NoWriteBack || s.Shards != 0 || s.ArtifactDir != "offload-shards/2" {
+	if !s.NoWriteBack || !s.KeepOutputs || s.Shards != 0 {
 		t.Fatalf("got %+v", s)
 	}
-	for _, p := range []string{"offload-shards/1/out.txt", "sub/offload-shards/2/x"} {
-		if !inShardsDir(p) {
-			t.Fatalf("%s is synced", p)
-		}
+}
+
+func TestSourceDigest(t *testing.T) {
+	ws := &Workspace{Dir: ".", Git: &api.GitRef{Head: "abc"}, Manifest: []api.FileEntry{{Path: "a", Hash: "1"}, {Path: "b", Hash: "2"}}}
+	d := sourceDigest(ws)
+	ws.Manifest[0], ws.Manifest[1] = ws.Manifest[1], ws.Manifest[0]
+	if sourceDigest(ws) != d {
+		t.Fatal("the order files were listed in must not matter")
 	}
-	if inShardsDir("offload-shards.go") || inShardsDir("src/offload-shardsx/a") {
-		t.Fatal("other paths must stay synced")
+	ws.Manifest[0].Hash = "3"
+	if sourceDigest(ws) == d {
+		t.Fatal("a changed file must change the digest")
+	}
+	ws.Manifest[0].Hash = "2"
+	ws.Manifest = append(ws.Manifest, api.FileEntry{Path: "new_test.go", Hash: "4"})
+	if sourceDigest(ws) == d {
+		t.Fatal("a new file must change the digest")
 	}
 }
 
@@ -124,40 +131,32 @@ func TestPickSpreadsShards(t *testing.T) {
 	}
 }
 
-// Shard outputs go under offload-shards/<i> of the destination, never through a symlink there.
-func TestFetchArtifactsUnderStaysInside(t *testing.T) {
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	tw.WriteHeader(&tar.Header{Name: "out.txt", Mode: 0o644, Size: 2, Typeflag: tar.TypeReg})
-	tw.Write([]byte("hi"))
-	tw.Close()
-	gz.Close()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(buf.Bytes()) }))
-	defer srv.Close()
-	h := newHost("r", srv.URL, "tok", 0)
-
-	dest, outside := t.TempDir(), t.TempDir()
-	if _, err := fetchArtifacts(context.Background(), h, "j-1", dest, "offload-shards/1", nil); err != nil {
-		t.Fatal(err)
-	}
-	if b, err := os.ReadFile(filepath.Join(dest, "offload-shards/1/out.txt")); err != nil || string(b) != "hi" {
-		t.Fatalf("got %q, %v", b, err)
-	}
-	dest = t.TempDir()
-	os.Symlink(outside, filepath.Join(dest, "offload-shards"))
-	fetchArtifacts(context.Background(), h, "j-2", dest, "offload-shards/1", nil)
-	if _, err := os.Stat(filepath.Join(outside, "1/out.txt")); err == nil {
-		t.Fatal("an artifact went through the symlink, outside the destination")
-	}
-}
-
 func TestLineWriterBoundsLongLines(t *testing.T) {
 	var buf bytes.Buffer
 	l := &lineWriter{w: &buf, prefix: "> "}
-	l.Write(bytes.Repeat([]byte("x"), maxLine+10))
-	if len(l.buf) != 10 || buf.Len() != len("> ")+maxLine+1 {
-		t.Fatalf("pending %d, written %d", len(l.buf), buf.Len())
+	l.Write(bytes.Repeat([]byte("x"), pipeBuf+10))
+	l.flush()
+	first, _, _ := strings.Cut(buf.String(), "\n")
+	if len(first)+1 != pipeBuf || strings.Count(buf.String(), "\n") != 2 {
+		t.Fatalf("first write %d bytes, %d lines", len(first)+1, strings.Count(buf.String(), "\n"))
+	}
+}
+
+type chanWriter chan string
+
+func (c chanWriter) Write(p []byte) (int, error) { c <- string(p); return len(p), nil }
+
+func TestLineWriterShowsPartialLines(t *testing.T) {
+	c := make(chanWriter, 1)
+	l := &lineWriter{w: c, prefix: "[1/2] "}
+	l.Write([]byte("Ready? "))
+	select {
+	case got := <-c:
+		if got != "[1/2] Ready? \n" {
+			t.Fatalf("got %q", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a partial line never showed")
 	}
 }
 

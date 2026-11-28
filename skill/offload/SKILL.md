@@ -61,7 +61,8 @@ offload run --shards 3 -- npx jest --shard={shard}/{shards}
 
 Output lines are prefixed `[2/4]`, and the exit code is the first failed shard's. Every shard
 builds the code again, so shard only suites where running the tests takes far longer than
-building them. Shards write nothing back; `--get` outputs land in `offload-shards/<i>/`.
+building them. Shards write nothing back; each shard prints the `offload get` for its `--get`
+outputs.
 
 Long jobs: run the Bash call in the background, or `offload run -d -- …` and later
 `offload attach <runner:id>`. Killing `offload run` cancels the job; Ctrl-C on `attach` detaches.

@@ -16,7 +16,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -111,7 +110,6 @@ func LoadWorkspace(cwd string) (*Workspace, error) {
 	}
 	ws.Dir = filepath.ToSlash(rel)
 	ws.Key = workspaceKey(ws.Root)
-	files = slices.DeleteFunc(files, inShardsDir)
 	ws.Manifest, err = hashFiles(ws.Root, files)
 	return ws, err
 }
