@@ -296,6 +296,9 @@ type GitHubAdd struct {
 	SharedCache *bool `json:"shared_cache,omitempty"`
 	// CreateOnly refuses the request if the runner already has the pool (the dashboard only adds).
 	CreateOnly bool `json:"create_only,omitempty"`
+	// SystemLabels gives the scale set GitHub's default self-hosted labels too. Nil: yes for a new
+	// pool, unchanged for an existing one (they widen which workflows reach it).
+	SystemLabels *bool `json:"system_labels,omitempty"`
 }
 
 // GitHub runner pool states.

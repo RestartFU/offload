@@ -230,9 +230,9 @@ func (s *Server) runPool(ctx context.Context, p *githubPool, done chan struct{})
 		started := time.Now()
 		err := s.listenPool(ctx, p, done)
 		s.mu.Lock()
-		current := p.done == done && p.State != api.GitHubRemoving
+		current, owner := p.done == done && p.State != api.GitHubRemoving, p.Owner
 		if current && ctx.Err() == nil {
-			p.State, p.Detail = api.GitHubFailed, githubProblem(err, p.Owner)
+			p.State, p.Detail = api.GitHubFailed, githubProblem(err, owner)
 		}
 		s.mu.Unlock()
 		if !current || ctx.Err() != nil {
@@ -241,7 +241,7 @@ func (s *Server) runPool(ctx context.Context, p *githubPool, done chan struct{})
 		if time.Since(started) > 10*time.Minute {
 			delay = 5 * time.Second
 		}
-		log.Printf("github %s: %v (retrying in %s)", p.Owner, err, delay)
+		log.Printf("github %s: %v (retrying in %s)", owner, err, delay)
 		select {
 		case <-ctx.Done():
 			return
@@ -996,6 +996,10 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	if len(labels) == 0 {
 		labels = []string{"offload"}
 	}
+	systemOn := p == nil || p.systemLabels // a new pool takes GitHub's defaults; an existing one keeps its choice
+	if req.SystemLabels != nil {
+		systemOn = *req.SystemLabels
+	}
 	if problem == "" && res.CPUMax > 0 && res.CPU > res.CPUMax {
 		problem, code = fmt.Sprintf("%.1f cpu per job would be more than its %.1f cpu ceiling: give --cpu-max too", res.CPU, res.CPUMax), 400
 	}
@@ -1015,7 +1019,11 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	var ss *scaleset.RunnerScaleSet
 	if err == nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		ss, err = ensureScaleSet(ctx, c, name, scaleSetLabels(labels))
+		want := labels
+		if systemOn {
+			want = scaleSetLabels(labels)
+		}
+		ss, err = ensureScaleSet(ctx, c, name, want)
 		cancel()
 	}
 	if err != nil {
@@ -1042,7 +1050,7 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	if ss != nil && ss.Name == name {
 		rec.ScaleSetID = ss.ID
 	}
-	rec.Token, rec.SystemLabels = req.Token, true // adding (again) takes GitHub's default labels
+	rec.Token, rec.SystemLabels = req.Token, systemOn
 	if err := writeFileJSON(filepath.Join(dir, "pool.json"), rec); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -1052,7 +1060,7 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		s.github[key] = p
 	} else {
 		p.token, p.Labels, p.Max, p.Resources, p.TokenFrom, p.Shared, p.ScaleSetID = req.Token, rec.Labels, rec.Max, rec.Resources, rec.TokenFrom, rec.Shared, rec.ScaleSetID
-		p.systemLabels = true
+		p.systemLabels = rec.SystemLabels
 	}
 	p.State, p.Detail = api.GitHubPreparing, "connecting to GitHub"
 	s.restartPoolLocked(p)

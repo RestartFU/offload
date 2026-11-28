@@ -30,6 +30,7 @@ type GitHubOptions struct {
 	On        []string
 	Resources api.Resources
 	Shared    *bool // --shared-cache, when given
+	System    *bool // --system-labels, when given
 }
 
 // githubToken resolves the token to hand runners, and where it came from ("gh" or "token").
@@ -259,7 +260,7 @@ func GitHubAdd(o GitHubOptions) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req := api.GitHubAdd{URL: owner, Token: token, TokenFrom: from, Labels: o.Labels, Max: o.Max, Resources: o.Resources, SharedCache: o.Shared}
+			req := api.GitHubAdd{URL: owner, Token: token, TokenFrom: from, Labels: o.Labels, Max: o.Max, Resources: o.Resources, SharedCache: o.Shared, SystemLabels: o.System}
 			if _, err := GitHubAddTo(ctx, h, req); err != nil {
 				mu.Lock()
 				line(h, "failed", err.Error())

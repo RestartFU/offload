@@ -93,6 +93,7 @@ Secrets can also come from the environment (e.g. an MCP entry's "env"):
 
 GitHub Actions (every GitHub job runs as an offload job on a runner with room for it):
   offload github add ORG[/REPO] [--labels offload] [--max N] [--on RUNNER,…] [--shared-cache]
+                     [--system-labels[=false]]
                      [--token SRC] [--cpu N] [--cpu-max N] [--mem SIZE (default 8G)]
                                      take ORG's jobs on every runner (or --on); workflows
                                      use "runs-on: offload" (or --labels). Uses your gh
@@ -375,6 +376,7 @@ func cmdGitHub(args []string) error {
 		on := fs.String("on", "", "runners to use, comma-separated (default: all)")
 		maxJobs := fs.Int("max", 0, "most GitHub jobs at once per runner (default: as many as fit)")
 		shared := fs.Bool("shared-cache", false, "let the organization's repositories share warm caches")
+		system := fs.Bool("system-labels", true, "also carry GitHub's default self-hosted labels (default for new connections)")
 		res := resourceFlags(fs)
 		_ = fs.Parse(args[2:])
 		if fs.NArg() > 0 {
@@ -384,6 +386,8 @@ func cmdGitHub(args []string) error {
 			switch f.Name {
 			case "shared-cache":
 				o.Shared = shared
+			case "system-labels":
+				o.System = system
 			case "max":
 				o.Max = maxJobs
 			case "on":
