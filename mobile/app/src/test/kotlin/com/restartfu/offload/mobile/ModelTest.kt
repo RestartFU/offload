@@ -1,0 +1,75 @@
+package com.restartfu.offload.mobile
+
+import java.net.InetAddress
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+
+@RunWith(RobolectricTestRunner::class)
+class ModelTest {
+    @Test fun parsesTheDashboardsFleet() {
+        val f = parseFleet(Fixtures.fleet())
+        assertEquals(listOf("fsn-build", "hel-build"), f.runners.map { it.name })
+        val zeno = f.runners[0]
+        assertEquals(22.0, zeno.status!!.capCpu, 0.0)
+        assertEquals(24, zeno.metrics!!.cpus.size)
+        val w = f.workloads()
+        val gh = w.first { it.kind == Workload.Kind.GITHUB && it.active }
+        assertEquals("test (ubuntu-latest)", gh.title)
+        assertEquals("acme/proxy", gh.repo)
+        val build = w.first { it.id == "j-4be1c07a2f" }
+        assertEquals("cargo build --release -p bedrock-proxy", build.title)
+        assertEquals("proxy-8d2e0f", build.repo)
+        assertEquals(5.4, build.use!!.cpu, 0.0)
+        assertEquals(101, w.first { it.id == "j-77aa01f3c9" }.exitCode)
+        assertNull(build.exitCode)
+    }
+
+    @Test fun combinesRunnersOnSharedBuckets() {
+        val a = Series(5, listOf(Point(100, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1), Point(105, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1)))
+        val b = Series(10, listOf(Point(100, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1)))
+        val c = combine(listOf(a, b))!!
+        assertEquals(10, c.step)
+        assertEquals(1, c.points.size)
+        assertEquals(12.0, c.points[0].cpuBusy, 1e-9)
+    }
+
+    @Test fun addresses() {
+        assertEquals("laptop" to 7421, splitAddress("laptop"))
+        assertEquals("laptop" to 8000, splitAddress("http://laptop:8000/"))
+        assertEquals("100.64.1.2" to 7421, splitAddress(" 100.64.1.2 "))
+        assertEquals("fd7a:115c:a1e0::1" to 7421, splitAddress("[fd7a:115c:a1e0::1]"))
+        assertNull(splitAddress("user@laptop"))
+        assertNull(splitAddress("laptop/x"))
+        assertNull(splitAddress("laptop:99999"))
+        assertNull(splitAddress(""))
+    }
+
+    @Test fun onlyTheTailnet() {
+        assertTrue(onTailnet(InetAddress.getByName("100.64.0.1")))
+        assertTrue(onTailnet(InetAddress.getByName("100.127.255.254")))
+        assertFalse(onTailnet(InetAddress.getByName("100.128.0.1")))
+        assertFalse(onTailnet(InetAddress.getByName("192.168.1.10")))
+        assertTrue(onTailnet(InetAddress.getByName("fd7a:115c:a1e0::5")))
+        assertFalse(onTailnet(InetAddress.getByName("fd7a:115c:a1e1::5")))
+    }
+
+    @Test fun logStreamSkipsItsHeader() {
+        val got = StringBuilder()
+        readLogs("{\"offset\":12}\nhello ✓\nworld\n".byteInputStream(), { got.append(it) })
+        assertEquals("hello ✓\nworld\n", got.toString())
+    }
+
+    @Test fun formats() {
+        assertEquals("1.5 GiB", bytes(1.5 * (1L shl 30)))
+        assertEquals("12 GiB", bytes(12L shl 30))
+        assertEquals("2.5", cores(2.46))
+        assertEquals("3", cores(3.0))
+        assertEquals("1m 05s", duration(65.0))
+        assertEquals("hi", stripAnsi("\u001b[1;32mhi\u001b[0m"))
+    }
+}

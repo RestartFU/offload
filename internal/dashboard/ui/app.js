@@ -256,7 +256,7 @@ function scheduleData() {
 function route() {
   takeKey();
   const parts = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent);
-  const view = parts[0] === "containers" || parts[0] === "github" ? parts[0] : "overview";
+  const view = ["containers", "github", "devices"].includes(parts[0]) ? parts[0] : "overview";
   const changed = view !== state.view;
   state.view = view;
   const sel = view !== "overview" && parts[1] && parts[2] ? { runner: parts[1], id: parts[2] } : null;
@@ -264,7 +264,7 @@ function route() {
   for (const a of document.querySelectorAll(".tabs a")) {
     if (a.dataset.view === view) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
   }
-  if (changed) { mainBuilt = ""; if (view === "overview") scheduleData(); }
+  if (changed) { mainBuilt = ""; if (view === "overview") scheduleData(); if (view === "devices") loadDevices(); }
   render();
 }
 addEventListener("hashchange", route);
@@ -315,7 +315,7 @@ let mainBuilt = "";
 function render() {
   renderLive();
   if (!state.fleet && !state.fleetErr) return;
-  if (state.view === "overview") renderOverview(); else if (state.view === "github") renderGitHubView(); else renderContainers();
+  if (state.view === "overview") renderOverview(); else if (state.view === "github") renderGitHubView(); else if (state.view === "devices") { if (mainBuilt !== "devices") renderDevices(); } else renderContainers();
   renderTabCounts();
   if (state.sel) renderDrawer();
 }
@@ -1570,6 +1570,77 @@ async function startLogs() {
   } catch (e) {
     if (e.name !== "AbortError" && logView === v) v.status.textContent = "Disconnected: " + e.message;
   }
+}
+
+// ---------- devices ----------
+// Phones paired with this dashboard reach its API over the tailnet with a token of their own.
+// Pairing shows a one-time code (ten minutes, one try) to type into the phone.
+state.devices = null; state.devErr = null; state.devBusy = ""; state.devArmed = "";
+let devTimer, devArmTimer;
+async function loadDevices() {
+  clearTimeout(devTimer);
+  try { state.devices = await api("/api/devices"); state.devErr = null; } catch (e) { state.devErr = e.message; }
+  if (state.view === "devices") { renderDevices(); devTimer = setTimeout(loadDevices, state.devices?.code ? 2000 : 10000); }
+}
+async function devPost(path, body) {
+  return api(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Offload-Dashboard": "1" }, body: JSON.stringify(body || {}) });
+}
+function renderDevices() {
+  const main = $("#main");
+  mainBuilt = "devices";
+  const d = state.devices;
+  if (!d) { main.replaceChildren(h("div", { class: "card empty-state" }, state.devErr || "Loading…")); return; }
+  const reach = d.addresses?.length ? d.addresses : null;
+  const host = d.name || (reach ? reach[0].replace(/:\d+$/, "") : "");
+  const port = reach ? reach[0].replace(/^.*:/, "") : "";
+  const kids = [];
+  if (state.devErr) kids.push(h("div", { class: "alerts" }, h("div", { class: "alert critical", role: "alert" }, icon("critical"), h("div", {}, state.devErr))));
+  if (d.error) kids.push(h("div", { class: "alerts" }, h("div", { class: "alert warning" }, icon("warning"), h("div", {}, d.error))));
+  let pair;
+  if (d.code) {
+    const left = Math.max(0, (new Date(d.code_expires) - Date.now()) / 1000);
+    pair = h("div", { class: "card pair-card" },
+      h("div", { class: "pair-steps" },
+        h("h3", {}, "Pair a phone"),
+        h("ol", {},
+          h("li", {}, "Install the offload app on the phone and make sure Tailscale is on there."),
+          h("li", {}, "In the app, enter this computer's address and the code."),
+          h("li", {}, "The phone keeps its own key: it stays paired across restarts until you forget it here.")),
+        h("div", { class: "pair-actions" }, h("button", { type: "button", class: "btn", onclick: async () => { await devPost("/api/devices/cancel"); loadDevices(); } }, "Cancel"))),
+      h("dl", { class: "pair-values" },
+        h("dt", {}, "Address"), h("dd", { class: "mono big" }, host + (port && port !== "7421" ? ":" + port : "")),
+        d.dns && d.dns !== host ? [h("dt", {}, "Or"), h("dd", { class: "mono" }, d.dns + (port && port !== "7421" ? ":" + port : ""))] : null,
+        reach ? [h("dt", {}, "Or by IP"), h("dd", { class: "mono" }, reach.join("  "))] : null,
+        h("dt", {}, "Code"), h("dd", { class: "mono code" }, d.code.slice(0, 4) + "-" + d.code.slice(4)),
+        h("dt", {}, "Expires"), h("dd", { class: "muted" }, "in " + fmtDur(left) + " or after one try")));
+  } else {
+    pair = h("div", { class: "card pair-card" },
+      h("div", { class: "pair-steps" },
+        h("h3", {}, "Pair a phone"),
+        h("p", { class: "muted" }, "The offload app shows everything this dashboard does: runners, containers, logs, GitHub jobs and activity, and it can pause runners and cancel work."),
+        h("div", { class: "pair-actions" }, h("button", { type: "button", class: "btn primary", disabled: !reach || state.devBusy === "pair", onclick: async () => {
+          state.devBusy = "pair"; renderDevices();
+          try { await devPost("/api/devices/pair"); } catch (e) { state.devErr = e.message; }
+          state.devBusy = ""; loadDevices();
+        } }, plusIcon(), "Pair a phone"))));
+  }
+  kids.push(h("section", {}, pair));
+  const list = d.devices || [];
+  kids.push(h("section", {},
+    h("div", { class: "section-head" }, h("h2", {}, "Paired devices"), h("span", { class: "muted" }, list.length ? "Each has its own key. Forget one to cut it off at once." : "")),
+    list.length ? h("div", { class: "card device-list" }, list.map((x) => {
+      const armed = state.devArmed === x.id;
+      const seen = x.last_seen ? (since(x.last_seen) < 15 ? "Connected now" : "Last seen " + agoCoarse(x.last_seen)) : "Not seen since the dashboard started";
+      return h("div", { class: "device-row" },
+        h("div", {}, h("div", { class: "name" }, x.name), h("div", { class: "muted" }, "Paired " + new Date(x.paired_at).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" }) + " · " + seen)),
+        h("button", { type: "button", class: "btn danger" + (armed ? " confirm" : ""), disabled: state.devBusy === x.id, onclick: async () => {
+          if (!armed) { state.devArmed = x.id; clearTimeout(devArmTimer); devArmTimer = setTimeout(() => { state.devArmed = ""; renderDevices(); }, 4000); renderDevices(); return; }
+          state.devArmed = ""; state.devBusy = x.id; renderDevices();
+          try { await devPost("/api/devices/forget", { id: x.id }); } catch (e) { state.devErr = e.message; }
+          state.devBusy = ""; loadDevices();
+        } }, state.devBusy === x.id ? "Forgetting…" : armed ? "Forget " + x.name + "?" : "Forget"));
+    })) : h("div", { class: "card empty-state" }, "No phones yet.")));
+  main.replaceChildren(...kids);
 }
 
 // ---------- theme ----------

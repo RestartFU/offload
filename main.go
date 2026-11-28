@@ -76,9 +76,10 @@ Client:
   offload get ID [DIR]               download a job's --get artifacts
   offload ps [--all]                 jobs and sessions on every runner
   offload hosts                      runners, capacity and load
-  offload dashboard [--port N] [--no-open]
+  offload dashboard [--port N] [--no-open] [--no-remote]
                                      web dashboard on this machine (127.0.0.1 only): runners,
-                                     cores, memory, jobs and sessions, logs, statistics
+                                     cores, memory, jobs and sessions, logs, statistics; phones
+                                     paired under Devices reach it on the tailnet
   offload mcp PROFILE [--on NAME] [--with SET] [--secret NAME[=SRC]]
                                      stdio MCP server backed by a runner session; PROFILE is a
                                      runner profile or ~/.config/offload/sessions/PROFILE.toml
@@ -312,10 +313,11 @@ func cmdDashboard(args []string) error {
 	fs := flag.NewFlagSet("dashboard", flag.ExitOnError)
 	port := fs.Int("port", 7421, "loopback port (another free one is used if it's taken)")
 	noOpen := fs.Bool("no-open", false, "don't open the browser")
+	noRemote := fs.Bool("no-remote", false, "don't listen on the tailnet for paired phones")
 	_ = fs.Parse(args)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return dashboard.Run(ctx, dashboard.Options{Addr: fmt.Sprintf("127.0.0.1:%d", *port), Open: !*noOpen, Version: versionString()})
+	return dashboard.Run(ctx, dashboard.Options{Addr: fmt.Sprintf("127.0.0.1:%d", *port), Open: !*noOpen, Remote: !*noRemote, Version: versionString()})
 }
 
 func cmdHost(args []string) error {

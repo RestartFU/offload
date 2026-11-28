@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The dashboard speaks plain HTTP over the tailnet, which WireGuard already encrypts.
+  The app refuses any address outside the tailnet before it sends anything (Tailnet.kt).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

@@ -258,16 +258,30 @@ serves a page with no build step (plain JS and SVG, embedded in the binary).
 Because it acts with those credentials, it guards them:
 
 - It listens on loopback only and checks `Host` (no DNS rebinding).
-- Every API request carries a per-run key in an `X-Offload-Key` header. The key isn't a cookie,
+- Every API request carries a key in an `X-Offload-Key` header. The key isn't a cookie,
   because cookies are shared by every port on `127.0.0.1`: any other local web server the
   browser visited would receive it. The printed link carries the key in its fragment
   (`#key=…`), which browsers never send to a server, and the page keeps it in its own origin's
-  storage.
+  storage. The key lives in a 0600 file, like the runner tokens, so a restart doesn't make the
+  user open a new link.
 - The browser is opened on a private (0600) HTML file that redirects to the link, never on the
   link itself: command lines are visible to other users in `ps`.
 - Changes (cancel, stop) also need an `X-Offload-Dashboard` header and a same-origin request.
 - A strict CSP forbids inline script and style, and runner data goes into the page as text
   nodes only.
+
+Phones reach the same API on a second listener, on this machine's tailnet addresses, and the
+dashboard is the only thing they talk to: it already holds the runner tokens, and pairing a
+phone with every runner would spread those credentials to a device that is easier to lose.
+That listener serves no page and refuses anything that looks like a browser (`Origin`,
+`Sec-Fetch-Site`), so tailnet identity, which a browser on another device carries for every
+page, never reaches it. Each request needs a device token, stored hashed in
+`dashboard/devices.json`; the browser key is not accepted there. A token comes only from a
+one-time code made by the page on loopback: eight characters, ten minutes, and used up by one
+wrong guess, so a job on another runner, which shares the tailnet identity, can't pair itself.
+The phone keeps its token in Android Keystore and refuses addresses outside the tailnet ranges,
+so the token never crosses a network WireGuard doesn't encrypt. Forgetting a device on either
+side removes its hash.
 
 The dashboard reads session output through `/v1/sessions/{id}/observe/{stream}`, which doesn't
 count as an attached client. The client streams count as attached, which keeps an idle session
