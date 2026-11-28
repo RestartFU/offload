@@ -1228,7 +1228,7 @@ function renderGhForm() {
   // what each of the owner's runners takes, and how GitHub matches, without suggesting a change.
   // Rebuilt only when that changes, so a refresh never disturbs it.
   const sets = existing ? owners.get(existing).map(([r, p]) => [r.name, runsOn(p.labels)]) : [];
-  const noteKey = sets.map((x) => x.join("=")).join("|");
+  const noteKey = (existing || "") + "|" + sets.map((x) => x.join("=")).join("|");
   if (noteKey !== f.labelsNoteKey) {
     f.labelsNoteKey = noteKey;
     f.labelsNote.hidden = !sets.length;
