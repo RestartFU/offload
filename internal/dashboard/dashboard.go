@@ -549,7 +549,7 @@ func (s *server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		Labels []string `json:"labels"`
 		Max    *int     `json:"max"`
 		Shared *bool    `json:"shared"`
-		On     []string `json:"on"`
+		On     []string `json:"on"` // runner IDs, as the page chose them
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<14)).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -578,10 +578,11 @@ func (s *server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "that doesn't look like a GitHub token")
 		return
 	}
-	// The rows the page showed, exactly: the token goes to no other runner.
-	rows, missing := s.fleet.rowHosts(req.On)
+	// The runners the page showed, by ID: the token goes to no other runner, not even a new one
+	// under the same name.
+	rows, missing := s.fleet.hostsByID(req.On)
 	if len(missing) > 0 {
-		writeErr(w, 409, strings.Join(missing, ", ")+" isn't answering any more; pick the runners again")
+		writeErr(w, 409, "a runner you chose changed or stopped answering; pick the runners again")
 		return
 	}
 	hosts, err := client.GitHubTargets(rows, nil)
@@ -623,7 +624,7 @@ func (s *server) handleGitHubRemove(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Owner  string   `json:"owner"`
 		Forget bool     `json:"forget"`
-		On     []string `json:"on"` // only these rows; empty: every one that has the pool
+		On     []string `json:"on"` // runner IDs; empty: every one that listed the pool
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -634,48 +635,35 @@ func (s *server) handleGitHubRemove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	hosts, offline := s.fleet.githubHolders(owner)
-	if len(req.On) > 0 {
-		want := map[string]bool{}
-		for _, n := range req.On {
-			want[n] = true
-		}
-		var picked []*client.Host
-		for _, h := range hosts {
-			if want[h.Name] {
-				picked = append(picked, h)
-			}
-		}
-		var off []string
-		for _, n := range offline {
-			if want[n] {
-				off = append(off, n)
-			}
-		}
-		hosts, offline = picked, off
+	ids := req.On
+	if len(ids) == 0 {
+		ids = s.fleet.githubHolderIDs(owner)
 	}
-	if len(hosts) == 0 && len(offline) == 0 {
+	if len(ids) == 0 {
 		writeErr(w, 404, "no runner takes GitHub jobs for "+owner)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	results := make([]githubResult, len(hosts), len(hosts)+len(offline))
+	// Every runner asked for gets a result: one that can't be checked is reported, never skipped.
+	results := make([]githubResult, len(ids))
 	var wg sync.WaitGroup
-	for i, h := range hosts {
+	for i, id := range ids {
+		h, why := s.fleet.githubHolder(id, owner)
+		if h == nil {
+			results[i] = githubResult{Runner: id, Error: why}
+			continue
+		}
+		results[i].Runner = h.Name
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i].Runner = h.Name
 			if err := client.GitHubRemoveFrom(ctx, h, owner, req.Forget); err != nil {
 				results[i].Error = err.Error()
 			}
 		}()
 	}
 	wg.Wait()
-	for _, n := range offline { // it may still be taking jobs: say so rather than skip it
-		results = append(results, githubResult{Runner: n, Error: "isn't answering; remove it again once it is"})
-	}
 	s.fleet.poke()
 	writeJSON(w, map[string]any{"results": results})
 }

@@ -884,10 +884,6 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, fmt.Sprintf("asks for %s per job; this runner hands out at most %s", units.FormatSize(res.Mem), units.FormatSize(s.cfg.memCap)))
 		return
 	}
-	if res.Mem == 0 {
-		res.Mem = min(githubDefaultMem, s.cfg.memCap)
-	}
-	res = s.cfg.effective(res, nil)
 	key := api.GitHubKey(owner)
 	if !validKey(key) {
 		writeErr(w, 400, "can't use "+owner)
@@ -924,13 +920,26 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		if req.Max == nil {
 			maxJobs = p.Max
 		}
-		if req.Resources == (api.Resources{}) {
-			res = p.Resources
+		if res.CPU == 0 {
+			res.CPU = p.Resources.CPU
+		}
+		if res.CPUMax == 0 {
+			res.CPUMax = p.Resources.CPUMax
+		}
+		if res.Mem == 0 {
+			res.Mem = p.Resources.Mem
 		}
 	}
 	if len(labels) == 0 {
 		labels = []string{"offload"}
 	}
+	if problem == "" && res.CPUMax > 0 && res.CPU > res.CPUMax {
+		problem, code = fmt.Sprintf("%.1f cpu per job would be more than its %.1f cpu ceiling: give --cpu-max too", res.CPU, res.CPUMax), 400
+	}
+	if res.Mem == 0 {
+		res.Mem = min(githubDefaultMem, s.cfg.memCap)
+	}
+	res = s.cfg.effective(res, nil)
 	s.mu.Unlock()
 	if problem != "" {
 		writeErr(w, code, problem)

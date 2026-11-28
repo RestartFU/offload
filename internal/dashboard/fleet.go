@@ -282,15 +282,15 @@ func (f *fleet) snapshot(version string) fleetView {
 	return v
 }
 
-// rowHosts are the named rows' runners, current ones only, each with its latest status and the
-// name the page shows (unique here, unlike runners' own names). missing lists the others.
-func (f *fleet) rowHosts(names []string) (hosts []*client.Host, missing []string) {
+// hostsByID are the runners with these IDs, current ones only, each with its latest status and
+// the name the page shows. missing lists the IDs that aren't (gone, replaced, or not answering).
+func (f *fleet) hostsByID(ids []string) (hosts []*client.Host, missing []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, n := range names {
-		r := f.byNameLocked(n)
-		if r == nil || !r.currentLocked() {
-			missing = append(missing, n)
+	for _, id := range ids {
+		r := f.runners[id]
+		if r == nil || r.Status == nil || r.Status.ID != id || !r.currentLocked() {
+			missing = append(missing, id)
 			continue
 		}
 		h, st := *r.host, *r.Status
@@ -300,27 +300,42 @@ func (f *fleet) rowHosts(names []string) (hosts []*client.Host, missing []string
 	return hosts, missing
 }
 
-// githubHolders are the rows whose runner last reported a GitHub pool for owner, split into
-// those answering now and those that aren't.
-func (f *fleet) githubHolders(owner string) (online []*client.Host, offline []string) {
+// githubHolder finds runner id for a GitHub removal: its host while it answers and last reported
+// a pool for owner, else why it can't be used.
+func (f *fleet) githubHolder(id, owner string) (*client.Host, string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, r := range f.runners {
-		for _, p := range r.GitHub {
-			if !strings.EqualFold(p.Owner, owner) {
-				continue
-			}
-			if r.Online {
-				h := *r.host
-				h.Name = r.Name
-				online = append(online, &h)
-			} else {
-				offline = append(offline, r.Name)
-			}
-			break
+	r := f.runners[id]
+	switch {
+	case r == nil:
+		return nil, "runner " + id + " is gone"
+	case !r.Online:
+		return nil, r.Name + " isn't answering; remove it again once it is"
+	}
+	for _, p := range r.GitHub {
+		if strings.EqualFold(p.Owner, owner) {
+			h := *r.host
+			h.Name = r.Name
+			return &h, ""
 		}
 	}
-	return online, offline
+	return nil, r.Name + " didn't list " + owner + " just now; check it and remove it again"
+}
+
+// githubHolderIDs are the runners that last reported a pool for owner.
+func (f *fleet) githubHolderIDs(owner string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ids []string
+	for id, r := range f.runners {
+		for _, p := range r.GitHub {
+			if strings.EqualFold(p.Owner, owner) {
+				ids = append(ids, id)
+				break
+			}
+		}
+	}
+	return ids
 }
 
 func (f *fleet) host(name string) *client.Host {

@@ -196,3 +196,28 @@ func TestFleetOneRowPerRunnerID(t *testing.T) {
 		t.Fatalf("stayed on a status-only address: %s", r.URL)
 	}
 }
+
+// GitHub actions reach runners by ID: a replaced runner under the same name is not the one chosen,
+// and one that can't be checked is reported instead of skipped.
+func TestGitHubTargetsByID(t *testing.T) {
+	st := func(id string) *api.Status { return &api.Status{ID: id, Proto: api.Proto, Metrics: true} }
+	f := &fleet{runners: map[string]*runnerState{
+		"new": {host: &client.Host{Name: "vps"}, key: "new", Name: "vps", Online: true, Status: st("new"),
+			GitHub: []api.GitHubPool{{Owner: "acme"}}},
+		"off": {host: &client.Host{Name: "box"}, key: "off", Name: "box", Online: false, Status: st("off"),
+			GitHub: []api.GitHubPool{{Owner: "acme"}}},
+	}}
+	hosts, missing := f.hostsByID([]string{"new", "old"})
+	if len(hosts) != 1 || hosts[0].Name != "vps" || len(missing) != 1 || missing[0] != "old" {
+		t.Fatalf("hosts %v, missing %v", hosts, missing)
+	}
+	if h, why := f.githubHolder("off", "acme"); h != nil || why == "" {
+		t.Fatalf("offline holder: %v %q", h, why)
+	}
+	if h, why := f.githubHolder("new", "other"); h != nil || why == "" {
+		t.Fatalf("holder without the pool: %v %q", h, why)
+	}
+	if h, _ := f.githubHolder("new", "ACME"); h == nil {
+		t.Fatal("holder not found")
+	}
+}
