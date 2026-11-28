@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/actions/scaleset"
+	"github.com/actions/scaleset/listener"
 
 	"github.com/RestartFU/offload/internal/api"
 )
@@ -381,7 +382,7 @@ func TestGitHubNewLabelsNewScaleSet(t *testing.T) {
 	f := &fakeScaleSets{ss: &scaleset.RunnerScaleSet{ID: 1, Name: "offload-box", Labels: []scaleset.Label{
 		{Type: "system", Name: "self-hosted"}, {Type: "system", Name: "Linux"}, {Type: "system", Name: "X64"}, {Type: "system", Name: "offload"}}}}
 	ctx := context.Background()
-	ss, stale, err := ensureScaleSet(ctx, f, "offload-box", []string{"self-hosted", "linux", "x64", "offload"}, false)
+	ss, stale, err := ensureScaleSet(ctx, f, "offload-box", []string{"self-hosted", "linux", "x64", "offload", "OFFLOAD"}, false)
 	if err != nil || ss.ID != 1 || stale || strings.Join(f.calls, ",") != "get" {
 		t.Fatalf("same labels: %+v, stale %v, calls %v, %v", ss, stale, f.calls, err)
 	}
@@ -413,6 +414,11 @@ func TestGitHubRelabelDrains(t *testing.T) {
 		t.Fatalf("while a job runs: claimed %v, drained %v, %v", f.acquired, p.drained, err)
 	}
 	j.State = api.StateExited
+	first := stats(0)
+	first.MessageID = listener.InitialMessageID
+	if err := sc.Scale(context.Background(), first); err != nil || p.drained {
+		t.Fatalf("on the initial count, before queued messages: drained %v, %v", p.drained, err)
+	}
 	if err := sc.Scale(context.Background(), stats(0)); !errors.Is(err, errRelabel) || !p.drained {
 		t.Fatalf("once it finished: drained %v, %v", p.drained, err)
 	}

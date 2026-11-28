@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"maps"
 	"math"
 	"net/http"
 	"net/url"
@@ -212,6 +213,7 @@ func (s *Server) restartPoolLocked(p *githubPool) {
 	}
 	cancel, done := p.cancel, p.done
 	p.cancel, p.restarting = nil, true
+	p.listener = nil // stopping, and maybe with old labels: never reported as listening
 	go func() {
 		cancel()
 		<-done
@@ -321,17 +323,14 @@ func ensureScaleSet(ctx context.Context, c scaleSets, name string, labels []stri
 
 // sameLabels compares like GitHub does: it hands back linux as Linux and x64 as X64.
 func sameLabels(have []scaleset.Label, want []string) bool {
-	set := map[string]bool{}
+	a, b := map[string]bool{}, map[string]bool{}
 	for _, l := range have {
-		set[strings.ToLower(l.Name)] = true
+		a[strings.ToLower(l.Name)] = true
 	}
 	for _, l := range want {
-		if !set[strings.ToLower(l)] {
-			return false
-		}
-		delete(set, strings.ToLower(l))
+		b[strings.ToLower(l)] = true
 	}
-	return len(set) == 0
+	return maps.Equal(a, b)
 }
 
 // listenPool runs one connection to GitHub with the settings the pool had when it started.
@@ -611,7 +610,8 @@ func (sc *githubScaler) Scale(ctx context.Context, m *scaleset.RunnerScaleSetMes
 	for _, j := range drop {
 		s.cancelJobLocked(j, "GitHub no longer has a job for this runner")
 	}
-	if p.relabel && p.Assigned == 0 && len(live) == 0 {
+	// The initial message's count can come before queued completions: wait for a real poll.
+	if p.relabel && p.Assigned == 0 && len(live) == 0 && (m == nil || m.MessageID != listener.InitialMessageID) {
 		p.drained = true
 		s.mu.Unlock()
 		return errRelabel
@@ -1215,10 +1215,11 @@ func (s *Server) finishRemoval(p *githubPool) {
 	log.Printf("github %s: removed", p.Owner)
 }
 
-// deleteScaleSet deletes this runner's scale set for the pool on GitHub (done if it's gone).
+// deleteScaleSet deletes this runner's scale set for the pool on GitHub (done if it's gone). It
+// goes by name: a relabel may have replaced the scale set without this runner learning the new ID.
 func (s *Server) deleteScaleSet(p *githubPool) error {
 	s.mu.Lock()
-	url, token, id, name := p.URL, p.token, p.ScaleSetID, p.ScaleSet
+	url, token, name := p.URL, p.token, p.ScaleSet
 	s.mu.Unlock()
 	c, err := s.githubClient(url, token)
 	if err != nil {
@@ -1226,14 +1227,11 @@ func (s *Server) deleteScaleSet(p *githubPool) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if id == 0 {
-		ss, err := c.GetRunnerScaleSet(ctx, 1, name)
-		if err != nil || ss == nil {
-			return err
-		}
-		id = ss.ID
+	ss, err := c.GetRunnerScaleSet(ctx, 1, name)
+	if err != nil || ss == nil {
+		return err
 	}
-	if err := c.DeleteRunnerScaleSet(ctx, id); err != nil && !errors.Is(err, scaleset.NotFoundError) {
+	if err := c.DeleteRunnerScaleSet(ctx, ss.ID); err != nil && !errors.Is(err, scaleset.NotFoundError) {
 		return err
 	}
 	return nil
