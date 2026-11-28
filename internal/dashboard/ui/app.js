@@ -901,17 +901,15 @@ const checkIcon = () => glyphSVG(s("path", { d: "M3.5 8.5 6.5 11.5 12.5 4.5" }))
 function ghStatus(w) {
   const g = w.github, r = w.raw;
   if (stale(w)) return exitChip(w);
+  const verdict = { succeeded: chip("good", "Succeeded"), failed: chip("critical", "Failed"), canceled: chip("neutral", "Cancelled"), cancelled: chip("neutral", "Cancelled") }[g.result];
   if (isActive(w)) {
+    if (verdict) return verdict; // GitHub has answered; the container is still stopping
     if (g.job) return chip("running", "Running");
     return chip("neutral", w.state === "queued" && (r.reason || "").includes("building") ? "Building env" : "Starting");
   }
   if (r.reason && r.reason.startsWith("out of memory")) return chip("critical", "Out of memory");
-  if (!g.job) return chip("neutral", w.state === "cancelled" ? "Stopped" : "Took no job");
-  switch (g.result) {
-    case "succeeded": return chip("good", "Succeeded");
-    case "failed": return chip("critical", "Failed");
-    case "canceled": case "cancelled": return chip("neutral", "Cancelled");
-  }
+  if (verdict) return verdict;
+  if (!g.job) return w.state === "cancelled" ? chip("neutral", "Stopped") : w.state === "failed" || w.exit_code ? exitChip(w) : chip("neutral", "Took no job");
   return w.state === "failed" ? chip("critical", "Failed") : chip("neutral", "Finished");
 }
 function poolChip(p) {
