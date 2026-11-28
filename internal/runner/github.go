@@ -447,8 +447,10 @@ func (s *Server) tickGitHub() {
 		case p.listener != nil && time.Now().Before(p.pauseTil):
 			p.State, p.Detail = api.GitHubFailed, fmt.Sprintf("runners keep failing to start; paused until %s", p.pauseTil.Format(time.TimeOnly))
 			capNow = p.Running + p.Starting
+		case p.listener != nil && p.relabel && max(p.Running+p.Starting, p.Assigned) == 0:
+			p.State, p.Detail = api.GitHubPreparing, "switching to the new labels"
 		case p.listener != nil && p.relabel:
-			p.State, p.Detail = api.GitHubPreparing, fmt.Sprintf("new labels take effect once the jobs running here finish (%d left)", p.Running+p.Starting)
+			p.State, p.Detail = api.GitHubPreparing, fmt.Sprintf("new labels take effect once the jobs running here finish (%d left)", max(p.Running+p.Starting, p.Assigned))
 		case p.listener != nil && s.paused:
 			p.State, p.Detail = api.GitHubPreparing, "this runner is paused: it takes no new GitHub jobs until it is resumed"
 		case p.listener != nil:
