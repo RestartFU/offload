@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -956,6 +957,23 @@ func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets s
 		// One overlay layer per workspace slot: an overlay's upper directory can't be shared by
 		// two mounts, and a slot runs one job at a time.
 		r.RustupLayer = j.slot.rustupLayer()
+	}
+	if key := j.Spec.GitHub; key != "" && validKey(key) {
+		// A slot (checkouts and tool cache, nested podman's image store, rustup layer) is kept
+		// for the next job of the same owner; the actions runner is shared and read-only.
+		slot, ok := githubSlotOf(j)
+		install := j.Spec.Env["OFFLOAD_GITHUB_INSTALL"]
+		if ok && filepath.Dir(install) == s.cacheDir("actions-runner") {
+			dir := filepath.Join(s.githubDir(), key, "slots", strconv.Itoa(slot))
+			r.Same = append(r.Same, filepath.Join(dir, "work"))
+			r.Volumes = append(r.Volumes, install+":"+githubRunnerDir+":O", filepath.Join(dir, "containers")+":/var/lib/containers")
+			r.RustupLayer = filepath.Join(dir, "rustup")
+		}
+		r.NestedSandbox = true
+		if _, err := os.Stat("/dev/fuse"); err == nil {
+			r.Devices = append(r.Devices, "/dev/fuse")
+		}
+		r.CacheScope = githubScope(key)
 	}
 	return s.podmanRun(r)
 }

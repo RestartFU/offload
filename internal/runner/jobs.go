@@ -203,6 +203,7 @@ func (s *Server) restore() {
 		s.jobs[j.ID] = j
 	}
 	s.restoreSessions()
+	s.restoreGitHub()
 }
 
 func (s *Server) findSlot(id string) *slot {
@@ -1107,6 +1108,9 @@ func (s *Server) finishLocked(j *job, state string, code *int, reason string) {
 		j.CPUSeconds = cpu // from the last sample: an older wrapper, or no exit record
 	}
 	s.recordJobLocked(j)
+	if j.Spec.GitHub != "" {
+		s.githubFinishedLocked(j)
+	}
 	s.cleanupCredentials(j)
 	s.releaseCPUsLocked(j.cpus)
 	j.cpus = nil
@@ -1424,6 +1428,9 @@ func (s *Server) gcRepoStoresLocked() {
 	for _, j := range s.jobs {
 		if !api.Terminal(j.State) {
 			inUse[j.Spec.WorkspaceKey] = true
+			if j.Spec.GitHub != "" {
+				inUse[githubScope(j.Spec.GitHub)] = true
+			}
 		}
 	}
 	for _, list := range s.slots {

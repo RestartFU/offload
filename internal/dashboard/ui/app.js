@@ -67,6 +67,7 @@ const shortKey = (k) => (k ? k.replace(/--b[0-9a-f]+$/, "") : "");
 function cmdline(argv) {
   return (argv || []).map((a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : "'" + a.replace(/'/g, "'\\''") + "'")).join(" ");
 }
+const jobCmd = (j) => (j.github ? (j.github.job || "Waiting for a GitHub job") : cmdline(j.spec.argv));
 function stripAnsi(t) { return t.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, "").replace(/\x1b\][^\x07]*\x07/g, ""); }
 
 // ---------- icons (status always pairs an icon with a label) ----------
@@ -153,6 +154,8 @@ const state = {
   series: {}, seriesFor: "", seriesLoading: false,
   ledger: null, ledgerFor: "", ledgerErrors: null, ledgerTruncated: [],
   cfilter: { state: store("cstate") || "active", kind: "", runner: "", q: "" },
+  gfilter: { state: store("gstate") || "active", owner: "" },
+  copied: "", // the snippet a copy button just copied
   sel: null, // {runner, id}
   stopping: new Map(), // "runner/id" -> "" while stopping, or the error
   pausing: new Map(), // runner name -> "" while pausing or resuming, or the error
@@ -252,10 +255,10 @@ function scheduleData() {
 function route() {
   takeKey();
   const parts = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent);
-  const view = parts[0] === "containers" ? "containers" : "overview";
+  const view = parts[0] === "containers" || parts[0] === "github" ? parts[0] : "overview";
   const changed = view !== state.view;
   state.view = view;
-  const sel = view === "containers" && parts[1] && parts[2] ? { runner: parts[1], id: parts[2] } : null;
+  const sel = view !== "overview" && parts[1] && parts[2] ? { runner: parts[1], id: parts[2] } : null;
   if (JSON.stringify(sel) !== JSON.stringify(state.sel)) { state.sel = sel; openDrawer(); }
   for (const a of document.querySelectorAll(".tabs a")) {
     if (a.dataset.view === view) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
@@ -311,7 +314,8 @@ let mainBuilt = "";
 function render() {
   renderLive();
   if (!state.fleet && !state.fleetErr) return;
-  if (state.view === "overview") renderOverview(); else renderContainers();
+  if (state.view === "overview") renderOverview(); else if (state.view === "github") renderGitHubView(); else renderContainers();
+  renderTabCounts();
   if (state.sel) renderDrawer();
 }
 
@@ -416,7 +420,7 @@ function heatClass(busy) {
 
 function workloadLabel(r, id) {
   const j = r.jobs.find((x) => x.id === id);
-  if (j) return id + " · " + truncate(cmdline(j.spec.argv), 60);
+  if (j) return id + " · " + truncate(jobCmd(j), 60);
   const se = r.sessions.find((x) => x.id === id);
   return se ? id + " · session " + se.profile : id;
 }
@@ -446,7 +450,7 @@ function runnerCard(r) {
           h("div", { class: "r" }, h("b", {}, pct(c.busy)), h("span", {}, "busy")),
           ...(c.owners || []).map((id) => h("div", { class: "r" }, h("span", {}, "pinned: " + workloadLabel(r, id)))),
         ]);
-        cell.addEventListener("click", () => { if (c.owners?.length) location.hash = `#/containers/${encodeURIComponent(r.name)}/${encodeURIComponent(c.owners[0])}`; });
+        cell.addEventListener("click", () => { if (c.owners?.length) location.hash = workloadHash(r, c.owners[0]); });
         return cell;
       })),
       h("div", { class: "legend-cores" },
@@ -504,7 +508,7 @@ function pauseBtn(r) {
 function renderQueue(runners) {
   const el = $("#ov-queue");
   const waiting = [];
-  for (const r of runners) if (r.online) for (const j of r.jobs) if (j.state === "queued" || j.state === "uploading") waiting.push([r, j]);
+  for (const r of runners) if (r.online) for (const j of r.jobs) if ((j.state === "queued" || j.state === "uploading") && !j.spec.github) waiting.push([r, j]);
   if (!waiting.length) { el.replaceChildren(); return; }
   waiting.sort((a, b) => new Date(a[1].created_at) - new Date(b[1].created_at));
   el.replaceChildren(
@@ -512,7 +516,7 @@ function renderQueue(runners) {
     h("div", { class: "table-wrap" }, h("table", {},
       h("thead", {}, h("tr", {}, ["Job", "Command", "Runner", "Waiting", "Asks for", "Why"].map((t) => h("th", {}, t)))),
       h("tbody", {}, waiting.map(([r, j]) => h("tr", { class: "click", tabindex: 0, onclick: () => (location.hash = `#/containers/${encodeURIComponent(r.name)}/${j.id}`) },
-        h("td", { class: "mono" }, j.id), h("td", {}, h("span", { class: "cmd mono" }, cmdline(j.spec.argv))), h("td", {}, r.name),
+        h("td", { class: "mono" }, j.id), h("td", {}, h("span", { class: "cmd mono" }, jobCmd(j))), h("td", {}, r.name),
         h("td", { class: "num nowrap" }, fmtDur(since(j.created_at))),
         h("td", { class: "num nowrap" }, `${fmtCores(j.resources.cpu)} cores · ${fmtBytes(j.resources.mem)}`),
         h("td", { class: "hint" }, (j.reason || (j.state === "uploading" ? "receiving source files" : "")).replace(/^waiting: /, ""))))))));
@@ -774,7 +778,7 @@ function workloads() {
     const owners = new Map();
     for (const c of r.metrics?.cpus || []) for (const id of c.owners || []) (owners.get(id) || owners.set(id, []).get(id)).push(c.id);
     for (const j of r.jobs) out.push({
-      kind: "job", runner: r.name, id: j.id, state: j.state, reason: j.reason, exit_code: j.exit_code, cmd: cmdline(j.spec.argv),
+      kind: "job", runner: r.name, id: j.id, state: j.state, reason: j.reason, exit_code: j.exit_code, cmd: jobCmd(j), github: j.spec.github ? j.github || { owner: "" } : null,
       repo: shortKey(j.spec.workspace_key), caller: j.caller || j.spec.client || "", res: j.resources, cpus: j.allowed_cpus,
       created: j.created_at, started: j.started_at, finished: j.finished_at, runtime: j.runtime, image: j.image,
       use: usage.get(j.id), raw: j, host: r,
@@ -836,12 +840,12 @@ function renderTable() {
   const el = $("#ct-table");
   if (!el) return;
   const f = state.cfilter, q = f.q.trim().toLowerCase();
-  let list = workloads().filter((w) =>
+  let list = workloads().filter((w) => !w.github &&
     (f.state === "all" || (f.state === "active") === isActive(w)) && (!f.kind || w.kind === f.kind) && (!f.runner || w.runner === f.runner) &&
     (!q || [w.id, w.cmd, w.repo, w.caller, w.runner, w.state].some((x) => (x || "").toLowerCase().includes(q))));
   list.sort((a, b) => (isActive(b) - isActive(a)) || new Date(b.created) - new Date(a.created));
   if (!list.length) {
-    const msg = !state.fleet?.runners.length ? "No runners found yet." : f.state === "active" ? "Nothing is running. Jobs you start with offload run show up here." : "No workloads match.";
+    const msg = !state.fleet?.runners.length ? "No runners found yet." : f.state === "active" ? "Nothing is running. Jobs you start with offload run show up here; GitHub jobs have their own tab." : "No workloads match.";
     el.replaceChildren(h("div", { class: "card empty-state" }, msg));
     return;
   }
@@ -866,6 +870,211 @@ function renderTable() {
     })))));
 }
 
+// ---------- GitHub ----------
+const workloadHash = (r, id) => `#/${r.jobs.some((j) => j.id === id && j.spec.github) ? "github" : "containers"}/${encodeURIComponent(r.name)}/${encodeURIComponent(id)}`;
+const ghPool = (r, owner) => (r.github || []).find((p) => p.owner === owner);
+const ghSettings = (owner) => owner.includes("/") ? `https://github.com/${owner}/settings/actions/runners` : `https://github.com/organizations/${owner}/settings/actions/runners`;
+const agoCoarse = (t) => { const x = since(t); return x < 60 ? "just now" : x < 3600 ? Math.round(x / 60) + "m ago" : fmtDur(x) + " ago"; };
+const runsOn = (labels) => (!labels?.length ? "offload" : labels.length === 1 ? labels[0] : "[" + labels.join(", ") + "]");
+const extIcon = () => glyphSVG(s("path", { d: "M6.5 3.5H4A1.5 1.5 0 0 0 2.5 5v7A1.5 1.5 0 0 0 4 13.5h7a1.5 1.5 0 0 0 1.5-1.5V9.5M9 2.5h4.5V7M13.5 2.5 7.5 8.5" }));
+const copyIcon = () => glyphSVG(s("rect", { x: "5.25", y: "5.25", width: "8.5", height: "8.5", rx: "1.5" }), s("path", { d: "M10.75 5.25V3.75a1.5 1.5 0 0 0-1.5-1.5h-5.5a1.5 1.5 0 0 0-1.5 1.5v5.5a1.5 1.5 0 0 0 1.5 1.5h1.5" }));
+const checkIcon = () => glyphSVG(s("path", { d: "M3.5 8.5 6.5 11.5 12.5 4.5" }));
+
+function ghStatus(w) {
+  const g = w.github, r = w.raw;
+  if (stale(w)) return exitChip(w);
+  if (isActive(w)) {
+    if (g.job) return chip("running", "Running");
+    return chip("neutral", w.state === "queued" && (r.reason || "").includes("building") ? "Building env" : "Starting");
+  }
+  if (r.reason && r.reason.startsWith("out of memory")) return chip("critical", "Out of memory");
+  if (!g.job) return chip("neutral", w.state === "cancelled" ? "Stopped" : "Took no job");
+  switch (g.result) {
+    case "succeeded": return chip("good", "Succeeded");
+    case "failed": return chip("critical", "Failed");
+    case "canceled": case "cancelled": return chip("neutral", "Cancelled");
+  }
+  return w.state === "failed" ? chip("critical", "Failed") : chip("neutral", "Finished");
+}
+function poolChip(p) {
+  switch (p.state) {
+    case "listening": return chip("good", "Ready");
+    case "preparing": return chip("info", "Preparing");
+    case "failed": return chip("critical", "Not taking jobs");
+    case "removing": return chip("neutral", "Removing");
+  }
+  return chip("neutral", p.state || "?");
+}
+function copyBtn(text, label) {
+  const done = state.copied === text;
+  return h("button", { type: "button", class: "btn copy" + (done ? " done" : ""), "aria-label": done ? "Copied" : "Copy " + (label || text), onclick: async (e) => {
+    e.stopPropagation();
+    try { await navigator.clipboard.writeText(text); } catch { return; }
+    state.copied = text; render();
+    setTimeout(() => { if (state.copied === text) { state.copied = ""; render(); } }, 1600);
+  } }, done ? checkIcon() : copyIcon(), done ? "Copied" : "Copy");
+}
+function slots(p) {
+  const busy = p.running, starting = p.starting, total = Math.max(p.capacity, busy + starting);
+  const room = Math.max(0, total - busy - starting);
+  const label = [busy && `${busy} running`, starting && `${starting} starting`, `room for ${room} more`].filter(Boolean).join(", ");
+  if (total > 32 || p.state !== "listening") return null;
+  const cells = [];
+  for (let i = 0; i < total; i++) cells.push(h("i", { class: "cell " + (i < busy ? "h4" : i < busy + starting ? "h1" : "") }));
+  return h("div", { class: "slots", role: "img", "aria-label": label, title: label }, cells);
+}
+function roomText(p) {
+  if (p.state !== "listening") return p.detail || "";
+  const busy = p.running + p.starting, room = Math.max(0, p.capacity - busy);
+  if (!busy && !room) return "Full right now: GitHub holds its jobs until there's room";
+  return [p.running && `${p.running} running`, p.starting && `${p.starting} starting`, room ? `room for ${room} more` : "no room for more"].filter(Boolean).join(" · ");
+}
+
+function ghWorkloads() {
+  return workloads().filter((w) => w.github);
+}
+function renderTabCounts() {
+  const a = document.querySelector('.tabs a[data-view="github"]');
+  if (!a) return;
+  const n = ghWorkloads().filter((w) => live(w) && w.github.job).length;
+  let c = a.querySelector(".count");
+  if (!n) { c?.remove(); a.removeAttribute("aria-label"); return; }
+  if (!c) { c = h("span", { class: "count", "aria-hidden": "true" }); a.append(c); }
+  c.textContent = n;
+  a.setAttribute("aria-label", `GitHub, ${n} job${n === 1 ? "" : "s"} running`);
+}
+
+let ghBuilt = "";
+function renderGitHubView() {
+  const main = $("#main");
+  if (mainBuilt !== "github") {
+    mainBuilt = "github"; ghBuilt = "";
+    main.replaceChildren(h("div", { class: "alerts", id: "gh-alerts" }), h("section", { id: "gh-jobs" }), h("section", { id: "gh-owners" }));
+  }
+  if (!state.fleet) {
+    $("#gh-jobs").replaceChildren(h("div", { class: "card empty-state" }, state.fleetErr || "Loading…"));
+    return;
+  }
+  const owners = new Map();
+  for (const r of state.fleet.runners) for (const p of r.github || []) (owners.get(p.owner) || owners.set(p.owner, []).get(p.owner)).push([r, p]);
+  if (!owners.size) {
+    $("#gh-alerts").replaceChildren();
+    $("#gh-owners").replaceChildren();
+    $("#gh-jobs").replaceChildren(ghOnboarding());
+    return;
+  }
+  const alerts = [];
+  for (const [owner, list] of owners) for (const [r, p] of list) {
+    if (p.state === "failed") alerts.push(h("div", { class: "alert critical", role: "alert" }, icon("critical"), h("div", {}, h("b", {}, r.name), ` isn't taking ${owner}'s jobs: ${p.detail || "unknown problem"}`)));
+    if (!r.online) alerts.push(h("div", { class: "alert warning" }, icon("warning"), h("div", {}, h("b", {}, r.name), ` isn't answering, so its ${owner} jobs below are what it last reported`)));
+  }
+  $("#gh-alerts").replaceChildren(...alerts);
+  renderGitHubJobs([...owners.keys()]);
+  $("#gh-owners").replaceChildren(
+    h("div", { class: "section-head" }, h("h2", {}, "Organizations and repositories"),
+      h("span", { class: "muted" }, "Every runner below tells GitHub how many jobs fit; GitHub sends each job to one with room")),
+    h("div", { class: "grid gh-owners" }, [...owners].sort((a, b) => a[0].localeCompare(b[0])).map(([owner, list]) => ownerCard(owner, list))));
+}
+
+function renderGitHubJobs(owners) {
+  const f = state.gfilter;
+  if (f.owner && !owners.includes(f.owner)) f.owner = "";
+  const all = ghWorkloads();
+  const active = all.filter(isActive);
+  const running = active.filter((w) => w.github.job).length, starting = active.length - running;
+  let room = 0;
+  for (const r of state.fleet.runners) if (r.online) for (const p of r.github || []) if (p.state === "listening") room += Math.max(0, p.capacity - p.running - p.starting);
+  const done = all.filter((w) => !isActive(w) && w.github.job);
+  const ok = done.filter((w) => w.github.result === "succeeded").length;
+  const summary = [
+    h("b", {}, running), " running", starting ? [" · ", h("b", {}, starting), " starting"] : null,
+    " · room for ", h("b", {}, room), " more",
+    done.length ? [" · ", h("b", {}, done.length), " finished in the last hour, ", h("b", {}, pct(ok / done.length)), " succeeded"] : null,
+  ];
+  const list = all.filter((w) => (f.state === "all" || (f.state === "active") === isActive(w)) && (!f.owner || w.github.owner === f.owner))
+    .sort((a, b) => (isActive(b) - isActive(a)) || new Date(b.created) - new Date(a.created));
+  const filters = h("div", { class: "filters" },
+    segmented([["active", "Active"], ["finished", "Finished"], ["all", "All"]], f.state, (v) => { f.state = v; store("gstate", v); render(); }, "State"),
+    owners.length > 1 ? h("select", { "aria-label": "Organization or repository", onchange: (e) => { f.owner = e.target.value; render(); } },
+      h("option", { value: "" }, "Everywhere"), owners.map((o) => h("option", { value: o, selected: o === f.owner }, o))) : null,
+    h("span", { class: "gh-summary", role: "status" }, summary));
+  let body;
+  if (!list.length) {
+    body = h("div", { class: "card empty-state" }, f.state === "active"
+      ? [h("p", {}, "No GitHub jobs right now."), h("p", {}, "They show up here the moment a workflow with ", h("code", {}, "runs-on: " + runsOn(ghFirstLabels())), " starts.")]
+      : "No finished GitHub jobs in the last hour.");
+  } else {
+    const showRunner = state.fleet.runners.length > 1;
+    body = h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, ["Job", "Status", showRunner && "Runner", "Time", "CPU used (cores)", "Memory", ""].filter((t) => t !== false).map((t) => h("th", {}, t)))),
+      h("tbody", {}, list.map((w) => {
+        const g = w.github;
+        const open = () => (location.hash = `#/github/${encodeURIComponent(w.runner)}/${w.id}`);
+        const t = stale(w) ? (w.host.last_seen ? `as of ${ago(w.host.last_seen)}` : "") : w.finished ? (w.started ? `took ${fmtDur((new Date(w.finished) - new Date(w.started)) / 1000)}` : `ended ${ago(w.finished)}`)
+          : w.started && w.state === "running" ? `for ${fmtDur(since(w.started))}` : `waiting ${fmtDur(since(w.created))}`;
+        return h("tr", { class: "click" + (state.sel && state.sel.id === w.id && state.sel.runner === w.runner ? " sel" : ""), tabindex: 0, onclick: open, onkeydown: (e) => { if (e.key === "Enter") open(); } },
+          h("td", { class: "gh-job" }, g.job
+            ? [h("div", { class: "name" }, g.job), h("div", { class: "where" }, g.repo, g.workflow ? h("span", { class: "muted" }, " · " + g.workflow) : null)]
+            : [h("div", { class: "name muted" }, isActive(w) ? "Waiting for a job" : "Took no job"), h("div", { class: "where muted" }, g.owner, h("span", { class: "mono" }, " · " + (g.runner || "")))]),
+          h("td", {}, ghStatus(w)),
+          showRunner && h("td", { class: "nowrap" }, w.runner),
+          h("td", { class: "nowrap num muted" }, t),
+          h("td", {}, live(w) && w.state === "running" ? usageCell(w.use?.cpu, w.res.cpu, fmtCores, " guaranteed") : h("span", { class: "muted num" }, w.raw.cpu_seconds ? fmtDur(w.raw.cpu_seconds) + " CPU" : "–")),
+          h("td", {}, live(w) && w.state === "running" ? usageCell(w.use?.mem, w.res.mem, fmtBytes, " limit", true) : h("span", { class: "muted num" }, w.raw.peak_mem ? "peak " + fmtBytes(w.raw.peak_mem) : "–")),
+          h("td", { class: "r" }, g.url ? h("a", { class: "icon-link", href: g.url, target: "_blank", rel: "noopener noreferrer", title: "Open the run on GitHub", "aria-label": `Open ${g.job} on GitHub`, onclick: (e) => e.stopPropagation() }, extIcon()) : null));
+      }))));
+  }
+  $("#gh-jobs").replaceChildren(h("div", { class: "section-head" }, h("h2", {}, "Jobs")), filters, body);
+}
+const ghFirstLabels = () => { for (const r of state.fleet?.runners || []) for (const p of r.github || []) return p.labels; return null; };
+
+function ownerCard(owner, list) {
+  const first = list[0][1];
+  const snippet = "runs-on: " + runsOn(first.labels);
+  const finished = sum(list, ([, p]) => p.runs);
+  const last = list.map(([, p]) => p.last_run).filter(Boolean).sort().pop();
+  const per = first.resources;
+  return h("div", { class: "card gh-owner" },
+    h("div", { class: "gh-owner-head" },
+      h("h3", {}, owner),
+      h("a", { class: "subtle-link", href: ghSettings(owner), target: "_blank", rel: "noopener noreferrer" }, "Runner settings", extIcon()),
+      h("div", { class: "runs-on" }, h("code", {}, snippet), copyBtn(snippet, snippet))),
+    h("div", { class: "gh-runners", role: "list" }, list.sort((a, b) => a[0].name.localeCompare(b[0].name)).map(([r, p]) =>
+      h("div", { class: "gh-runner", role: "listitem" },
+        h("span", { class: "n" }, r.name),
+        poolChip(p),
+        h("div", { class: "room" }, slots(p), h("span", { class: p.state === "failed" ? "crit-text" : "muted" }, roomText(p)))))),
+    h("div", { class: "runner-foot" },
+      h("span", {}, "Each job ", h("b", {}, `${fmtCores(per.cpu)}–${fmtCores(per.cpu_max)} cores`), " · ", h("b", {}, fmtBytes(per.mem))),
+      h("span", {}, h("b", {}, finished), " finished", last ? " · last one " + agoCoarse(last) : ""),
+      h("span", {}, first.token_from === "gh" ? "With your gh login" : "With a token")));
+}
+
+function ghOnboarding() {
+  const add = "offload github add ORG";
+  const use = "runs-on: offload";
+  return h("div", { class: "card onboarding" },
+    h("h2", {}, "Run your GitHub Actions jobs on these runners"),
+    h("p", { class: "muted" }, "Each job gets a fresh container sized like any offload job, and GitHub sends it to whichever runner has room. Docker builds work, and checkouts, tool and dependency caches stay warm between jobs."),
+    h("ol", { class: "steps" },
+      h("li", {}, h("div", { class: "what" }, "Connect an organization or repository. Offload uses your GitHub CLI login."),
+        h("div", { class: "snippet" }, h("code", {}, add), copyBtn(add))),
+      h("li", {}, h("div", { class: "what" }, "Point workflows at it."),
+        h("div", { class: "snippet" }, h("code", {}, use), copyBtn(use)))),
+    h("p", { class: "muted small" }, "Prefer a narrower credential? Pass ", h("code", {}, "--token"), " a fine-grained token with only “Self-hosted runners: write”."));
+}
+
+function ghDrawerHead(w) {
+  const g = w.github;
+  return [
+    h("div", { class: "row" }, h("span", { class: "kind" }, "GitHub"), h("h2", {}, g.job || (isActive(w) ? "Waiting for a job" : "Took no job")),
+      ghStatus(w), live(w) ? stopBtn(w) : null, closeBtn()),
+    h("div", { class: "gh-head-sub" },
+      h("span", {}, g.repo || g.owner, g.workflow ? h("span", { class: "muted" }, " · " + g.workflow) : null, h("span", { class: "muted mono" }, " · " + w.id)),
+      g.url ? h("a", { class: "btn", href: g.url, target: "_blank", rel: "noopener noreferrer" }, "Open on GitHub", extIcon()) : null),
+  ];
+}
+
 // ---------- drawer ----------
 let scrim;
 let logView = null; // {key, stream, abort, pre, follow, status}
@@ -880,7 +1089,7 @@ function openDrawer() {
   d.replaceChildren();
   renderDrawer();
 }
-function closeDrawer() { location.hash = "#/containers"; }
+function closeDrawer() { location.hash = state.view === "github" ? "#/github" : "#/containers"; }
 addEventListener("keydown", (e) => { if (e.key === "Escape" && state.sel) closeDrawer(); });
 
 function findWorkload() {
@@ -902,10 +1111,10 @@ function renderDrawer() {
     body.append(h("div", { id: "dr-info" }), h("div", { id: "dr-logs" }));
     d.replaceChildren(head, body);
   }
-  head.replaceChildren(
+  head.replaceChildren(...(w.github ? ghDrawerHead(w) : [
     h("div", { class: "row" }, h("span", { class: "kind" }, w.kind === "job" ? "Job" : "Session"), h("h2", { class: "mono" }, w.id), exitChip(w),
       live(w) ? stopBtn(w) : null, closeBtn()),
-    h("div", { class: "cmdline mono" }, w.kind === "job" ? w.cmd : "profile " + w.cmd));
+    h("div", { class: "cmdline mono" }, w.kind === "job" ? w.cmd : "profile " + w.cmd)]));
   const err = state.stopping.get(w.runner + "/" + w.id);
   $("#dr-info").replaceChildren(err ? h("div", { class: "alert critical", role: "alert", style: { marginBottom: "14px" } }, icon("critical"), h("div", {}, err)) : "", ...drawerInfo(w));
   ensureLogs(w);
@@ -919,7 +1128,8 @@ function stopBtn(w) {
   const key = w.runner + "/" + w.id;
   if (state.stopping.get(key) === "") return h("button", { class: "btn danger", disabled: true, style: { marginLeft: "auto" } }, "Stopping…");
   const confirming = confirmFor === key;
-  const b = h("button", { class: "btn danger" + (confirming ? " confirm" : ""), style: { marginLeft: "auto" } }, confirming ? (w.kind === "job" ? "Confirm cancel" : "Confirm stop") : (w.kind === "job" ? "Cancel job" : "Stop session"));
+  const label = w.github ? ["Stop runner", "Confirm: fails the GitHub job"] : w.kind === "job" ? ["Cancel job", "Confirm cancel"] : ["Stop session", "Confirm stop"];
+  const b = h("button", { class: "btn danger" + (confirming ? " confirm" : ""), style: { marginLeft: "auto" } }, confirming ? label[1] : label[0]);
   b.addEventListener("click", async () => {
     if (!confirming) { confirmFor = key; clearTimeout(confirmTimer); confirmTimer = setTimeout(() => { confirmFor = null; renderDrawer(); }, 4000); renderDrawer(); return; }
     confirmFor = null; state.stopping.set(key, ""); renderDrawer();
@@ -956,7 +1166,15 @@ function drawerInfo(w) {
   const add = (k, v) => { if (v != null && v !== "" && v !== false) rows.push(h("dt", {}, k), h("dd", {}, v)); };
   add("Runner", stale(w) ? `${w.runner} (not answering${w.host.last_seen ? ", last seen " + ago(w.host.last_seen) : ""}: this is its last report)` : w.runner);
   if (r.reason) add("Reason", r.reason.replace(/^waiting: /, "Waiting: "));
-  if (w.kind === "job") {
+  if (w.github) {
+    const g = w.github;
+    add("Repository", g.repo ? h("a", { href: "https://github.com/" + g.repo, target: "_blank", rel: "noopener noreferrer" }, g.repo) : null);
+    add("Workflow", g.workflow ? h("span", { class: "mono" }, g.workflow) : null);
+    add("Triggered by", g.event ? g.event.replace(/_/g, " ") : null);
+    add("GitHub's result", g.result ? g.result.replace(/^canceled$/, "cancelled") : null);
+    add("Runner on GitHub", h("span", { class: "mono" }, g.runner || "–"));
+    add("For", g.owner ? h("span", {}, g.owner, h("span", { class: "muted" }, " · " + (ghPool(w.host, g.owner)?.scale_set || ""))) : null);
+  } else if (w.kind === "job") {
     const sp = r.spec;
     add("Profile", sp.profile);
     add("Repository", sp.workspace_key ? h("span", { class: "mono" }, sp.workspace_key) : "none (throwaway directory)");
@@ -971,7 +1189,7 @@ function drawerInfo(w) {
     add("Last client contact", r.last_seen ? ago(r.last_seen) : null);
     add("Network", r.network === "client" ? "through the attached client" : null);
   }
-  add("Caller", [w.raw.caller, w.kind === "job" ? r.spec.client : r.client].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join(" · "));
+  if (!w.github) add("Caller", [w.raw.caller, w.kind === "job" ? r.spec.client : r.client].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join(" · "));
   add("Runtime", w.runtime === "container" ? h("span", {}, "container ", h("span", { class: "mono muted" }, w.image || "")) : w.runtime);
   add("Resources", `${fmtCores(res.cpu)} ${fmtCores(res.cpu) === "1" ? "core" : "cores"} guaranteed, up to ${fmtCores(res.cpu_max)} · ${fmtBytes(res.mem)} memory` + (r.mem_from ? ` (${r.mem_from === "learned" ? "learned from earlier runs" : r.mem_from})` : ""));
   add("Pinned CPUs", w.cpus ? h("span", { class: "mono" }, w.cpus) : null);
@@ -983,7 +1201,7 @@ function drawerInfo(w) {
   if (r.peak_mem) add("Peak memory", fmtBytes(r.peak_mem) + (res.mem ? ` (${pct(r.peak_mem / res.mem)} of the limit)` : ""));
   if (r.cpu_seconds) add("CPU time", fmtDur(r.cpu_seconds));
   if (w.kind === "job") {
-    add("Secrets", (r.spec.secret_names || []).length ? r.spec.secret_names.join(", ") : null);
+    if (!w.github) add("Secrets", (r.spec.secret_names || []).length ? r.spec.secret_names.join(", ") : null);
     add("Write-back", r.write_back ? `${(r.write_back.modified || []).length} file(s) changed` : null);
     add("Network", r.spec.network === "client" ? "through the client" : null);
   }

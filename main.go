@@ -91,6 +91,16 @@ Secrets can also come from the environment (e.g. an MCP entry's "env"):
   offload host upgrade NAME|--all [--binary PATH]   push this (or a matching) binary to runners
   offload host pair NAME [--code C]  let this client use a runner (C from "offload runner pair-code" on it)
 
+GitHub Actions (every GitHub job runs as an offload job on a runner with room for it):
+  offload github add ORG[/REPO] [--labels offload] [--max N] [--on RUNNER,…]
+                     [--token SRC] [--cpu N] [--cpu-max N] [--mem SIZE (default 8G)]
+                                     take ORG's jobs on every runner (or --on); workflows
+                                     use "runs-on: offload" (or --labels). Uses your gh
+                                     login unless --token gives a token or cmd:/env:/file:
+  offload github ls                  organizations and repositories, per runner
+  offload github rm ORG[/REPO] [--on RUNNER,…]
+                                     stop taking its jobs (and delete them on GitHub)
+
 Environments (jobs run in containers; agents are root inside and can install anything):
   offload env show [--environment N]            the environment a job here would use
   offload env add PKG...                        add system packages (persisted, one sorted layer)
@@ -161,6 +171,8 @@ func main() {
 		err = cmdHost(args)
 	case "env":
 		code, err = cmdEnv(args)
+	case "github":
+		err = cmdGitHub(args)
 	case "runner":
 		code, err = cmdRunner(args)
 	case "hook":
@@ -332,6 +344,54 @@ func cmdHost(args []string) error {
 	force := fs.Bool("force", false, "upgrade even if it stops running work")
 	_ = fs.Parse(args[1:])
 	return client.Upgrade(fs.Args(), *all, *binary, *force)
+}
+
+func cmdGitHub(args []string) error {
+	usage := "usage: offload github add ORG[/REPO] [flags] | ls | rm ORG[/REPO] [--on RUNNER,…]"
+	if len(args) < 1 {
+		die(usage)
+	}
+	list := func(v string) []string {
+		var out []string
+		for _, x := range strings.Split(v, ",") {
+			if x = strings.TrimSpace(x); x != "" {
+				out = append(out, x)
+			}
+		}
+		return out
+	}
+	switch args[0] {
+	case "add":
+		if len(args) < 2 || strings.HasPrefix(args[1], "-") {
+			die("usage: offload github add ORG[/REPO] [--labels offload] [--max N] [--on RUNNER,…] [--token SRC] [--cpu N] [--cpu-max N] [--mem SIZE]")
+		}
+		fs := flag.NewFlagSet("github add", flag.ExitOnError)
+		o := client.GitHubOptions{Owner: args[1]}
+		fs.StringVar(&o.Token, "token", "", "token, or cmd:…, env:…, file:… (default: your gh login)")
+		labels := fs.String("labels", "offload", "labels workflows use in runs-on, comma-separated")
+		on := fs.String("on", "", "runners to use, comma-separated (default: all)")
+		fs.IntVar(&o.Max, "max", 0, "most GitHub jobs at once per runner (default: as many as fit)")
+		res := resourceFlags(fs)
+		_ = fs.Parse(args[2:])
+		var err error
+		if o.Resources, err = res(); err != nil {
+			return err
+		}
+		o.Labels, o.On = list(*labels), list(*on)
+		return client.GitHubAdd(o)
+	case "ls", "list":
+		return client.GitHubList()
+	case "rm", "remove":
+		if len(args) < 2 || strings.HasPrefix(args[1], "-") {
+			die("usage: offload github rm ORG[/REPO] [--on RUNNER,…]")
+		}
+		fs := flag.NewFlagSet("github rm", flag.ExitOnError)
+		on := fs.String("on", "", "runners, comma-separated (default: all)")
+		_ = fs.Parse(args[2:])
+		return client.GitHubRemove(args[1], list(*on))
+	}
+	die(usage)
+	return nil
 }
 
 func cmdEnv(args []string) (int, error) {

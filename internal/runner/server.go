@@ -50,6 +50,8 @@ type Server struct {
 	jobs     map[string]*job
 	sessions map[string]*session
 	slots    map[string][]*slot
+	github   map[string]*githubPool // GitHub Actions runner pools, by owner key
+	serveCtx context.Context        // Serve's context, for pools added while it runs
 	cpuUse   map[int]int
 	features map[string]bool
 	history  map[string]*histEntry
@@ -95,7 +97,7 @@ func New(cfg *Config, version string) (*Server, error) {
 	}
 	s := &Server{
 		cfg: cfg, version: version, self: self,
-		jobs: map[string]*job{}, sessions: map[string]*session{}, slots: map[string][]*slot{},
+		jobs: map[string]*job{}, sessions: map[string]*session{}, slots: map[string][]*slot{}, github: map[string]*githubPool{},
 		cpuUse: map[int]int{}, wake: make(chan struct{}, 1), whois: map[string]whoisEntry{},
 		builds: map[string]*envBuild{}, buildErrs: map[string]error{}, readyImages: map[string]bool{}, readyChecked: map[string]time.Time{}, tz: hostTimezone(),
 	}
@@ -186,12 +188,19 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/metrics", s.handleMetrics)
 	mux.HandleFunc("GET /v1/metrics/series", s.handleSeries)
 	mux.HandleFunc("GET /v1/ledger", s.handleLedger)
+	mux.HandleFunc("GET /v1/github", s.handleGitHubList)
+	mux.HandleFunc("POST /v1/github", s.handleGitHubAdd)
+	mux.HandleFunc("DELETE /v1/github/{key}", s.handleGitHubRemove)
 
 	handler := s.auth(mux)
 	errc := make(chan error, len(s.cfg.Listen))
 	for _, addr := range s.cfg.Listen {
 		go func(addr string) { errc <- s.listen(ctx, addr, handler) }(addr)
 	}
+	s.mu.Lock()
+	s.serveCtx = ctx
+	s.mu.Unlock()
+	s.startGitHub(ctx)
 	go s.loop(ctx)
 	go s.prebuildBase()
 	sctx, stopSampler := context.WithCancel(ctx)
@@ -671,7 +680,7 @@ func (s *Server) tailnetOK(ctx context.Context, remote string) (string, bool) {
 func (s *Server) loop(ctx context.Context) {
 	tick := time.NewTicker(200 * time.Millisecond) // exit records are a cheap stat; see checkRunning
 	defer tick.Stop()
-	lastGC, lastRelays, lastRetire := time.Time{}, time.Time{}, time.Time{}
+	lastGC, lastRelays, lastRetire, lastGitHub := time.Time{}, time.Time{}, time.Time{}, time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -681,6 +690,10 @@ func (s *Server) loop(ctx context.Context) {
 		}
 		s.checkRunning()
 		s.checkSessions()
+		if time.Since(lastGitHub) >= githubTick {
+			lastGitHub = time.Now()
+			s.tickGitHub()
+		}
 		if time.Since(lastRetire) > 10*time.Second {
 			s.mu.Lock()
 			failed := s.retireErr != ""
