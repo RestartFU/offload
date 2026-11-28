@@ -140,6 +140,47 @@ Unpaired tailnet callers may only discover a runner (and pair the first client),
 the URL names it by IP address, its hostname or tailnet name. Add any other DNS name to `hostnames` in the runner's `runner.toml`.
 The runner API refuses requests made by web pages.
 
+## GitHub Actions
+
+```bash
+offload github add ZenoMCPE          # or ORG/REPO; every runner that has podman
+offload github ls
+offload github rm ZenoMCPE
+```
+
+Workflows then use `runs-on: offload`. `add` uses your GitHub CLI login: GitHub wants the
+`admin:org` scope to manage an organization's runners (`repo` for a repository), and `add` says
+how to grant it when it's missing (`gh auth refresh -h github.com -s admin:org`). For a narrower
+credential, pass `--token` a fine-grained token with only "Self-hosted runners: write", as a
+value or a `cmd:`, `env:` or `file:` source.
+
+Each runner keeps its own runner scale set on GitHub (`offload-<runner>-<id>`) and tells GitHub how
+many jobs fit there right now. Scale sets share labels, so GitHub hands each job to a runner with
+room and holds it while none has any. Every job gets a one-job runner as an ordinary offload job:
+admission, CPU and memory limits (the runner's default CPU guarantee and 8G unless `--cpu`,
+`--cpu-max` or `--mem` say otherwise), memory booked from earlier runs, the ledger and the
+dashboard's GitHub tab. `--max N` caps how many run at once on each runner, `--labels` sets what
+`runs-on` matches, and `--on` picks runners. Adding it again, to give it a new token for example,
+keeps the settings you don't give.
+
+The container is new for every job. Docker works through podman inside it (`docker build`,
+`run`, `login`, `push`; not `buildx` or `compose`). A repository's jobs keep checkouts, the
+`actions/setup-*` tool cache, Go, cargo and npm caches and the inner image store warm between
+runs, each parallel job in a warm copy of its own. An organization's jobs start clean every time,
+because its repositories would otherwise share what one leaves for the next; `--shared-cache`
+keeps them warm when they all trust each other. It is chosen when the organization is added
+(`rm` it to change that).
+
+`github rm` stops the jobs and deletes the scale sets on GitHub. If GitHub can't be reached or the
+token no longer works, it keeps retrying and says so; `--forget` removes it locally anyway (then
+delete the scale set under Settings → Actions → Runners).
+
+The token stays on each runner (mode 0600 in its state directory) so it can keep talking to
+GitHub. Workflows can't read it; anything running directly on the runner host as its user,
+such as an `offload run --host` job, could. A workflow can read its own job's runner
+configuration, as on any self-hosted runner, so don't run pull requests from forks of public
+repositories here.
+
 ## Dashboard
 
 ```bash
@@ -156,6 +197,10 @@ A local web page covering every runner:
   took, queued jobs included, finishes. A pause survives runner restarts.
 - **Containers.** Every job and session with live CPU and memory against its guarantee and
   limit. Open one to follow its logs, see its details, or cancel it.
+- **GitHub.** GitHub Actions jobs running on the runners, with links to their runs, and each
+  connected organization or repository: which runners take its jobs, how many more fit, and the
+  `runs-on` line to copy. Add an organization or repository there (with this machine's gh login
+  or a pasted token) and remove one, as `offload github add` and `rm` do.
 - **Activity.** Statistics on finished jobs: success rate, out-of-memory kills, wait times,
   CPU time, warm-file rate, and per command its run times and how much of its guaranteed CPU it
   really uses.

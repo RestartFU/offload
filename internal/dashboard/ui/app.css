@@ -72,6 +72,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; }
 body {
   background: var(--page);
@@ -140,7 +141,7 @@ select:focus-visible, input:focus-visible, button:focus-visible, a:focus-visible
 
 /* Sections & cards */
 section { margin-bottom: 28px; }
-.section-head { display: flex; align-items: baseline; gap: 12px; margin: 0 0 12px; }
+.section-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin: 0 0 12px; }
 .section-head h2 { font-size: 15px; font-weight: 650; margin: 0; letter-spacing: -0.005em; }
 .section-head .muted { font-size: 13px; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
@@ -251,6 +252,101 @@ tbody tr.sel { background: color-mix(in srgb, var(--accent) 9%, transparent); }
 
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; margin-bottom: 16px; }
 
+/* GitHub */
+.tabs .count { margin-left: 7px; min-width: 18px; padding: 0 6px; border-radius: 999px; background: var(--accent); color: #fff; font-size: 11px; font-weight: 650; line-height: 18px; text-align: center; font-variant-numeric: tabular-nums; }
+.gh-summary { margin-left: auto; color: var(--ink-2); font-size: 13px; }
+.gh-summary b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+td.gh-job { min-width: 260px; }
+.gh-job .name { font-weight: 550; overflow-wrap: anywhere; }
+.gh-job .where { font-size: 12.5px; margin-top: 1px; }
+.icon-link { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 7px; color: var(--ink-2); }
+.icon-link:hover { background: var(--hover); color: var(--ink); }
+.icon-link svg, .subtle-link svg, .btn svg { width: 14px; height: 14px; flex: none; }
+.grid.gh-owners { grid-template-columns: repeat(auto-fill, minmax(min(100%, 500px), 1fr)); }
+.gh-owner-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; }
+.gh-owner-head h3 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
+.subtle-link { display: inline-flex; align-items: center; gap: 4px; color: var(--ink-2); font-size: 12.5px; text-decoration: none; }
+.subtle-link:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+.runs-on { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.runs-on code, .snippet code { background: var(--surface-2); padding: 4px 8px; border-radius: 6px; color: var(--ink); }
+.btn { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; }
+.btn.copy { padding: 3px 9px; font-size: 12.5px; color: var(--ink-2); }
+.btn.copy:hover { color: var(--ink); }
+.btn.copy.done { color: var(--good-ink); }
+.gh-runners { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); align-items: center; gap: 10px 14px; margin-top: 14px; }
+.gh-runner { display: contents; }
+.gh-runner .n { font-weight: 600; }
+.gh-runner > .chip { justify-self: start; }
+.gh-runner .room { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; font-size: 12.5px; min-width: 0; }
+.crit-text { color: var(--critical-ink); }
+.runs-on-row { display: inline-flex; align-items: center; gap: 6px; }
+.runs-on-row code { background: var(--surface-2); padding: 2px 6px; border-radius: 5px; color: var(--ink); }
+.slots { display: flex; flex-wrap: wrap; gap: 3px; }
+.slots .cell { width: 14px; height: 14px; aspect-ratio: auto; border-radius: 3px; display: block; }
+.slots .cell:hover { box-shadow: none; }
+.onboarding { padding: 28px 30px; max-width: 760px; }
+.onboarding h2 { margin: 0 0 6px; font-size: 18px; font-weight: 650; letter-spacing: -0.015em; text-wrap: balance; }
+.onboarding > p { margin: 0; max-width: 62ch; }
+.onboarding .small { font-size: 12.5px; margin-top: 18px; }
+.onboarding code { font-size: 12.5px; }
+.steps { list-style: none; counter-reset: step; margin: 22px 0 0; padding: 0; display: grid; gap: 16px; }
+.steps li { counter-increment: step; display: grid; grid-template-columns: 26px 1fr; gap: 4px 12px; }
+.steps li::before { content: counter(step); grid-row: span 2; width: 24px; height: 24px; border-radius: 50%; background: var(--surface-2); color: var(--ink); display: grid; place-items: center; font-size: 12.5px; font-weight: 650; }
+.steps .what { padding-top: 2px; }
+.snippet { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gh-head-sub { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 8px; font-size: 13px; }
+.drawer-head h2 { overflow-wrap: anywhere; }
+.btn.primary { background: var(--ink); color: var(--page); border-color: var(--ink); }
+.btn.primary:hover { background: color-mix(in srgb, var(--ink) 86%, var(--page)); }
+.btn.primary:disabled { opacity: .55; }
+.btn svg { width: 14px; height: 14px; }
+.section-head .push { margin-left: auto; align-self: center; }
+.gh-foot { align-items: center; }
+.gh-actions { margin-left: auto; display: inline-flex; gap: 8px; }
+.gh-actions .btn { padding: 3px 10px; font-size: 12.5px; }
+.small-or { font-size: 12.5px; }
+.gh-form { margin-bottom: 16px; padding: 18px 22px 20px; max-width: 880px; }
+.gh-form-head { display: flex; align-items: center; margin-bottom: 6px; }
+.gh-form-head h3 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
+.gh-field { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 4px 18px; padding: 12px 0; border: 0; border-top: 1px solid var(--grid); margin: 0; min-width: 0; }
+.gh-field:first-of-type { border-top: 0; }
+.gh-field > label, .gh-field > legend { padding: 6px 0 0; font-weight: 550; float: left; }
+.gh-field .control { min-width: 0; display: grid; gap: 8px; }
+.gh-field .hint { color: var(--ink-2); font-size: 12.5px; }
+.gh-field .hint code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; color: var(--ink); }
+input[type="text"], input[type="password"], input[type="number"] {
+  height: 34px; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 0 10px; font-size: 13.5px; width: 100%; max-width: 420px;
+}
+input[type="text"]:focus-visible, input[type="password"]:focus-visible, input[type="number"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+input::placeholder { color: color-mix(in srgb, var(--ink-2) 80%, transparent); }
+input[type="number"] { max-width: 180px; }
+.choices { display: grid; gap: 8px; }
+.choices.inline { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.choice { display: flex; align-items: flex-start; gap: 9px; cursor: pointer; line-height: 1.4; }
+.choice input { margin: 3px 0 0; accent-color: var(--accent); flex: none; }
+.choice b { font-weight: 550; }
+.choice .muted { font-size: 12.5px; }
+.choice:has(input:disabled) { cursor: default; opacity: .6; }
+.token-row input { max-width: 420px; font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace; }
+.gh-form-result { display: grid; gap: 8px; }
+.gh-form-result:not(:empty) { margin: 6px 0 4px; }
+.gh-form-result .msg { white-space: pre-wrap; }
+.gh-form-result .snippet { margin-top: 6px; }
+.gh-form-actions { display: flex; gap: 10px; padding-top: 14px; border-top: 1px solid var(--grid); }
+.gh-form-actions .btn { padding: 6px 16px; }
+.alert.good svg { color: var(--good); }
+::selection { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+@media (max-width: 760px) {
+  .gh-field { grid-template-columns: 1fr; }
+  .gh-actions { margin-left: 0; }
+  .gh-form { padding: 16px; }
+  .gh-summary { margin-left: 0; flex-basis: 100%; }
+  .gh-runners { grid-template-columns: max-content 1fr; }
+  .gh-runner .room { grid-column: 1 / -1; margin-top: -4px; }
+  .runs-on { margin-left: 0; }
+  .onboarding { padding: 20px; }
+}
+
 /* Drawer */
 .drawer {
   position: fixed; top: 0; right: 0; bottom: 0; width: min(720px, 100vw); z-index: 30;
@@ -306,7 +402,10 @@ pre.log .gap { color: #8a929c; }
 .tooltip .r span { color: var(--ink-2); }
 
 @media (max-width: 760px) {
-  .topbar { padding: 0 16px; gap: 14px; }
+  .topbar { padding: 0 16px; gap: 12px; }
+  .brand .word { display: none; }
+  .tabs { min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .tabs a { padding: 0 8px; white-space: nowrap; }
   main { padding: 16px 16px 48px; }
   .live .txt { display: none; }
   .theme-switch button[aria-pressed="false"] { display: none; }

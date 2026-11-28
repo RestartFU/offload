@@ -203,6 +203,7 @@ func (s *Server) restore() {
 		s.jobs[j.ID] = j
 	}
 	s.restoreSessions()
+	s.restoreGitHub()
 }
 
 func (s *Server) findSlot(id string) *slot {
@@ -265,6 +266,10 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(spec.Argv) == 0 {
 		out.err(400, "argv is empty")
+		return
+	}
+	if spec.GitHub != "" {
+		out.err(400, "github is set by the runner for its own GitHub jobs, not by clients")
 		return
 	}
 	if spec.Dir != "" {
@@ -1107,6 +1112,9 @@ func (s *Server) finishLocked(j *job, state string, code *int, reason string) {
 		j.CPUSeconds = cpu // from the last sample: an older wrapper, or no exit record
 	}
 	s.recordJobLocked(j)
+	if j.Spec.GitHub != "" {
+		s.githubFinishedLocked(j)
+	}
 	s.cleanupCredentials(j)
 	s.releaseCPUsLocked(j.cpus)
 	j.cpus = nil
@@ -1454,6 +1462,23 @@ func (s *Server) gcRepoStoresLocked() {
 		if stale(filepath.Join(work, k, ".used")) {
 			log.Printf("gc: removing git store of %s (unused for %s)", k, s.cfg.cacheRetain)
 			discard(filepath.Join(work, k))
+		}
+	}
+	busyGitHub := map[string]bool{}
+	for _, j := range s.jobs {
+		if !api.Terminal(j.State) && j.Spec.GitHub != "" {
+			busyGitHub[j.Spec.GitHub] = true
+		}
+	}
+	entries, _ = os.ReadDir(s.cacheDir("github"))
+	for _, e := range entries { // GitHub pools' dependency caches: cache/github/<pool>
+		k := e.Name()
+		if !e.IsDir() || busyGitHub[k] {
+			continue
+		}
+		if stale(s.cacheDir("github", k, ".used")) {
+			log.Printf("gc: removing GitHub dependency caches of %s (unused for %s)", k, s.cfg.cacheRetain)
+			discard(s.cacheDir("github", k))
 		}
 	}
 	entries, _ = os.ReadDir(s.cacheDir("scoped"))

@@ -60,6 +60,9 @@ func commandSig(argv []string) string {
 func effectiveArgv(argv []string) []string { return api.CommandWords(argv) }
 
 func histKey(spec api.JobSpec) string {
+	if spec.GitHub != "" {
+		return "github:" + spec.GitHub
+	}
 	k := spec.WorkspaceKey
 	if k == "" {
 		k = "-"

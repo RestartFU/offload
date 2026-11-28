@@ -2,7 +2,10 @@
 package api
 
 import (
+	"fmt"
+	"net/url"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -107,6 +110,9 @@ type JobSpec struct {
 	SubmitID     string `json:"submit_id,omitempty"`
 	IgnoreRules  string `json:"ignore_rules,omitempty"`
 	IgnoreGlobal string `json:"ignore_global,omitempty"`
+	// GitHub is the GitHub runner pool (its owner's key) this job runs a one-job runner for; set
+	// by the runner, which creates these jobs itself.
+	GitHub string `json:"github,omitempty"`
 }
 
 // Job is a job record as returned by the runner.
@@ -132,6 +138,8 @@ type Job struct {
 	// WriteBackError says the runner couldn't collect the job's edits (none were sent back).
 	WriteBackError string     `json:"write_back_error,omitempty"`
 	WriteBack      *WriteBack `json:"write_back,omitempty"`
+	// GitHub describes a GitHub runner job: its runner and, once it took one, the GitHub job.
+	GitHub *GitHubJob `json:"github,omitempty"`
 	// PeakMem is the job's peak memory use (cgroup memory.peak), once it has finished.
 	PeakMem int64 `json:"peak_mem,omitempty"`
 	// AutoMem is set when the runner chose the memory limit (from history or the profile)
@@ -271,6 +279,75 @@ type Session struct {
 	CPUSeconds    float64    `json:"cpu_seconds,omitempty"`
 }
 
+// GitHubAdd is the body of POST /v1/github: run GitHub Actions jobs for an organization or
+// repository on this runner. The token must be able to manage its self-hosted runners.
+type GitHubAdd struct {
+	URL       string `json:"url"`                  // https://github.com/OWNER or https://github.com/OWNER/REPO
+	Token     string `json:"token"`                // kept on the runner to talk to GitHub
+	TokenFrom string `json:"token_from,omitempty"` // "gh" (the client's gh login) or "token", for listings
+	// Settings a request leaves out (nil labels or max, zero resources) keep an existing pool's,
+	// so re-adding to refresh a token changes nothing else. A new pool gets the defaults.
+	Labels    []string  `json:"labels,omitempty"` // what workflows put in runs-on; default "offload"
+	Max       *int      `json:"max,omitempty"`    // most GitHub jobs at once here; 0 is as many as fit
+	Resources Resources `json:"resources"`        // for each GitHub job
+	// SharedCache lets an organization's repositories share warm checkouts, caches and images.
+	// Without it each of its jobs starts clean; a repository's jobs always share them.
+	// Nil keeps an existing pool's choice (it is fixed once the pool exists).
+	SharedCache *bool `json:"shared_cache,omitempty"`
+	// CreateOnly refuses the request if the runner already has the pool (the dashboard only adds).
+	CreateOnly bool `json:"create_only,omitempty"`
+}
+
+// GitHub runner pool states.
+const (
+	GitHubPreparing = "preparing" // installing the actions runner or building its environment
+	GitHubListening = "listening" // taking GitHub jobs
+	GitHubFailed    = "failed"    // can't reach GitHub or start runners; retrying
+	GitHubRemoving  = "removing"
+)
+
+// GitHubPool is one organization or repository a runner takes GitHub Actions jobs for: its own
+// runner scale set on GitHub, which tells GitHub how many jobs fit here right now.
+type GitHubPool struct {
+	Owner      string     `json:"owner"`     // "ORG" or "ORG/REPO"
+	URL        string     `json:"url"`       // https://github.com/<owner>
+	ScaleSet   string     `json:"scale_set"` // this runner's scale set name on GitHub
+	ScaleSetID int        `json:"scale_set_id,omitempty"`
+	Labels     []string   `json:"labels"`
+	Max        int        `json:"max,omitempty"`
+	Resources  Resources  `json:"resources"`
+	TokenFrom  string     `json:"token_from,omitempty"`
+	Shared     bool       `json:"shared"` // jobs reuse warm state (a repository, or --shared-cache)
+	CreatedAt  time.Time  `json:"created_at"`
+	State      string     `json:"state"`
+	Detail     string     `json:"detail,omitempty"` // what preparing waits for, or why it failed
+	Capacity   int        `json:"capacity"`         // GitHub jobs it accepts now, running ones included
+	Assigned   int        `json:"assigned"`         // jobs GitHub has given it, running ones included
+	Running    int        `json:"running"`          // its runners that are running a GitHub job
+	Starting   int        `json:"starting"`         // its runners waiting to start or for their job
+	Runs       int        `json:"runs"`             // GitHub jobs it has finished
+	LastRun    *time.Time `json:"last_run,omitempty"`
+}
+
+// GitHubJob is what a GitHub runner job is doing on GitHub, once its runner has taken a job.
+type GitHubJob struct {
+	Owner    string `json:"owner"`  // the pool's owner
+	Runner   string `json:"runner"` // the one-job runner's name on GitHub
+	RunnerID int    `json:"runner_id,omitempty"`
+	Repo     string `json:"repo,omitempty"`     // OWNER/REPO
+	Workflow string `json:"workflow,omitempty"` // e.g. "pr.yml"
+	Job      string `json:"job,omitempty"`      // the job's display name
+	RunID    int64  `json:"run_id,omitempty"`
+	Event    string `json:"event,omitempty"`
+	URL      string `json:"url,omitempty"`    // the workflow run on GitHub
+	Result   string `json:"result,omitempty"` // GitHub's verdict: succeeded, failed, cancelled…
+	// Where the runner keeps the job's state: a shared slot of the pool (Slot >= 0) or the job's
+	// own directory (-1), and the actions runner it mounts. Set by the runner only.
+	Slot    int    `json:"slot"`
+	Dir     string `json:"dir,omitempty"`
+	Install string `json:"install,omitempty"`
+}
+
 // ProfileInfo summarizes a runner profile in /v1/status.
 type ProfileInfo struct {
 	Kind        string    `json:"kind"`            // "job" or "session"
@@ -390,3 +467,36 @@ func MatchProfile(profiles map[string]ProfileInfo, argv []string) string {
 	}
 	return best
 }
+
+var githubNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
+
+// GitHubOwner parses an organization or repository (ORG, ORG/REPO or its https URL) into its
+// owner path and canonical URL.
+func GitHubOwner(raw string) (owner, canonical string, err error) {
+	s := strings.TrimSpace(raw)
+	if !strings.Contains(s, "://") {
+		s = "https://github.com/" + s
+	}
+	u, perr := url.Parse(s)
+	var parts []string
+	if perr == nil {
+		for _, p := range strings.Split(strings.Trim(u.Path, "/"), "/") {
+			if p != "" {
+				parts = append(parts, p)
+			}
+		}
+	}
+	ok := perr == nil && u.Scheme == "https" && (u.Host == "github.com" || u.Host == "www.github.com") && u.User == nil && u.RawQuery == "" && u.Fragment == "" &&
+		(len(parts) == 1 || len(parts) == 2)
+	for _, p := range parts {
+		ok = ok && githubNameRE.MatchString(p) && p != "." && p != ".."
+	}
+	if !ok {
+		return "", "", fmt.Errorf("%q is not a github.com organization or repository: use ORG, ORG/REPO or https://github.com/ORG[/REPO]", raw)
+	}
+	owner = strings.Join(parts, "/")
+	return owner, "https://github.com/" + owner, nil
+}
+
+// GitHubKey names an owner's GitHub runner pool on a runner: "acme" or "acme--app".
+func GitHubKey(owner string) string { return strings.ToLower(strings.ReplaceAll(owner, "/", "--")) }

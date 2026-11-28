@@ -38,7 +38,7 @@ func (s *Server) ledgerPath() string { return filepath.Join(s.cfg.StateDir, "led
 // recordJobLocked appends a finished job to the ledger.
 func (s *Server) recordJobLocked(j *job) {
 	e := api.LedgerEntry{
-		ID: j.ID, Kind: "job", Command: commandSig(j.Spec.Argv), Workspace: j.Spec.WorkspaceKey,
+		ID: j.ID, Kind: "job", Command: ledgerCommand(j), Workspace: j.Spec.WorkspaceKey,
 		Profile: j.Spec.Profile, Client: j.Spec.Client, Caller: j.Caller, Runtime: j.Runtime,
 		State: j.State, ExitCode: j.ExitCode, Reason: j.Reason, OOM: isOOMReason(j.Reason),
 		CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, Resources: j.Resources, MemFrom: j.MemFrom,
@@ -273,4 +273,15 @@ func (s *Server) gcLedger() {
 		log.Printf("ledger gc: %v", err)
 		os.Remove(tmpPath)
 	}
+}
+
+// ledgerCommand groups a job's statistics: by its command, or a GitHub job by repository and name.
+func ledgerCommand(j *job) string {
+	if g := j.GitHub; g != nil {
+		if g.Repo == "" {
+			return "GitHub runner for " + g.Owner + " (took no job)"
+		}
+		return "GitHub " + g.Repo + " · " + g.Job
+	}
+	return commandSig(j.Spec.Argv)
 }

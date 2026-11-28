@@ -158,6 +158,45 @@ which first gets the MCP client's original `initialize` (under a reserved id who
 shim swallows) and `notifications/initialized`. Pings are answered locally while stopped, so a
 keepalive doesn't wake it. Server state, such as a running game, doesn't survive this.
 
+## GitHub Actions
+
+- **Scale sets, one per runner.** Their names carry the runner's ID, because a removal deletes
+  the scale set: two runners of the same name must never share one. GitHub's runner scale sets
+  hand out jobs to a listener that
+  says how many it can take (`maxCapacity` on each poll). Each runner registers its own scale set
+  per owner with the same labels and advertises what fits there now. GitHub then routes across
+  runners itself: no runner knows another, there is no leader, and a dead runner only takes its
+  own share offline. This was checked before building it: two scale sets sharing a label never
+  got more jobs than they advertised, and the rest waited on GitHub.
+- **A one-job runner per assigned job.** For every job GitHub assigns, the runner generates a
+  just-in-time runner config and queues an offload job running the actions runner with it. The
+  config is a credential, so it lives only in the job's secrets. When GitHub assigns fewer jobs
+  than there are runners still waiting for one, the extra runners are stopped and removed on
+  GitHub. Runners that end without ever taking a job pause the pool, so a broken setup can't spin.
+- **Capacity counts the runner's real room** (CPU with overbooking, memory room, queued work)
+  in units of one GitHub job, booked at its learned peak. Several pools on one runner each see
+  the same room; the few jobs that over-assigns wait in offload's queue like any job.
+- **The token is stored on the runner,** in the pool's record (one atomic 0600 write, so settings
+  and token never disagree after a crash), unlike job secrets: the listener needs it for as long
+  as the pool exists. It defaults to the client's gh login because that is the setup with no
+  extra steps; a fine-grained token with only the runners permission is the narrow option.
+- **Shared, read-only actions runner.** The runner installs the release itself (checked daily)
+  and mounts it into jobs as an overlay, so a job can't plant anything in the next one's runner.
+- **Warm state only within one trust domain.** A runner is started before GitHub picks its job,
+  so its mounts can't depend on the repository. Writable state (work directory with checkouts and
+  tool cache, the inner image store, dependency caches, a rustup layer) therefore persists only
+  where every job is the same trust domain: a repository's pool, or an organization added with
+  `--shared-cache`. There it lives in slots, one job at a time, and its dependency caches in
+  `cache/github/<owner>`, a tree no client's workspace key can name; otherwise each job gets its
+  own, deleted when it ends. The slot and paths come from the runner's own job record: a client's job
+  can't name a GitHub pool.
+- **A removal finishes only once GitHub confirms it** (or the scale set is already gone), so a
+  timeout never leaves a scale set nobody knows about. A token that no longer works would block
+  it forever, so `rm --forget` is the way out.
+- **Nested podman, not a docker daemon.** Inner containers share the job container's
+  namespaces and cgroup, so offload's limits cover them and nothing needs real privileges. The
+  job container gets the `nested_sandbox` permissions, as flatpak sessions do.
+
 ## Client networking
 
 A job or session with network "client" runs with `--network=none --device /dev/net/tun

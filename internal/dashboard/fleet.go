@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,17 +39,18 @@ type fleet struct {
 
 type runnerState struct {
 	host     *client.Host
-	key      string        // its key in fleet.runners: the runner's ID, or its URL
-	Name     string        `json:"name"` // unique here: a runner's own name, or name (address) for a second one
-	URL      string        `json:"url"`
-	Online   bool          `json:"online"`
-	Current  bool          `json:"current"` // online, on our protocol, with metrics, ledger and the log viewer
-	Error    string        `json:"error,omitempty"`
-	LastSeen time.Time     `json:"last_seen"`
-	Status   *api.Status   `json:"status,omitempty"`
-	Metrics  *api.Metrics  `json:"metrics,omitempty"`
-	Jobs     []api.Job     `json:"jobs"`
-	Sessions []api.Session `json:"sessions"`
+	key      string           // its key in fleet.runners: the runner's ID, or its URL
+	Name     string           `json:"name"` // unique here: a runner's own name, or name (address) for a second one
+	URL      string           `json:"url"`
+	Online   bool             `json:"online"`
+	Current  bool             `json:"current"` // online, on our protocol, with metrics, ledger and the log viewer
+	Error    string           `json:"error,omitempty"`
+	LastSeen time.Time        `json:"last_seen"`
+	Status   *api.Status      `json:"status,omitempty"`
+	Metrics  *api.Metrics     `json:"metrics,omitempty"`
+	Jobs     []api.Job        `json:"jobs"`
+	Sessions []api.Session    `json:"sessions"`
+	GitHub   []api.GitHubPool `json:"github"`
 }
 
 func newFleet(cfg *client.Config) *fleet {
@@ -190,6 +192,7 @@ func (f *fleet) pollOne(ctx context.Context, r *runnerState) {
 		met      *api.Metrics
 		jobs     []api.Job
 		sessions []api.Session
+		github   []api.GitHubPool
 		wg       sync.WaitGroup
 		errs     [2]error
 	)
@@ -218,9 +221,10 @@ func (f *fleet) pollOne(ctx context.Context, r *runnerState) {
 	if st.Proto != api.Proto {
 		werr = fmt.Errorf("it speaks protocol %d and this machine %d, so its jobs and sessions can't be shown: run offload host upgrade", st.Proto, api.Proto)
 	} else {
-		wg.Add(2)
+		wg.Add(3)
 		go func() { defer wg.Done(); errs[0] = h.Do(ctx, "GET", "/v1/jobs", nil, &jobs) }()
 		go func() { defer wg.Done(); errs[1] = h.Do(ctx, "GET", "/v1/sessions", nil, &sessions) }()
+		go func() { defer wg.Done(); _ = h.Do(ctx, "GET", "/v1/github", nil, &github) }() // older runners have none
 		if st.Metrics {
 			wg.Add(1)
 			go func() {
@@ -241,7 +245,7 @@ func (f *fleet) pollOne(ctx context.Context, r *runnerState) {
 	}
 	r.Online, r.LastSeen, r.Status, r.Metrics = true, time.Now(), &st, met
 	if werr != nil {
-		r.Error, r.Jobs, r.Sessions = werr.Error(), []api.Job{}, []api.Session{}
+		r.Error, r.Jobs, r.Sessions, r.GitHub = werr.Error(), []api.Job{}, []api.Session{}, []api.GitHubPool{}
 		return
 	}
 	r.Error = ""
@@ -251,7 +255,10 @@ func (f *fleet) pollOne(ctx context.Context, r *runnerState) {
 	if sessions == nil {
 		sessions = []api.Session{}
 	}
-	r.Jobs, r.Sessions = jobs, sessions
+	if github == nil {
+		github = []api.GitHubPool{}
+	}
+	r.Jobs, r.Sessions, r.GitHub = jobs, sessions, github
 }
 
 // fleetView is the body of GET /api/fleet.
@@ -273,6 +280,62 @@ func (f *fleet) snapshot(version string) fleetView {
 	}
 	sort.Slice(v.Runners, func(a, b int) bool { return v.Runners[a].Name < v.Runners[b].Name })
 	return v
+}
+
+// hostsByID are the runners with these IDs, current ones only, each with its latest status and
+// the name the page shows. missing lists the IDs that aren't (gone, replaced, or not answering).
+func (f *fleet) hostsByID(ids []string) (hosts []*client.Host, missing []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, id := range ids {
+		r := f.runners[id]
+		if r == nil || r.Status == nil || r.Status.ID != id || !r.currentLocked() {
+			missing = append(missing, id)
+			continue
+		}
+		h, st := *r.host, *r.Status
+		h.Status, h.Name = &st, r.Name
+		hosts = append(hosts, &h)
+	}
+	return hosts, missing
+}
+
+// githubHolder finds runner id for a GitHub removal: its host while it answers and last reported
+// a pool for owner, else why it can't be used.
+func (f *fleet) githubHolder(id, owner string) (*client.Host, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.runners[id]
+	switch {
+	case r == nil:
+		return nil, "runner " + id + " is gone"
+	case !r.Online:
+		return nil, r.Name + " isn't answering; remove it again once it is"
+	}
+	for _, p := range r.GitHub {
+		if strings.EqualFold(p.Owner, owner) {
+			h := *r.host
+			h.Name = r.Name
+			return &h, ""
+		}
+	}
+	return nil, r.Name + " didn't list " + owner + " just now; check it and remove it again"
+}
+
+// githubHolderIDs are the runners that last reported a pool for owner.
+func (f *fleet) githubHolderIDs(owner string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ids []string
+	for id, r := range f.runners {
+		for _, p := range r.GitHub {
+			if strings.EqualFold(p.Owner, owner) {
+				ids = append(ids, id)
+				break
+			}
+		}
+	}
+	return ids
 }
 
 func (f *fleet) host(name string) *client.Host {

@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RestartFU/offload/internal/api"
@@ -153,6 +154,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/logs", s.handleLogs)
 	mux.HandleFunc("POST /api/stop", s.handleStop)
 	mux.HandleFunc("POST /api/pause", s.handlePause)
+	mux.HandleFunc("POST /api/github/add", s.handleGitHubAdd)
+	mux.HandleFunc("POST /api/github/remove", s.handleGitHubRemove)
 	return s.guard(mux)
 }
 
@@ -530,4 +533,137 @@ func (s *server) handlePause(w http.ResponseWriter, r *http.Request) {
 	}
 	s.fleet.setStatus(req.Host, h, &st)
 	writeJSON(w, st)
+}
+
+type githubResult struct {
+	Runner string `json:"runner"`
+	Error  string `json:"error,omitempty"`
+}
+
+// handleGitHubAdd connects an organization or repository on runners, as `offload github add`.
+// A token from the page is used exactly as typed: never as a cmd:, env: or file: source.
+func (s *server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Owner  string   `json:"owner"`
+		Token  string   `json:"token"` // empty: this machine's gh login
+		Labels []string `json:"labels"`
+		Max    *int     `json:"max"`
+		Shared *bool    `json:"shared"`
+		On     []string `json:"on"` // runner IDs, as the page chose them
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<14)).Decode(&req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	owner, _, err := api.GitHubOwner(req.Owner)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if len(req.On) == 0 {
+		writeErr(w, 400, "pick at least one runner")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	token, from := strings.TrimSpace(req.Token), "token"
+	if token == "" {
+		if token, err = client.GitHubLoginToken(ctx, owner); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		from = "gh"
+	}
+	if strings.ContainsAny(token, " \t\r\n") {
+		writeErr(w, 400, "that doesn't look like a GitHub token")
+		return
+	}
+	// The runners the page showed, by ID: the token goes to no other runner, not even a new one
+	// under the same name.
+	rows, missing := s.fleet.hostsByID(req.On)
+	if len(missing) > 0 {
+		writeErr(w, 409, "a runner you chose changed or stopped answering; pick the runners again")
+		return
+	}
+	hosts, err := client.GitHubTargets(rows, nil)
+	if err != nil || len(hosts) != len(rows) {
+		ok := map[*client.Host]bool{}
+		for _, h := range hosts {
+			ok[h] = true
+		}
+		var bad []string
+		for _, h := range rows {
+			if !ok[h] {
+				bad = append(bad, h.Name)
+			}
+		}
+		writeErr(w, 400, strings.Join(bad, ", ")+" can't take GitHub jobs (not paired with this machine, no podman, or another version)")
+		return
+	}
+	add := api.GitHubAdd{URL: owner, Token: token, TokenFrom: from, Labels: req.Labels, Max: req.Max, SharedCache: req.Shared, CreateOnly: true}
+	results := make([]githubResult, len(hosts))
+	var wg sync.WaitGroup
+	for i, h := range hosts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i].Runner = h.Name
+			if _, err := client.GitHubAddTo(ctx, h, add); err != nil {
+				results[i].Error = err.Error()
+			}
+		}()
+	}
+	wg.Wait()
+	s.fleet.poke()
+	writeJSON(w, map[string]any{"results": results})
+}
+
+// handleGitHubRemove stops taking an owner's GitHub jobs on every runner that does (forget: only
+// here, when GitHub can't be told).
+func (s *server) handleGitHubRemove(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Owner  string   `json:"owner"`
+		Forget bool     `json:"forget"`
+		On     []string `json:"on"` // runner IDs; empty: every one that listed the pool
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	owner, _, err := api.GitHubOwner(req.Owner)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	ids := req.On
+	if len(ids) == 0 {
+		ids = s.fleet.githubHolderIDs(owner)
+	}
+	if len(ids) == 0 {
+		writeErr(w, 404, "no runner takes GitHub jobs for "+owner)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	// Every runner asked for gets a result: one that can't be checked is reported, never skipped.
+	results := make([]githubResult, len(ids))
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		h, why := s.fleet.githubHolder(id, owner)
+		if h == nil {
+			results[i] = githubResult{Runner: id, Error: why}
+			continue
+		}
+		results[i].Runner = h.Name
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := client.GitHubRemoveFrom(ctx, h, owner, req.Forget); err != nil {
+				results[i].Error = err.Error()
+			}
+		}()
+	}
+	wg.Wait()
+	s.fleet.poke()
+	writeJSON(w, map[string]any{"results": results})
 }
