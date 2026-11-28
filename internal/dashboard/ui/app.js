@@ -1222,9 +1222,13 @@ function renderGhForm() {
   const pools = existing ? owners.get(existing).map(([, p]) => p) : [];
   f.cacheNote.textContent = repo ? "A repository's jobs keep warm caches: they are all the same repository's code."
     : pools.length ? `${existing} has ${pools.some((p) => p.shared) ? "shared" : "clean"} caches on its other runners; these runners get what you choose here.` : "";
-  if (!f.labelsEdited) { // workflows already target a connected owner's labels: new runners should match them
-    if (pools.length) { f.labels.value = (pools[0].labels || ["offload"]).join(", "); f.inherited = owner.toLowerCase(); }
-    else if (f.inherited !== owner.toLowerCase()) { f.labels.value = "offload"; f.inherited = null; } // a refresh that briefly loses the pool keeps them
+  // Workflows already target a connected owner's labels, so new runners start from them: the
+  // labels each owner last reported, kept apart from the field, so neither a refresh that briefly
+  // loses the pool nor a cancelled edit changes what is offered.
+  f.reported ||= new Map();
+  if (pools.length) f.reported.set(owner.toLowerCase(), (pools[0].labels || ["offload"]).join(", "));
+  if (!f.labelsEdited) {
+    f.labels.value = f.reported.get(owner.toLowerCase()) || "offload";
     f.preview.textContent = "runs-on: " + runsOn(f.labels.value.split(",").map((x) => x.trim()).filter(Boolean));
   }
   f.exists.hidden = !existing;
