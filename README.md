@@ -170,7 +170,7 @@ keeps the settings you don't give. New labels take effect on a runner once the j
 finish, because GitHub can't relabel a scale set in use.
 
 The container is new for every job. Docker works through podman inside it (`docker build`,
-`run`, `login`, `push`; not `buildx` or `compose`), so `docker/setup-buildx-action` and
+`run`, `exec`, `login`, `push`; not `buildx` or `compose`), so `docker/setup-buildx-action` and
 `docker/build-push-action` fail there: build with `docker build` and push with `docker push`.
 Short image names without an alias, such as `golang:1.26`, default to Docker Hub.
 `gh` and `skopeo` are installed. A repository's jobs keep checkouts, the `actions/setup-*` tool cache, Go,

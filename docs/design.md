@@ -201,7 +201,10 @@ keepalive doesn't wake it. Server state, such as a running game, doesn't survive
   it forever, so `rm --forget` is the way out.
 - **Nested podman, not a docker daemon.** Inner containers share the job container's
   namespaces and cgroup, so offload's limits cover them and nothing needs real privileges. The
-  job container gets the `nested_sandbox` permissions, as flatpak sessions do.
+  job container gets the `nested_sandbox` permissions, as flatpak sessions do, plus SYS_PTRACE:
+  `docker exec` opens the inner container's namespaces, and when its PID 1 has dropped root
+  (postgres) that takes ptrace access. Each job has its own PID namespace, so it reaches only
+  the job's own processes.
 
 ## Client networking
 

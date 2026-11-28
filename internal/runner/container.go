@@ -722,6 +722,7 @@ type runSpec struct {
 	ReadOnly                            []string // host paths mounted read-only at the same path
 	Volumes                             []string // "host:container"
 	Devices                             []string
+	CapAdd                              []string
 	Env                                 map[string]string
 	Interactive                         bool   // keep stdin (sessions)
 	NestedSandbox                       bool   // flatpak/bubblewrap inside: unmask /proc, no seccomp filter
@@ -896,6 +897,9 @@ func (s *Server) podmanRun(r runSpec) []string {
 		// container owns, not the host's.
 		a = append(a, "--security-opt", "unmask=ALL", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN", "--cap-add", "NET_ADMIN")
 	}
+	for _, c := range r.CapAdd {
+		a = append(a, "--cap-add", c)
+	}
 	// Only this workload's own paths: never the runner's main socket or the shared runtime dir.
 	for _, p := range r.Same {
 		if _, err := os.Stat(p); err == nil {
@@ -972,6 +976,10 @@ func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets s
 			r.RustupLayer = filepath.Join(g.Dir, "rustup")
 		}
 		r.NestedSandbox = true
+		// docker exec joins an inner container's namespaces, which takes ptrace access to its
+		// PID 1; images that drop root (postgres) need SYS_PTRACE for that. It reaches only the
+		// processes this job can see, in its own PID namespace.
+		r.CapAdd = []string{"SYS_PTRACE"}
 		if _, err := os.Stat("/dev/fuse"); err == nil {
 			r.Devices = append(r.Devices, "/dev/fuse")
 		}

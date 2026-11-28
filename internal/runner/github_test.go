@@ -268,6 +268,9 @@ func TestGitHubOrgJobsStartClean(t *testing.T) {
 	if strings.Contains(argv, "/opt/offload/go/pkg/mod") || !strings.Contains(argv, j.GitHub.Dir+"/containers:/var/lib/containers") {
 		t.Fatalf("org job mounts shared caches or misses its own store: %s", argv)
 	}
+	if !strings.Contains(argv, "--cap-add SYS_PTRACE") {
+		t.Fatalf("docker exec into a container that drops root needs SYS_PTRACE: %s", argv)
+	}
 	p.Shared = true
 	if err := (&githubScaler{s: s, p: p, session: f}).Scale(context.Background(), stats(2)); err != nil {
 		t.Fatal(err)
