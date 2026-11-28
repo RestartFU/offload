@@ -80,6 +80,7 @@ type Host struct {
 	derived  bool           // Token is the one stored for this URL by `host pair`, not configured
 	named    bool           // Name comes from client.toml
 	estimate *api.Resources // what this runner said the job at hand would get (see estimate)
+	placed   int            // earlier shards of this run that went here (see markPlaced)
 }
 
 // dialRaw opens a plain connection to the runner (for stream upgrades).
@@ -668,7 +669,7 @@ func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []s
 		}
 		r.Mem = min(r.Mem, st.Capacity.Mem)
 		f := h.free()
-		score := float64(h.Priority) * 1000
+		score := float64(h.Priority)*1000 - 400*float64(h.placed) // spread shards unless only this one can start now
 		unbooked := st.Capacity.CPU - st.Allocated.CPU - st.Pending.CPU
 		if f.CPU >= r.CPU && f.Mem >= r.Mem {
 			score += 400 // can start right away

@@ -2,6 +2,7 @@ package client
 
 import (
 	"archive/tar"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
@@ -48,6 +49,8 @@ type RunOptions struct {
 	Ephemeral   bool
 	Detach      bool
 	Quiet       bool
+	Shards      int    // run the command this many times, spread over runners (see asShard)
+	ArtifactDir string // where --get outputs land, relative to the working directory
 	Argv        []string
 }
 
@@ -89,7 +92,14 @@ func runInPlace(argv []string, env map[string]string) (int, error) {
 // memory limit from earlier runs, and an out-of-memory kill is retried once with twice the memory.
 // Ctrl-C (or SIGTERM) cancels the remote job.
 func Run(o RunOptions) (int, error) {
+	if i, n, ok := shardChild(); ok {
+		openShardReport()
+		o = asShard(o, i, n)
+	}
 	if inJob() && o.On == "" {
+		if o.Shards > 0 { // all of it here, as the one and only shard
+			o = asShard(o, 1, 1)
+		}
 		return runInPlace(o.Argv, o.Env) // the command keeps normal SIGPIPE behavior
 	}
 	// A closed output (piped into `head`) must surface as a write error, which ends following
@@ -105,6 +115,12 @@ func Run(o RunOptions) (int, error) {
 		if c := path.Clean(filepath.ToSlash(a)); c == "." || c == "/" || c == ".." || strings.HasPrefix(c, "../") || path.IsAbs(c) {
 			return 1, fmt.Errorf("--get %s: name the outputs, relative to the working directory and inside it (for example --get dist)", a)
 		}
+	}
+	if o.Shards > 1 {
+		return runShards(ctx, o)
+	}
+	if o.Shards == 1 {
+		o = asShard(o, 1, 1)
 	}
 	spec := api.JobSpec{Argv: o.Argv, Env: o.Env, Profile: o.Profile, Resources: o.Resources,
 		Artifacts: o.Artifacts, Fresh: o.Fresh, Ephemeral: o.Ephemeral, Client: clientLabel(), Detached: o.Detach}
@@ -158,7 +174,7 @@ func Run(o RunOptions) (int, error) {
 
 	var snap map[string]fileSig
 	if len(o.Artifacts) > 0 {
-		snap = snapshotArtifacts(o.Artifacts)
+		snap = snapshotArtifacts(o.ArtifactDir, o.Artifacts)
 	}
 	moves := 0
 	for attempt := 0; ; attempt++ {
@@ -270,6 +286,7 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 					avail = append(avail, x)
 				}
 			}
+			markPlaced(avail)
 			h, err = PickFor(avail, spec, "job")
 			if err != nil && len(busy) > 0 { // the runners left can't take it: wait for a busy one
 				if berr := backoff("every runner that fits is busy"); berr != nil {
@@ -319,6 +336,7 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 			return nil, j, fmt.Errorf("%s: %w", h.Name, err)
 		}
 		rememberJob(j.ID, h)
+		reportPlaced(h)
 		if !o.Detach {
 			// Before the upload that makes the job runnable: a job may ask for credentials or
 			// dial out the moment it starts, and the runner only waits briefly for a client.
@@ -839,7 +857,7 @@ func finish(ctx context.Context, h *Host, j *api.Job, ws *Workspace, o RunOption
 	if len(o.Artifacts) > 0 && j.State == api.StateExited {
 		if !j.HasArtifact {
 			artErr = fmt.Errorf("the job produced none of the requested artifacts (%s)", strings.Join(o.Artifacts, ", "))
-		} else if kept, err := fetchArtifacts(ctx, h, j.ID, ".", snap); err != nil {
+		} else if kept, err := fetchArtifacts(ctx, h, j.ID, cmp.Or(o.ArtifactDir, "."), snap); err != nil {
 			artErr = fmt.Errorf("artifacts: %w", err)
 		} else if kept > 0 {
 			artErr = fmt.Errorf("%d artifact(s) not written over local changes (saved beside them)", kept)
@@ -963,9 +981,12 @@ func sigOf(root *os.Root, rel string, fi fs.FileInfo) fileSig {
 
 // snapshotArtifacts records what the --get destinations look like before the job runs, so the
 // download never replaces anything that appeared or changed here meanwhile.
-func snapshotArtifacts(paths []string) map[string]fileSig {
+func snapshotArtifacts(dir string, paths []string) map[string]fileSig {
 	snap := map[string]fileSig{}
-	tree, err := os.OpenRoot(".")
+	if dir == "" {
+		dir = "."
+	}
+	tree, err := os.OpenRoot(dir)
 	if err != nil {
 		return snap
 	}

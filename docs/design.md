@@ -81,6 +81,15 @@ For each (workspace, "program subcommand") it keeps the last five peaks (`memory
 for the largest plus 25%. An OOM counts as twice its limit, and the client retries such a job
 once with double memory. A nested `offload run` (OFFLOAD_JOB is set) runs in place.
 
+### Shards
+
+A shard is the same `offload run` started again as a child process, which reads its index from
+the environment. Every child therefore keeps all of a single run's behavior (retries, moves,
+reattach, cancel on interrupt, credential relays) without a second copy of it. A child starts
+only once the previous one has created its job and reported the runner on fd 3: the runner
+counts that job as pending, and pick holds every earlier shard against a runner as much as the
+"can start now" bonus, so shards spread unless only an already used runner can start one now.
+
 ## Git
 
 Each workspace key has a bare `shared.git` object store. Slots are ordinary repositories

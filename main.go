@@ -69,9 +69,13 @@ Client:
                        tailnet; "laptop" / 10.233.0.1 inside the job is this machine's localhost)
       --fresh          start from an empty workspace (cold build)
       --ephemeral      drop the workspace afterwards
+      --shards N       run N copies spread over runners; each gets OFFLOAD_SHARD (1..N) and
+                       OFFLOAD_SHARDS, and {shard} / {shards} in CMD are replaced: e.g.
+                       --shards 4 -- cargo nextest run --partition count:{shard}/{shards}
+                       (no write-back; --get outputs land in shards/<i>/)
       --detach, -d     print the job id and return
       --quiet, -q      no offload status lines
-  offload attach ID                  follow a job to the end (Ctrl-C detaches)
+  offload attach ID...               follow jobs to the end (Ctrl-C detaches)
   offload cancel ID                  stop a job or session
   offload get ID [DIR]               download a job's --get artifacts
   offload ps [--all]                 jobs and sessions on every runner
@@ -138,10 +142,14 @@ func main() {
 	case "run":
 		code, err = cmdRun(args)
 	case "attach", "logs":
-		if len(args) != 1 {
-			die("usage: offload attach ID")
+		switch {
+		case len(args) == 0:
+			die("usage: offload attach ID...")
+		case len(args) == 1:
+			code, err = client.Attach(args[0])
+		default:
+			code, err = client.AttachAll(args)
 		}
-		code, err = client.Attach(args[0])
 	case "cancel", "stop":
 		if len(args) != 1 {
 			die("usage: offload cancel ID")
@@ -260,7 +268,11 @@ func cmdRun(args []string) (int, error) {
 	fs.BoolVar(&o.Detach, "d", false, "")
 	fs.BoolVar(&o.Quiet, "quiet", false, "")
 	fs.BoolVar(&o.Quiet, "q", false, "")
+	fs.IntVar(&o.Shards, "shards", 0, "")
 	_ = fs.Parse(fl)
+	if o.Shards < 0 || o.Shards > client.MaxShards {
+		return 2, fmt.Errorf("--shards wants 1 to %d", client.MaxShards)
+	}
 	if rest == nil {
 		rest = fs.Args()
 	}
