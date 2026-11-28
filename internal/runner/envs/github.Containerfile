@@ -9,5 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN printf '%s\n' '[containers]' 'netns="host"' 'userns="host"' 'ipcns="host"' 'utsns="host"' \
       'cgroupns="host"' 'cgroups="disabled"' 'log_driver="k8s-file"' \
       '[engine]' 'cgroup_manager="cgroupfs"' 'events_logger="file"' 'runtime="crun"' \
-      > /etc/containers/containers.conf
+      > /etc/containers/containers.conf \
+    && mkdir -p /etc/containers/registries.conf.d \
+    && echo 'unqualified-search-registries = ["docker.io"]' > /etc/containers/registries.conf.d/docker-hub.conf
 ENV BUILDAH_ISOLATION=chroot RUNNER_ALLOW_RUNASROOT=1
