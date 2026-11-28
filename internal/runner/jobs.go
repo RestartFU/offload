@@ -387,6 +387,11 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if s.paused { // 403 sends the client on to another runner
+		_ = os.RemoveAll(j.dir)
+		out.err(403, "runner is paused (resume it in offload dashboard)")
+		return
+	}
 	if spec.WorkspaceKey == "" {
 		if err := os.MkdirAll(filepath.Join(j.dir, "work"), 0o755); err != nil {
 			out.err(500, err.Error())

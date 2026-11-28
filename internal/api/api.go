@@ -313,6 +313,7 @@ type Status struct {
 	Images       int                    `json:"images,omitempty"`
 	Features     []string               `json:"features"` // cgroup controllers in use: cpuset, io…
 	Accepting    bool                   `json:"accepting"`
+	Paused       bool                   `json:"paused,omitempty"` // by the developer (POST /v1/admin/pause)
 	Proto        int                    `json:"proto"`
 	Reason       string                 `json:"reason,omitempty"`
 	Started      time.Time              `json:"started"`             // when this runner process started

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"math"
 	"net"
@@ -65,6 +66,8 @@ type Server struct {
 	tokensLock func() // releases the lifetime lock on the tokens file
 	upgrading  bool   // a new binary is being swapped in: start nothing
 	retireErr  string // set while workloads of another version couldn't be confirmed stopped
+	paused     bool   // the developer paused this runner: start no new work
+	pauseMu    sync.Mutex
 
 	whoisMu sync.Mutex
 	whois   map[string]whoisEntry
@@ -107,6 +110,8 @@ func New(cfg *Config, version string) (*Server, error) {
 	s.loadMetrics()
 	s.started = time.Now()
 	s.loadImageUse()
+	_, err = os.Stat(s.pausedPath())
+	s.paused = err == nil
 	// Held for the daemon's lifetime: `runner reset-pairing` resets the file directly only when
 	// no runner holds it.
 	if release, err := tryLock(s.tokensPath() + ".lock"); err != nil {
@@ -177,6 +182,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/estimate", s.handleEstimate)
 	mux.HandleFunc("POST /v1/admin/reset-pairing-checked", s.handleResetPairing)
 	mux.HandleFunc("POST /v1/admin/pair", s.handlePair)
+	mux.HandleFunc("POST /v1/admin/pause", s.handlePause)
 	mux.HandleFunc("GET /v1/metrics", s.handleMetrics)
 	mux.HandleFunc("GET /v1/metrics/series", s.handleSeries)
 	mux.HandleFunc("GET /v1/ledger", s.handleLedger)
@@ -776,6 +782,9 @@ func (s *Server) status() api.Status {
 	if st.MemAvailable < s.cfg.memReserve {
 		st.Accepting, st.Reason = false, "host memory below reserve"
 	}
+	if s.paused {
+		st.Paused, st.Accepting, st.Reason = true, false, "paused"
+	}
 	if s.retireErr != "" {
 		st.Accepting, st.Reason = false, "not ready: "+s.retireErr
 	}
@@ -992,6 +1001,43 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 		s.saveMetrics() // os.Exit skips Serve's shutdown, and with it the sampler's final save
 		os.Exit(0)
 	}()
+}
+
+func (s *Server) pausedPath() string { return filepath.Join(s.cfg.StateDir, "paused") }
+
+// handlePause pauses or resumes the runner. Paused, it refuses new jobs and sessions; work it
+// already took, queued jobs included, carries on.
+func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Paused bool `json:"paused"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<10)).Decode(&req); err != nil {
+		writeErr(w, 400, "bad request: "+err.Error())
+		return
+	}
+	s.pauseMu.Lock()
+	var err error
+	if req.Paused {
+		err = os.WriteFile(s.pausedPath(), nil, 0o600)
+	} else if err = os.Remove(s.pausedPath()); errors.Is(err, fs.ErrNotExist) {
+		err = nil
+	}
+	if err == nil {
+		s.mu.Lock()
+		changed := s.paused != req.Paused
+		s.paused = req.Paused
+		s.mu.Unlock()
+		if changed {
+			log.Printf("%s by %s", map[bool]string{true: "paused", false: "resumed"}[req.Paused], callerOf(r))
+		}
+	}
+	s.pauseMu.Unlock()
+	if err != nil {
+		writeErr(w, 500, "pause: "+err.Error())
+		return
+	}
+	s.kick()
+	writeJSON(w, s.status())
 }
 
 // allocatedBusyLocked counts running jobs and live sessions.

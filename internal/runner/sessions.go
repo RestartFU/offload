@@ -204,6 +204,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 			s.builds[tag].sessionAsked = time.Now()
 		}
 	}
+	if s.paused { // 503: clients try another runner, or with --on wait for this one
+		out.err(http.StatusServiceUnavailable, "runner is paused (resume it in offload dashboard)")
+		return
+	}
 	// Capacity first: a full runner says so at once (503), and the client tries another.
 	live := 0
 	for _, x := range s.sessions {
