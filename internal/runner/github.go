@@ -86,6 +86,7 @@ type githubPoolRecord struct {
 	Runs       int           `json:"runs"`
 	LastRun    *time.Time    `json:"last_run,omitempty"`
 	Removing   bool          `json:"removing,omitempty"`
+	Forget     bool          `json:"forget,omitempty"`
 }
 
 func (s *Server) githubDir() string { return filepath.Join(s.cfg.StateDir, "github") }
@@ -110,7 +111,7 @@ func githubScaleSetName(runner, id string) string {
 func (p *githubPool) record() githubPoolRecord {
 	return githubPoolRecord{Owner: p.Owner, URL: p.URL, ScaleSet: p.ScaleSet, ScaleSetID: p.ScaleSetID, Labels: p.Labels,
 		Max: p.Max, Resources: p.Resources, TokenFrom: p.TokenFrom, Shared: p.Shared, CreatedAt: p.CreatedAt, Runs: p.Runs,
-		LastRun: p.LastRun, Removing: p.State == api.GitHubRemoving}
+		LastRun: p.LastRun, Removing: p.State == api.GitHubRemoving, Forget: p.forget}
 }
 
 func (p *githubPool) save() error {
@@ -139,7 +140,7 @@ func (s *Server) restoreGitHub() {
 		tok, _ := os.ReadFile(filepath.Join(dir, "token"))
 		p := s.newPool(key, dir, rec, strings.TrimSpace(string(tok)))
 		if rec.Removing {
-			p.State = api.GitHubRemoving
+			p.State, p.forget = api.GitHubRemoving, rec.Forget
 		}
 		s.github[key] = p
 	}
@@ -453,13 +454,25 @@ type githubScaler struct {
 func (sc *githubScaler) Scale(ctx context.Context, m *scaleset.RunnerScaleSetMessage) error {
 	s, p := sc.s, sc.p
 	if m != nil && len(m.JobAvailableMessages) > 0 {
-		ids := make([]int64, 0, len(m.JobAvailableMessages))
+		// An offer can answer a poll made before a pause or before other work took the room:
+		// claim only what fits now. GitHub offers the rest to other scale sets.
+		s.mu.Lock()
+		room := s.githubCapacityLocked(p) - max(p.Assigned, len(s.githubJobsLocked(p)))
+		if time.Now().Before(p.pauseTil) || p.State == api.GitHubRemoving {
+			room = 0
+		}
+		s.mu.Unlock()
+		var ids []int64
 		for _, ja := range m.JobAvailableMessages {
-			ids = append(ids, ja.RunnerRequestID)
+			if len(ids) < room {
+				ids = append(ids, ja.RunnerRequestID)
+			}
 		}
 		// Left unacknowledged on failure (the listener reconnects), so GitHub offers them again.
-		if _, err := sc.session.AcquireJobs(ctx, ids); err != nil {
-			return fmt.Errorf("claiming jobs GitHub offered: %w", err)
+		if len(ids) > 0 {
+			if _, err := sc.session.AcquireJobs(ctx, ids); err != nil {
+				return fmt.Errorf("claiming jobs GitHub offered: %w", err)
+			}
 		}
 	}
 	s.mu.Lock()
@@ -883,6 +896,12 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, owner+" is still being removed here; try again in a minute")
 		return
 	}
+	shared := req.SharedCache || strings.Contains(owner, "/")
+	if p != nil && p.Shared != shared {
+		// Runners already started keep the state they were given: changing it means starting over.
+		writeErr(w, http.StatusConflict, "--shared-cache can only be chosen when "+owner+" is added: run offload github rm "+owner+" first")
+		return
+	}
 	dir := filepath.Join(s.githubDir(), key)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		writeErr(w, 500, err.Error())
@@ -897,7 +916,7 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		s.github[key] = p
 	}
 	p.token, p.Labels, p.Max, p.Resources, p.TokenFrom = req.Token, req.Labels, req.Max, res, req.TokenFrom
-	p.Shared = req.SharedCache || strings.Contains(owner, "/")
+	p.Shared = shared
 	if ss != nil && p.ScaleSet == ss.Name {
 		p.ScaleSetID = ss.ID
 	}
@@ -930,13 +949,20 @@ func (s *Server) handleGitHubRemove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "this runner doesn't take GitHub jobs for that owner")
 		return
 	}
-	if r.URL.Query().Get("forget") == "1" {
-		p.forget = true
-	}
-	if p.State != api.GitHubRemoving {
-		p.State, p.Detail = api.GitHubRemoving, "stopping its runners"
+	forget := r.URL.Query().Get("forget") == "1"
+	if p.State != api.GitHubRemoving || (forget && !p.forget) {
+		state, detail, was := p.State, p.Detail, p.forget
+		p.State, p.forget = api.GitHubRemoving, p.forget || forget
+		if state != api.GitHubRemoving {
+			p.Detail = "stopping its runners"
+		}
 		if err := p.save(); err != nil {
+			p.State, p.Detail, p.forget = state, detail, was
 			writeErr(w, 500, "can't record the removal: "+err.Error())
+			return
+		}
+		if state == api.GitHubRemoving {
+			writeJSON(w, s.githubViewLocked(p)) // finishRemoval picks up forget
 			return
 		}
 		for _, j := range s.githubJobsLocked(p) {

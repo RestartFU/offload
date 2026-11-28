@@ -167,7 +167,8 @@ The container is new for every job. Docker works through podman inside it (`dock
 `actions/setup-*` tool cache, Go, cargo and npm caches and the inner image store warm between
 runs, each parallel job in a warm copy of its own. An organization's jobs start clean every time,
 because its repositories would otherwise share what one leaves for the next; `--shared-cache`
-keeps them warm when they all trust each other.
+keeps them warm when they all trust each other. It is chosen when the organization is added
+(`rm` it to change that).
 
 `github rm` stops the jobs and deletes the scale sets on GitHub. If GitHub can't be reached or the
 token no longer works, it keeps retrying and says so; `--forget` removes it locally anyway (then

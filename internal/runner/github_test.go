@@ -272,3 +272,27 @@ func TestGitHubOrgJobsStartClean(t *testing.T) {
 		t.Fatalf("a client job claiming a GitHub pool: %d %s", w.Code, w.Body)
 	}
 }
+
+// A paused runner leaves GitHub's offers for other scale sets.
+func TestGitHubPausedRunnerClaimsNothing(t *testing.T) {
+	s, p, f := newGitHubServer(t)
+	s.paused = true
+	offer := &scaleset.RunnerScaleSetMessage{JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 9}}}}
+	if err := (&githubScaler{s: s, p: p, session: f}).Scale(context.Background(), offer); err != nil || len(f.acquired) != 0 {
+		t.Fatalf("paused runner claimed %v: %v", f.acquired, err)
+	}
+}
+
+// rm --forget survives a restart in the middle of the removal.
+func TestGitHubForgetSurvivesRestart(t *testing.T) {
+	s, p, _ := newGitHubServer(t)
+	p.State, p.forget = api.GitHubRemoving, true
+	if err := p.save(); err != nil {
+		t.Fatal(err)
+	}
+	s2 := &Server{cfg: s.cfg, jobs: map[string]*job{}, github: map[string]*githubPool{}}
+	s2.restoreGitHub()
+	if r := s2.github["acme"]; r == nil || r.State != api.GitHubRemoving || !r.forget {
+		t.Fatalf("restored %+v", r)
+	}
+}

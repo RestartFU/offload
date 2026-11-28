@@ -268,6 +268,9 @@ func GitHubAdd(o GitHubOptions) error {
 		}()
 	}
 	wg.Wait()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && ok == 0 {
+		return errors.New("no runner confirmed it is taking GitHub jobs within 20 minutes: `offload github ls` shows where each one stands")
+	}
 	if ctx.Err() != nil {
 		fmt.Println("\nStill setting up in the background: `offload github ls` shows how far each runner got.")
 		return nil
