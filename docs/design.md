@@ -291,9 +291,13 @@ phone with every runner would spread those credentials to a device that is easie
   forget and write it back; it runs without phones and says so.
 - The phone keeps its token in Android Keystore. A tailnet address alone proves nothing there:
   with Tailscale off, `100.64.0.0/10` is whatever the phone's network says it is (carriers use
-  that range). The app resolves the name through the VPN, requires that VPN to have its own
-  route to the address, binds the socket to it and never uses a proxy, so the token only
-  travels inside WireGuard.
+  that range), and other VPNs take it with catch-all routes such as `0.0.0.0/1`. The app
+  resolves the name through the VPN, requires that VPN to have a tailnet address of its own and
+  a route to the computer that lies inside Tailscale's ranges, binds the socket to it and never
+  uses a proxy, so the token travels inside the VPN's tunnel. Android doesn't say which app
+  owns a VPN, so this can't tell Tailscale from another overlay that hands out the same range
+  (and then only if the computer's address falls inside that overlay's routes). Closing that
+  would take the phone authenticating the dashboard before it sends the token.
 
 The dashboard reads session output through `/v1/sessions/{id}/observe/{stream}`, which doesn't
 count as an attached client. The client streams count as attached, which keeps an idle session

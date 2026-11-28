@@ -246,8 +246,8 @@ The dashboard has to be running for the phone to connect (`offload dashboard --n
 user service keeps it up). It listens on this machine's tailnet addresses at the page's port,
 7421, and serves only the API there, to paired devices; started before Tailscale, it begins
 once Tailscale is up. `--no-remote` turns that off. Of several dashboards on one machine, the
-first serves phones and manages devices. If the phone can't connect, check that a firewall
-allows port 7421 on `tailscale0`.
+first one started without `--no-remote` serves phones and manages devices. If the phone can't
+connect, check that a firewall allows port 7421 on `tailscale0`.
 
 Build the app on an x86-64 runner with
 `offload run --platform linux/amd64 --get mobile/app/build/outputs/apk -- mobile/build.sh :app:assembleDebug`
