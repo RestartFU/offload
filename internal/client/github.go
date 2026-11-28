@@ -244,7 +244,7 @@ func GitHubAdd(o GitHubOptions) error {
 		how = "the token you gave"
 	}
 	key := api.GitHubKey(owner)
-	known := githubKnown(ctx, all, key)
+	hint := !strings.Contains(owner, "/") && o.Shared == nil && !githubKnown(ctx, all, key)
 	fmt.Printf("Taking GitHub jobs for %s on %s, with %s.\n\n", owner, joinNames(hosts), how)
 	width := 0
 	for _, h := range hosts {
@@ -334,11 +334,10 @@ func GitHubAdd(o GitHubOptions) error {
 		fmt.Print("GitHub can't relabel a runner that has jobs, so a runner still working takes no new jobs\n" +
 			"until they finish, then switches to the new labels.\n\n")
 	}
-	if !strings.Contains(owner, "/") && o.Shared == nil && !known {
+	if hint {
 		fmt.Printf("Each job starts with clean caches, because %s's repositories would otherwise share checkouts,\n"+
-			"dependency caches and docker images. The choice is made when an owner is added, so if they all\n"+
-			"trust each other, start over with warm caches:\n\n"+
-			"    offload github rm %s && offload github add %s --shared-cache\n\n", owner, owner, owner)
+			"dependency caches and docker images. If they all trust each other, keep them warm: that is chosen\n"+
+			"when an owner is added, so run offload github rm %s, then this add again with --shared-cache.\n\n", owner, owner)
 	}
 	return nil
 }
@@ -526,10 +525,20 @@ func GitHubRemove(raw string, on []string, forget bool) error {
 	return failed
 }
 
-// githubKnown reports whether any runner already takes the owner's jobs.
+// githubKnown reports whether any runner already takes the owner's jobs. It only decides a hint,
+// so a runner that doesn't answer within a few seconds counts as not having it.
 func githubKnown(ctx context.Context, hosts []*Host, key string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	found := make(chan bool, len(hosts))
 	for _, h := range hosts {
-		if pools, err := githubPools(ctx, h); err == nil && githubFind(pools, key) != nil {
+		go func() {
+			pools, err := githubPools(ctx, h)
+			found <- err == nil && githubFind(pools, key) != nil
+		}()
+	}
+	for range hosts {
+		if <-found {
 			return true
 		}
 	}

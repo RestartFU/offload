@@ -876,25 +876,29 @@ const workloadHash = (r, id) => `#/${r.jobs.some((j) => j.id === id && j.spec.gi
 const ghPool = (r, owner) => (r.github || []).find((p) => p.owner.toLowerCase() === (owner || "").toLowerCase());
 const ghSettings = (owner) => owner.includes("/") ? `https://github.com/${owner}/settings/actions/runners` : `https://github.com/organizations/${owner}/settings/actions/runners`;
 const agoCoarse = (t) => { const x = since(t); return x < 60 ? "just now" : x < 3600 ? Math.round(x / 60) + "m ago" : fmtDur(x) + " ago"; };
-// GitHub's usual self-hosted labels. Kept out of the copyable runs-on line when a pool has
-// labels of its own, since those say more about where a job goes.
-const GH_DEFAULT_LABELS = ["self-hosted", "linux", "x64", "arm64", "arm"];
+// Every offload runner is self-hosted Linux, so these never tell its runners apart: the copyable
+// runs-on line leaves them out when anything else is left.
+const GH_EVERYWHERE = ["self-hosted", "linux"];
+const GH_ARCHS = ["x64", "arm64", "arm"];
 const ghLabels = (p) => {
   const out = [], seen = new Set();
   for (const l of [...(p.system_labels || []), ...(p.labels || [])]) if (!seen.has(l.toLowerCase())) { seen.add(l.toLowerCase()); out.push(l); }
   return out;
 };
 const ghRunsOn = (labels) => {
-  const own = labels.filter((l) => !GH_DEFAULT_LABELS.includes(l.toLowerCase()));
+  const own = labels.filter((l) => !GH_EVERYWHERE.includes(l.toLowerCase()));
   return "runs-on: " + runsOn(own.length ? own : labels);
 };
 const labelChips = (labels) => labels.map((l, i) => [i ? " " : "", h("code", { class: "label" }, l)]).flat();
 const ghArch = (r) => ({ amd64: "x64", arm64: "arm64", arm: "arm" })[r.status?.arch] || r.status?.arch || "";
-// The labels a new organization's runners start with: GitHub's usual ones (with the architecture
-// when every chosen runner shares it) and offload.
-function ghDefaultLabels(runners) {
+// The labels chosen runners start with: base (GitHub's usual ones and offload, or what the owner's
+// runners share), its architecture replaced by the chosen runners' when they all share one.
+function ghDefaultLabels(runners, base = ["self-hosted", "linux", "offload"]) {
   const archs = [...new Set(runners.map(ghArch).filter(Boolean))];
-  return ["self-hosted", "linux", ...(archs.length === 1 ? archs : []), "offload"];
+  const out = base.filter((l) => !GH_ARCHS.includes(l.toLowerCase()));
+  const at = out.findIndex((l) => l.toLowerCase() === "linux") + 1;
+  out.splice(at, 0, ...(archs.length === 1 ? archs : []));
+  return out;
 }
 const runsOn = (labels) => (!labels?.length ? "offload" : labels.length === 1 ? labels[0] : "[" + labels.join(", ") + "]");
 const extIcon = () => glyphSVG(s("path", { d: "M6.5 3.5H4A1.5 1.5 0 0 0 2.5 5v7A1.5 1.5 0 0 0 4 13.5h7a1.5 1.5 0 0 0 1.5-1.5V9.5M9 2.5h4.5V7M13.5 2.5 7.5 8.5" }));
@@ -1300,7 +1304,7 @@ function renderGhForm() {
   const chosen = runners.filter((r) => f.picks?.get(r.status.id) && !holders.has(r.status.id));
   if (!f.labelsEdited) {
     const keys = sets.map(([, l]) => l.map((x) => x.toLowerCase()).sort().join(","));
-    const want = (sets.length && keys.every((k) => k === keys[0]) ? sets[0][1] : ghDefaultLabels(chosen)).join(", ");
+    const want = (sets.length && keys.every((k) => k === keys[0]) ? ghDefaultLabels(chosen, sets[0][1]) : ghDefaultLabels(chosen)).join(", ");
     if (f.labels.value !== want) f.labels.value = want;
   }
   const boxLabels = f.labels.value.split(",").map((x) => x.trim()).filter(Boolean);
