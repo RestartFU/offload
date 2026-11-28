@@ -876,6 +876,22 @@ const workloadHash = (r, id) => `#/${r.jobs.some((j) => j.id === id && j.spec.gi
 const ghPool = (r, owner) => (r.github || []).find((p) => p.owner.toLowerCase() === (owner || "").toLowerCase());
 const ghSettings = (owner) => owner.includes("/") ? `https://github.com/${owner}/settings/actions/runners` : `https://github.com/organizations/${owner}/settings/actions/runners`;
 const agoCoarse = (t) => { const x = since(t); return x < 60 ? "just now" : x < 3600 ? Math.round(x / 60) + "m ago" : fmtDur(x) + " ago"; };
+const GH_ARCHS = ["x64", "arm64", "arm"];
+const ghLabels = (p) => {
+  const out = [], seen = new Set();
+  for (const l of [...(p.system_labels || []), ...(p.labels || [])]) if (!seen.has(l.toLowerCase())) { seen.add(l.toLowerCase()); out.push(l); }
+  return out;
+};
+const labelChips = (labels) => labels.map((l, i) => [i ? " " : "", h("code", { class: "label" }, l)]).flat();
+const ghArch = (r) => ({ amd64: "x64", arm64: "arm64", arm: "arm" })[r.status?.arch] || r.status?.arch || "";
+// The labels chosen runners start with: GitHub's usual ones and offload, or what the owner's runners
+// share. An architecture label is the chosen runners' when they all share one, and left out if not.
+function ghDefaultLabels(runners, base) {
+  const archs = [...new Set(runners.map(ghArch).filter(Boolean))];
+  const arch = archs.length === 1 ? archs : [];
+  if (!base) return ["self-hosted", "linux", ...arch, "offload"];
+  return base.flatMap((l) => GH_ARCHS.includes(l.toLowerCase()) ? arch : [l]);
+}
 const runsOn = (labels) => (!labels?.length ? "offload" : labels.length === 1 ? labels[0] : "[" + labels.join(", ") + "]");
 const extIcon = () => glyphSVG(s("path", { d: "M6.5 3.5H4A1.5 1.5 0 0 0 2.5 5v7A1.5 1.5 0 0 0 4 13.5h7a1.5 1.5 0 0 0 1.5-1.5V9.5M9 2.5h4.5V7M13.5 2.5 7.5 8.5" }));
 const copyIcon = () => glyphSVG(s("rect", { x: "5.25", y: "5.25", width: "8.5", height: "8.5", rx: "1.5" }), s("path", { d: "M10.75 5.25V3.75a1.5 1.5 0 0 0-1.5-1.5h-5.5a1.5 1.5 0 0 0-1.5 1.5v5.5a1.5 1.5 0 0 0 1.5 1.5h1.5" }));
@@ -1098,14 +1114,10 @@ function ghAvatar(list) {
 function ownerCard(owner, list) {
   const first = list[0][1];
   const display = list.map(([, p]) => p.name).find(Boolean);
+  const key = (p) => ghLabels(p).map((l) => l.toLowerCase()).sort().join(",");
+  const sameLabels = list.every(([, p]) => key(p) === key(first));
   const snippet = "runs-on: " + runsOn(first.labels);
-  const sameLabels = list.every(([, p]) => runsOn(p.labels) === runsOn(first.labels));
   const sameCaches = list.every(([, p]) => !!p.shared === !!first.shared);
-  // GitHub's default labels: the ones every runner has here; the rest (an architecture) per runner.
-  const sys = list.map(([, p]) => p.system_labels || []);
-  const shared = sys[0].filter((l) => sys.every((x) => x.includes(l)));
-  const own = (p) => (p.system_labels || []).filter((l) => !shared.includes(l));
-  const sharedAll = list.every(([, p]) => !own(p).length);
   const finished = sum(list, ([, p]) => p.runs);
   const last = list.map(([, p]) => p.last_run).filter(Boolean).sort().pop();
   const per = first.resources;
@@ -1123,11 +1135,11 @@ function ownerCard(owner, list) {
         h("span", { class: "n" }, r.name),
         poolChip(p),
         h("div", { class: "room" }, slots(p), h("span", { class: p.state === "failed" ? "crit-text" : "muted" }, roomText(p)),
-          sameLabels ? null : h("span", { class: "runs-on-row" }, h("code", {}, "runs-on: " + runsOn(p.labels)), copyBtn("runs-on: " + runsOn(p.labels))),
+          sameLabels ? null : h("span", { class: "runs-on-row" }, ...labelChips(ghLabels(p)), copyBtn("runs-on: " + runsOn(ghLabels(p)))),
           sameCaches ? null : h("span", { class: p.shared ? "" : "muted" }, p.shared ? "shared caches" : "clean caches"),
-          own(p).length ? h("span", { class: "muted" }, "also ", ...own(p).map((l, i) => [i ? ", " : "", h("code", {}, l)]).flat()) : null)))),
-    shared.length ? h("div", { class: "gh-also muted" }, "Also matches GitHub's self-hosted labels: ",
-      ...shared.map((l, i) => [i ? ", " : "", h("code", {}, l)]).flat(), sharedAll ? "" : " (and each runner's own, below)") : null,
+          null)))),
+    sameLabels ? h("div", { class: "gh-also muted" }, "Labels ", ...labelChips(ghLabels(first)),
+      h("span", {}, " · a workflow runs here when these include every label it asks for")) : null,
     h("div", { class: "runner-foot gh-foot" },
       h("span", {}, "Each job ", h("b", {}, `${fmtCores(per.cpu)}–${fmtCores(per.cpu_max)} cores`), " · ", h("b", {}, fmtBytes(per.mem))),
       h("span", {}, h("b", {}, finished), " finished", last ? " · last one " + agoCoarse(last) : ""),
@@ -1164,7 +1176,8 @@ function ghFormEl() {
     return [input, h("label", { class: "choice" }, input, h("span", {}, h("b", {}, label), desc ? h("span", { class: "muted" }, desc) : null))];
   };
   f.owner = h("input", { type: "text", id: "gh-f-owner", placeholder: "ORG or ORG/REPO", autocomplete: "off", spellcheck: "false", "aria-describedby": "gh-f-owner-hint", oninput: () => renderGhForm() });
-  f.labels = h("input", { type: "text", id: "gh-f-labels", value: "offload", autocomplete: "off", spellcheck: "false", oninput: () => renderGhForm() });
+  f.labels = h("input", { type: "text", id: "gh-f-labels", value: "self-hosted, linux, offload", autocomplete: "off", spellcheck: "false", oninput: () => { f.labelsEdited = true; renderGhForm(); } });
+  f.archNote = h("span", {});
   f.labelsNote = h("div", { class: "gh-form-result", hidden: true });
   f.preview = h("code", {});
   let c;
@@ -1188,8 +1201,8 @@ function ghFormEl() {
       h("button", { type: "button", class: "icon-btn", "aria-label": "Close", onclick: closeGhForm }, s("svg", { viewBox: "0 0 16 16", width: 16, height: 16, "aria-hidden": "true" }, s("path", { d: "M4 4l8 8M12 4l-8 8", stroke: "currentColor", "stroke-width": 1.8, "stroke-linecap": "round" })))),
     field("Organization or repository", "gh-f-owner", f.owner, h("span", { id: "gh-f-owner-hint" }, "As on GitHub, like ", h("code", {}, "acme"), " or ", h("code", {}, "acme/app"), ".")),
     f.exists,
-    field("Workflows use", "gh-f-labels", f.labels, ["Labels, comma-separated. Workflows then say ", f.preview,
-      ". The runners also have GitHub's usual self-hosted labels, like ", h("code", {}, "self-hosted"), ", ", h("code", {}, "linux"), " and ", h("code", {}, "x64"), "."]),
+    field("Labels", "gh-f-labels", f.labels, ["Every label the runners get, comma-separated: GitHub's usual self-hosted ones and your own. ",
+      "A workflow runs here when these include every label it asks for, like ", f.preview, ".", f.archNote]),
     f.labelsNote,
     h("fieldset", { class: "gh-field" }, h("legend", {}, "Caches"), h("div", { class: "control" }, f.cacheChoices, f.cacheNote)),
     h("fieldset", { class: "gh-field" }, h("legend", {}, "Connect with"), h("div", { class: "control" }, h("div", { class: "choices" }, authGh, c), f.tokenRow)),
@@ -1204,7 +1217,7 @@ function ghFormEl() {
 
 function openGhForm() {
   state.ghFormOpen = true; state.ghFormMsg = null;
-  if (ghForm) { ghForm.picks = null; ghForm.runnerKey = null; ghForm.lastOwner = null; ghForm.cacheClean.checked = true; ghForm.labels.value = "offload"; }
+  if (ghForm) { ghForm.picks = null; ghForm.runnerKey = null; ghForm.lastOwner = null; ghForm.cacheClean.checked = true; ghForm.labelsEdited = false; }
   render();
   ghForm.root.scrollIntoView({ block: "nearest", behavior: "smooth" });
   ghForm.owner.focus();
@@ -1229,7 +1242,6 @@ function renderGhForm() {
   if (!state.ghFormOpen) return;
   const owners = state.ghOwners || new Map();
   const owner = ghOwnerInput();
-  f.preview.textContent = "runs-on: " + runsOn(f.labels.value.split(",").map((x) => x.trim()).filter(Boolean));
   if (owner !== f.lastOwner) { // sharing is chosen for the name at hand, never carried over
     f.lastOwner = owner;
     f.cacheClean.checked = true;
@@ -1242,17 +1254,14 @@ function renderGhForm() {
   const pools = existing ? owners.get(existing).map(([, p]) => p) : [];
   f.cacheNote.textContent = repo ? "A repository's jobs keep warm caches: they are all the same repository's code."
     : pools.length ? `${existing} has ${pools.some((p) => p.shared) ? "shared" : "clean"} caches on its other runners; these runners get what you choose here.` : "";
-  // Which labels new runners need depends on their hardware, which only the person knows: show
-  // what each of the owner's runners takes, and how GitHub matches, without suggesting a change.
-  // Rebuilt only when that changes, so a refresh never disturbs it.
-  const sets = existing ? owners.get(existing).map(([r, p]) => [r.name, runsOn(p.labels)]) : [];
-  const noteKey = (existing || "") + "|" + sets.map((x) => x.join("=")).join("|");
+  // Rebuilt only when the owner's runners or their labels change, so a refresh never disturbs it.
+  const sets = existing ? owners.get(existing).map(([r, p]) => [r.name, ghLabels(p)]) : [];
+  const noteKey = (existing || "") + "|" + sets.map(([n, l]) => n + "=" + l.join(",")).join("|");
   if (noteKey !== f.labelsNoteKey) {
     f.labelsNoteKey = noteKey;
     f.labelsNote.hidden = !sets.length;
     f.labelsNote.replaceChildren(...(sets.length ? [ghAlert("info",
-      h("div", {}, `${existing}'s runners take `, ...sets.map(([name, l], i) => [i ? ", " : "", h("code", {}, "runs-on: " + l), ` (${name})`]).flat(),
-        ". A workflow reaches a runner that has every label it asks for, so give these runners the labels of the workflows they should run."))] : []));
+      h("div", {}, `${existing}'s runners have `, ...sets.map(([name, l], i) => [i ? "; " : "", ...labelChips(l), ` (${name})`]).flat(), "."))] : []));
   }
   f.exists.hidden = !existing;
   if (existing) {
@@ -1277,11 +1286,23 @@ function renderGhForm() {
       const id = r.status.id;
       if (!f.picks.has(id)) f.picks.set(id, false);
       const has = holders.has(id);
-      const input = h("input", { type: "checkbox", value: id, checked: !has && f.picks.get(id), disabled: has, onchange: (e) => f.picks.set(id, e.target.checked) });
+      const input = h("input", { type: "checkbox", value: id, checked: !has && f.picks.get(id), disabled: has, onchange: (e) => { f.picks.set(id, e.target.checked); renderGhForm(); } });
       return h("label", { class: "choice" + (has ? " off" : "") }, input, h("span", {}, h("b", {}, r.name),
         h("span", { class: "muted" }, has ? " already connected" : ` ${fmtCores(r.status.capacity.cpu)} cores`)));
     }) : [h("span", { class: "muted" }, "No runner can take GitHub jobs: they need podman, and must be up to date.")]));
   }
+  // Until the box is edited it follows the choice: the labels the owner's runners already share,
+  // else GitHub's usual ones for the chosen runners and offload.
+  const chosen = runners.filter((r) => f.picks?.get(r.status.id) && !holders.has(r.status.id));
+  if (!f.labelsEdited) {
+    const keys = sets.map(([, l]) => l.map((x) => x.toLowerCase()).sort().join(","));
+    const want = (sets.length && keys.every((k) => k === keys[0]) ? ghDefaultLabels(chosen, sets[0][1]) : ghDefaultLabels(chosen)).join(", ");
+    if (f.labels.value !== want) f.labels.value = want;
+  }
+  const boxLabels = f.labels.value.split(",").map((x) => x.trim()).filter(Boolean);
+  f.preview.textContent = boxLabels.length ? "runs-on: " + runsOn(boxLabels) : "runs-on: …";
+  const archs = [...new Set(chosen.map(ghArch).filter(Boolean))];
+  f.archNote.textContent = archs.length > 1 ? ` The chosen runners differ in architecture (${archs.join(", ")}): list one only if every chosen runner has it.` : "";
   f.submit.disabled = !!state.ghFormBusy || (existing && ghRunners().every((r) => holders.has(r.status.id)));
   f.submit.textContent = state.ghFormBusy ? "Adding…" : "Add";
   const m = state.ghFormMsg;
@@ -1313,8 +1334,9 @@ async function submitGhForm() {
   if (f.authToken.checked && !token) return fail("Paste the token, or connect with your GitHub CLI login.", f.token);
   const max = f.max.value === "" ? 0 : Number(f.max.value);
   if (!Number.isInteger(max) || max < 0) return fail("Most jobs at once is a whole number, or empty.", f.max);
-  const body = { owner, token, on, max, labels: f.labels.value.split(",").map((x) => x.trim()).filter(Boolean) };
-  if (!body.labels.length) body.labels = ["offload"];
+  // What the box shows is exactly what the runners get: no defaults are added behind it.
+  const body = { owner, token, on, max, labels: f.labels.value.split(",").map((x) => x.trim()).filter(Boolean), system_labels: false };
+  if (!body.labels.length) return fail("Give the runners at least one label.", f.labels);
   if (!owner.includes("/")) body.shared = f.cacheShared.checked;
   state.ghFormBusy = true; state.ghFormMsg = null; render();
   try {

@@ -243,6 +243,8 @@ func GitHubAdd(o GitHubOptions) error {
 	if from == "token" {
 		how = "the token you gave"
 	}
+	key := api.GitHubKey(owner)
+	hint := !strings.Contains(owner, "/") && o.Shared == nil && githubNew(ctx, all, key)
 	fmt.Printf("Taking GitHub jobs for %s on %s, with %s.\n\n", owner, joinNames(hosts), how)
 	width := 0
 	for _, h := range hosts {
@@ -251,7 +253,6 @@ func GitHubAdd(o GitHubOptions) error {
 	line := func(h *Host, state, detail string) {
 		fmt.Printf("  %-*s  %-10s %s\n", width, h.Name, state, detail)
 	}
-	key := api.GitHubKey(owner)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	ok, draining := 0, 0
@@ -333,10 +334,10 @@ func GitHubAdd(o GitHubOptions) error {
 		fmt.Print("GitHub can't relabel a runner that has jobs, so a runner still working takes no new jobs\n" +
 			"until they finish, then switches to the new labels.\n\n")
 	}
-	if !strings.Contains(owner, "/") && o.Shared == nil && !githubSharedNow(ctx, hosts, owner) {
+	if hint {
 		fmt.Printf("Each job starts with clean caches, because %s's repositories would otherwise share checkouts,\n"+
-			"dependency caches and docker images. If they all trust each other, keep them warm with:\n\n"+
-			"    offload github add %s --shared-cache\n\n", owner, owner)
+			"dependency caches and docker images. If they all trust each other, keep them warm: that is chosen\n"+
+			"when an owner is added, so run offload github rm %s, then this add again with --shared-cache.\n\n", owner, owner)
 	}
 	return nil
 }
@@ -524,15 +525,22 @@ func GitHubRemove(raw string, on []string, forget bool) error {
 	return failed
 }
 
-// githubSharedNow reports whether a runner already keeps owner with shared caches (the choice is
-// fixed when an organization is added, so re-adding it for a new token keeps it).
-func githubSharedNow(ctx context.Context, hosts []*Host, owner string) bool {
+// githubNew reports whether every runner confirmed it doesn't take the owner's jobs yet. It only
+// decides a hint, so it waits a few seconds at most and a runner that doesn't answer means no.
+func githubNew(ctx context.Context, hosts []*Host, key string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	free := make(chan bool, len(hosts))
 	for _, h := range hosts {
-		if pools, err := githubPools(ctx, h); err == nil {
-			if p := githubFind(pools, api.GitHubKey(owner)); p != nil && p.Shared {
-				return true
-			}
+		go func() {
+			pools, err := githubPools(ctx, h)
+			free <- err == nil && githubFind(pools, key) == nil
+		}()
+	}
+	for range hosts {
+		if !<-free {
+			return false
 		}
 	}
-	return false
+	return true
 }

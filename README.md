@@ -152,7 +152,8 @@ Workflows then use `runs-on: offload`. The runners also carry the labels GitHub 
 self-hosted runner (`self-hosted`, `linux` and the architecture, such as `x64`), so workflows
 written for ordinary self-hosted runners match too. A connection made before these defaults
 existed keeps its own labels until you add it again with `--system-labels`;
-`--system-labels=false` leaves them off a new one. `add` uses your GitHub CLI login: GitHub wants the
+`--system-labels=false` leaves them off a new one. The dashboard's add form lists every label,
+GitHub's defaults included, and the runners get exactly what is in it. `add` uses your GitHub CLI login: GitHub wants the
 `admin:org` scope to manage an organization's runners (`repo` for a repository), and `add` says
 how to grant it when it's missing (`gh auth refresh -h github.com -s admin:org`). For a narrower
 credential, pass `--token` a fine-grained token with only "Self-hosted runners: write", as a
