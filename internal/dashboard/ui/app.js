@@ -1224,21 +1224,17 @@ function renderGhForm() {
   const pools = existing ? owners.get(existing).map(([, p]) => p) : [];
   f.cacheNote.textContent = repo ? "A repository's jobs keep warm caches: they are all the same repository's code."
     : pools.length ? `${existing} has ${pools.some((p) => p.shared) ? "shared" : "clean"} caches on its other runners; these runners get what you choose here.` : "";
-  // A workflow reaches a runner that has every label it asks for (more are fine). So the new runners
-  // need every label the owner's runners have: name the ones missing here and offer to add them.
-  // Rebuilt only when that changes, so a refresh never takes focus from the button.
-  const have = new Set(f.labels.value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean));
-  const missing = [...new Set(pools.flatMap((p) => p.labels || ["offload"]))].filter((l) => !have.has(l.toLowerCase()));
-  const noteKey = existing && missing.length ? existing + "|" + missing.join(",") : "";
+  // Which labels new runners need depends on their hardware, which only the person knows: show
+  // what each of the owner's runners takes, and how GitHub matches, without suggesting a change.
+  // Rebuilt only when that changes, so a refresh never disturbs it.
+  const sets = existing ? owners.get(existing).map(([r, p]) => [r.name, runsOn(p.labels)]) : [];
+  const noteKey = sets.map((x) => x.join("=")).join("|");
   if (noteKey !== f.labelsNoteKey) {
     f.labelsNoteKey = noteKey;
-    f.labelsNote.hidden = !noteKey;
-    f.labelsNote.replaceChildren(...(noteKey ? [ghAlert("warning",
-      h("div", {}, `${existing}'s workflows can ask for `, ...missing.map((l, i) => [i ? ", " : "", h("code", {}, l)]).flat(),
-        ", which these runners wouldn't have: such workflows won't reach them."),
-      h("div", { class: "snippet" }, h("button", { type: "button", class: "btn", onclick: () => {
-        f.labels.value = [...f.labels.value.split(",").map((x) => x.trim()).filter(Boolean), ...missing].join(", "); renderGhForm(); f.labels.focus();
-      } }, "Add " + missing.join(", "))))] : []));
+    f.labelsNote.hidden = !sets.length;
+    f.labelsNote.replaceChildren(...(sets.length ? [ghAlert("info",
+      h("div", {}, `${existing}'s runners take `, ...sets.map(([name, l], i) => [i ? ", " : "", h("code", {}, "runs-on: " + l), ` (${name})`]).flat(),
+        ". A workflow reaches a runner that has every label it asks for, so give these runners the labels of the workflows they should run."))] : []));
   }
   f.exists.hidden = !existing;
   if (existing) {
