@@ -368,7 +368,7 @@ function renderOverview() {
   renderKPIs(runners);
   const focused = document.activeElement?.dataset?.pause;
   $("#ov-runners").replaceChildren(...runners.map(runnerCard));
-  if (focused != null) [...document.querySelectorAll("#ov-runners [data-pause]")].find((b) => b.dataset.pause === focused)?.focus();
+  if (focused != null) [...document.querySelectorAll("#ov-runners [data-pause]")].find((b) => b.dataset.pause === focused)?.focus({ preventScroll: true });
   renderQueue(runners);
 }
 
