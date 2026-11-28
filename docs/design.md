@@ -203,8 +203,11 @@ keepalive doesn't wake it. Server state, such as a running game, doesn't survive
   namespaces and cgroup, so offload's limits cover them and nothing needs real privileges. The
   job container gets the `nested_sandbox` permissions, as flatpak sessions do, plus SYS_PTRACE:
   `docker exec` opens the inner container's namespaces, and when its PID 1 has dropped root
-  (postgres) that takes ptrace access. Each job has its own PID namespace, so it reaches only
-  the job's own processes.
+  (postgres) that takes ptrace access. All rootless containers share one user namespace, where
+  those capabilities hold, and a separate PID namespace doesn't fence them: a unix socket peer
+  hands out a pidfd. So a GitHub job gets its own network namespace (rootless podman's pasta)
+  with outbound access only. Its abstract sockets, ports and broadcasts stay inside the job,
+  and so do its inner containers and build steps, which share it.
 
 ## Client networking
 

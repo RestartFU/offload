@@ -173,6 +173,9 @@ The container is new for every job. Docker works through podman inside it (`dock
 `run`, `exec`, `login`, `push`; not `buildx` or `compose`), so `docker/setup-buildx-action` and
 `docker/build-push-action` fail there: build with `docker build` and push with `docker push`.
 Short image names without an alias, such as `golang:1.26`, default to Docker Hub.
+Each job has a network of its own with outbound access: what it and its containers listen on
+stays inside the job (reach it on `localhost`; `-p` changes nothing), and the runner's own
+`localhost` is out of reach.
 `gh` and `skopeo` are installed. A repository's jobs keep checkouts, the `actions/setup-*` tool cache, Go,
 cargo and npm caches and the inner image store warm between runs, each parallel job in a warm
 copy of its own. An organization's jobs start clean every time,
