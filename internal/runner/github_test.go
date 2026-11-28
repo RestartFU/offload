@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/actions/scaleset"
+	"github.com/actions/scaleset/listener"
 
 	"github.com/RestartFU/offload/internal/api"
 )
@@ -347,5 +349,77 @@ func TestGitHubSystemLabelsOnlyWhenChosen(t *testing.T) {
 	p.systemLabels = true
 	if got := p.scaleSetLabels(); len(got) != 4 || got[0] != "self-hosted" {
 		t.Fatalf("labels %v", got)
+	}
+}
+
+type fakeScaleSets struct {
+	ss    *scaleset.RunnerScaleSet
+	calls []string
+}
+
+func (f *fakeScaleSets) GetRunnerScaleSet(context.Context, int, string) (*scaleset.RunnerScaleSet, error) {
+	f.calls = append(f.calls, "get")
+	return f.ss, nil
+}
+
+func (f *fakeScaleSets) CreateRunnerScaleSet(_ context.Context, ss *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error) {
+	f.calls = append(f.calls, "create")
+	made := *ss
+	made.ID = 2
+	f.ss = &made
+	return f.ss, nil
+}
+
+func (f *fakeScaleSets) DeleteRunnerScaleSet(context.Context, int) error {
+	f.calls = append(f.calls, "delete")
+	f.ss = nil
+	return nil
+}
+
+// GitHub keeps a scale set's labels whatever an update says, so new labels make a new scale set,
+// once the old one may go. The same labels in GitHub's spelling change nothing.
+func TestGitHubNewLabelsNewScaleSet(t *testing.T) {
+	f := &fakeScaleSets{ss: &scaleset.RunnerScaleSet{ID: 1, Name: "offload-box", Labels: []scaleset.Label{
+		{Type: "system", Name: "self-hosted"}, {Type: "system", Name: "Linux"}, {Type: "system", Name: "X64"}, {Type: "system", Name: "offload"}}}}
+	ctx := context.Background()
+	ss, stale, err := ensureScaleSet(ctx, f, "offload-box", []string{"self-hosted", "linux", "x64", "offload", "OFFLOAD"}, false)
+	if err != nil || ss.ID != 1 || stale || strings.Join(f.calls, ",") != "get" {
+		t.Fatalf("same labels: %+v, stale %v, calls %v, %v", ss, stale, f.calls, err)
+	}
+	labels := []string{"self-hosted", "linux", "x64", "offload", "ci"}
+	f.calls = nil
+	ss, stale, err = ensureScaleSet(ctx, f, "offload-box", labels, false)
+	if err != nil || ss.ID != 1 || !stale || strings.Join(f.calls, ",") != "get" {
+		t.Fatalf("new labels, runners still working: %+v, stale %v, calls %v, %v", ss, stale, f.calls, err)
+	}
+	f.calls = nil
+	ss, stale, err = ensureScaleSet(ctx, f, "offload-box", labels, true)
+	if err != nil || ss.ID != 2 || len(ss.Labels) != 5 || stale || strings.Join(f.calls, ",") != "get,delete,create" {
+		t.Fatalf("new labels, drained: %+v, stale %v, calls %v, %v", ss, stale, f.calls, err)
+	}
+}
+
+// A runner waiting to take new labels claims no new jobs, keeps the ones it has, and hands its
+// scale set over once nothing is assigned or running here.
+func TestGitHubRelabelDrains(t *testing.T) {
+	s, p, f := newGitHubServer(t)
+	p.relabel = true
+	j := &job{}
+	j.ID, j.State, j.Spec.GitHub, j.GitHub = "j-gh", api.StateRunning, p.key, &api.GitHubJob{Job: "build"}
+	s.jobs[j.ID] = j
+	sc := &githubScaler{s: s, p: p, session: f}
+	offer := stats(1)
+	offer.JobAvailableMessages = []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 9}}}
+	if err := sc.Scale(context.Background(), offer); err != nil || len(f.acquired) != 0 || p.drained {
+		t.Fatalf("while a job runs: claimed %v, drained %v, %v", f.acquired, p.drained, err)
+	}
+	j.State = api.StateExited
+	first := stats(0)
+	first.MessageID = listener.InitialMessageID
+	if err := sc.Scale(context.Background(), first); err != nil || p.drained {
+		t.Fatalf("on the initial count, before queued messages: drained %v, %v", p.drained, err)
+	}
+	if err := sc.Scale(context.Background(), stats(0)); !errors.Is(err, errRelabel) || !p.drained {
+		t.Fatalf("once it finished: drained %v, %v", p.drained, err)
 	}
 }
