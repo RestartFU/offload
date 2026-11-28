@@ -509,7 +509,7 @@ function pauseBtn(r) {
 function renderQueue(runners) {
   const el = $("#ov-queue");
   const waiting = [];
-  for (const r of runners) if (r.online) for (const j of r.jobs) if ((j.state === "queued" || j.state === "uploading") && !j.spec.github) waiting.push([r, j]);
+  for (const r of runners) if (r.online) for (const j of r.jobs) if (j.state === "queued" || j.state === "uploading") waiting.push([r, j]);
   if (!waiting.length) { el.replaceChildren(); return; }
   waiting.sort((a, b) => new Date(a[1].created_at) - new Date(b[1].created_at));
   el.replaceChildren(
@@ -780,7 +780,7 @@ function workloads() {
     for (const c of r.metrics?.cpus || []) for (const id of c.owners || []) (owners.get(id) || owners.set(id, []).get(id)).push(c.id);
     for (const j of r.jobs) out.push({
       kind: "job", runner: r.name, id: j.id, state: j.state, reason: j.reason, exit_code: j.exit_code, cmd: jobCmd(j), github: j.spec.github ? j.github || { owner: "" } : null,
-      repo: shortKey(j.spec.workspace_key), caller: j.caller || j.spec.client || "", res: j.resources, cpus: j.allowed_cpus,
+      repo: j.spec.github ? j.github?.repo || "" : shortKey(j.spec.workspace_key), caller: j.caller || j.spec.client || "", res: j.resources, cpus: j.allowed_cpus,
       created: j.created_at, started: j.started_at, finished: j.finished_at, runtime: j.runtime, image: j.image,
       use: usage.get(j.id), raw: j, host: r,
     });
@@ -823,7 +823,7 @@ function renderCtFilters() {
   ctFiltersKey = runnerNames();
   $("#ct-filters").replaceChildren(...[
     segmented([["active", "Active"], ["finished", "Finished"], ["all", "All"]], f.state, (v) => { f.state = v; store("cstate", v); again(); }, "State"),
-    segmented([["", "Jobs and sessions"], ["job", "Jobs"], ["session", "Sessions"]], f.kind, (v) => { f.kind = v; again(); }, "Kind"),
+    segmented([["", "All kinds"], ["job", "Jobs"], ["session", "Sessions"], ["github", "GitHub"]], f.kind, (v) => { f.kind = v; again(); }, "Kind"),
     runnerSelect(f.runner, (v) => { f.runner = v; again(); }),
     $("#main")._search,
     f.state !== "active" ? h("span", { class: "muted", style: { fontSize: "12.5px" } }, "Runners list finished work for an hour; Overview › Activity goes further back") : null,
@@ -841,12 +841,13 @@ function renderTable() {
   const el = $("#ct-table");
   if (!el) return;
   const f = state.cfilter, q = f.q.trim().toLowerCase();
-  let list = workloads().filter((w) => !w.github &&
-    (f.state === "all" || (f.state === "active") === isActive(w)) && (!f.kind || w.kind === f.kind) && (!f.runner || w.runner === f.runner) &&
+  const kind = (w) => (w.github ? "github" : w.kind);
+  let list = workloads().filter((w) =>
+    (f.state === "all" || (f.state === "active") === isActive(w)) && (!f.kind || kind(w) === f.kind) && (!f.runner || w.runner === f.runner) &&
     (!q || [w.id, w.cmd, w.repo, w.caller, w.runner, w.state].some((x) => (x || "").toLowerCase().includes(q))));
   list.sort((a, b) => (isActive(b) - isActive(a)) || new Date(b.created) - new Date(a.created));
   if (!list.length) {
-    const msg = !state.fleet?.runners.length ? "No runners found yet." : f.state === "active" ? "Nothing is running. Jobs you start with offload run show up here; GitHub jobs have their own tab." : "No workloads match.";
+    const msg = !state.fleet?.runners.length ? "No runners found yet." : f.state === "active" ? "Nothing is running. Jobs you start with offload run, sessions and GitHub jobs show up here." : "No workloads match.";
     el.replaceChildren(h("div", { class: "card empty-state" }, msg));
     return;
   }
@@ -858,7 +859,7 @@ function renderTable() {
       const open = () => (location.hash = `#/containers/${encodeURIComponent(w.runner)}/${w.id}`);
       const t = stale(w) ? (w.host.last_seen ? `as of ${ago(w.host.last_seen)}` : "") : w.finished ? `ended ${ago(w.finished)}` : w.started && w.state === "running" ? `for ${fmtDur(since(w.started))}` : `waiting ${fmtDur(since(w.created))}`;
       return h("tr", { class: "click" + (sel && sel.id === w.id && sel.runner === w.runner ? " sel" : ""), tabindex: 0, onclick: open, onkeydown: (e) => { if (e.key === "Enter") open(); } },
-        h("td", { class: "nowrap" }, h("span", { class: "kind" }, w.kind === "job" ? "Job" : "Session"), h("span", { class: "mono" }, w.id)),
+        h("td", { class: "nowrap" }, h("span", { class: "kind" }, w.github ? "GitHub" : w.kind === "job" ? "Job" : "Session"), h("span", { class: "mono" }, w.id)),
         h("td", {}, h("span", { class: "cmd mono", title: w.cmd }, w.cmd)),
         showRunner && h("td", { class: "nowrap" }, w.runner),
         h("td", {}, exitChip(w)),
