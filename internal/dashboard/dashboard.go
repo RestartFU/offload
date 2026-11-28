@@ -6,8 +6,10 @@ package dashboard
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,7 +42,8 @@ type Options struct {
 	Open    bool   // open the browser
 	Version string // this binary's version, compared with the runners'
 	Remote  bool   // also listen on this machine's tailnet addresses, for paired phones
-	Dir     string // where the key and paired devices are kept; "" is the client's config dir
+	KeepKey bool   // keep the browser key across restarts instead of making one per run
+	Dir     string // where paired devices (and a kept key) live; "" is the client's config dir
 }
 
 // keyHeader carries the per-run key on every API request. The page keeps the key in its own
@@ -53,8 +56,8 @@ type server struct {
 	token   string
 	host    string // the Host header the page is served under, e.g. "127.0.0.1:7421"
 	fleet   *fleet
-	devices *devices
-	remote  *remote // nil without Options.Remote
+	devices *devices // nil when another dashboard on this machine owns them
+	remote  *remote
 }
 
 // Run serves the dashboard until ctx ends.
@@ -74,11 +77,15 @@ func Run(ctx context.Context, opts Options) error {
 	if dir == "" {
 		dir = filepath.Join(client.ConfigDir(), "dashboard")
 	}
-	key, err := loadKey(filepath.Join(dir, "key"))
-	if err != nil {
-		return err
+	var key string
+	if opts.KeepKey {
+		key, err = loadKey(filepath.Join(dir, "key"))
+	} else {
+		b := make([]byte, 24)
+		if _, err = rand.Read(b); err == nil {
+			key = hex.EncodeToString(b)
+		}
 	}
-	devs, err := loadDevices(dir)
 	if err != nil {
 		return err
 	}
@@ -89,23 +96,33 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
-	s := &server{opts: opts, token: key, host: ln.Addr().String(), fleet: newFleet(cfg), devices: devs}
-	var tailnet []net.Listener
-	if opts.Remote {
-		tailnet, s.remote = listenTailnet(ctx, port)
+	s := &server{opts: opts, token: key, host: ln.Addr().String(), fleet: newFleet(cfg), remote: &remote{}}
+	// One dashboard owns the paired devices: a second one would keep serving a phone the first
+	// was told to forget, and write it back.
+	owner, err := tryLock(filepath.Join(dir, "lock"))
+	switch {
+	case err != nil:
+		return err
+	case !owner:
+		s.remote.fail("another offload dashboard on this machine serves phones: pair and forget devices there")
+	default:
+		if s.devices, err = loadDevices(dir); err != nil {
+			return err
+		}
+		if !opts.Remote {
+			s.remote.fail("phones can't reach this dashboard: it was started with --no-remote")
+		}
 	}
 	go s.fleet.run(ctx)
 
 	// The key travels in the fragment: browsers don't send it to the server or keep it in
 	// Referer. The page moves it to its own origin's storage and sends it with each API call.
 	link := "http://" + s.host + "/#key=" + s.token
-	fmt.Printf("offload dashboard: %s\n(the link holds this computer's dashboard key; Ctrl-C stops the dashboard)\n", link)
-	switch {
-	case s.remote != nil && len(s.remote.addrs) > 0:
-		fmt.Printf("phones paired under Devices reach it at %s\n", strings.Join(s.remote.addrs, ", "))
-	case s.remote != nil:
-		fmt.Println(s.remote.err)
+	what := "this session's key"
+	if opts.KeepKey {
+		what = "this computer's dashboard key"
 	}
+	fmt.Printf("offload dashboard: %s\n(the link holds %s; Ctrl-C stops the dashboard)\n", link, what)
 	if opts.Open {
 		if err := openBrowser(ctx, link); err != nil {
 			fmt.Printf("could not open a browser (%v); open the link above\n", err)
@@ -113,14 +130,13 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	mux := s.routes()
 	srv := &http.Server{Handler: s.guard(mux), ReadHeaderTimeout: 10 * time.Second}
-	dev := &http.Server{Handler: s.deviceGuard(mux), ReadHeaderTimeout: 10 * time.Second}
+	// Unpaired peers reach this one (to pair), so a request has to arrive whole within half a
+	// minute. Answers aren't bounded: a log stream stays open.
+	dev := &http.Server{Handler: s.deviceGuard(mux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute}
 	go func() { <-ctx.Done(); _ = srv.Close(); _ = dev.Close() }()
-	for _, l := range tailnet {
-		go func() {
-			if err := dev.Serve(l); !errors.Is(err, http.ErrServerClosed) {
-				fmt.Printf("phones can't reach the dashboard at %s any more: %v\n", l.Addr(), err)
-			}
-		}()
+	if s.devices != nil && opts.Remote {
+		_, bound, _ := net.SplitHostPort(s.host) // the port the page got, which may not be the one asked for
+		go s.serveTailnet(ctx, bound, dev)
 	}
 	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -221,7 +237,7 @@ func (s *server) guard(next http.Handler) http.Handler {
 			return
 		}
 		if !s.tokenOK(r.Header.Get(keyHeader)) {
-			writeErr(w, http.StatusUnauthorized, "open the link offload dashboard printed (it carries this computer's dashboard key)")
+			writeErr(w, http.StatusUnauthorized, "open the link offload dashboard printed (it carries the dashboard's key)")
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {

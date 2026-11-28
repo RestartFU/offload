@@ -1612,7 +1612,7 @@ function renderDevices() {
         d.dns && d.dns !== host ? [h("dt", {}, "Or"), h("dd", { class: "mono" }, d.dns + (port && port !== "7421" ? ":" + port : ""))] : null,
         reach ? [h("dt", {}, "Or by IP"), h("dd", { class: "mono" }, reach.join("  "))] : null,
         h("dt", {}, "Code"), h("dd", { class: "mono code" }, d.code.slice(0, 4) + "-" + d.code.slice(4)),
-        h("dt", {}, "Expires"), h("dd", { class: "muted" }, "in " + fmtDur(left) + " or after one try")));
+        h("dt", {}, "Expires"), h("dd", { class: "muted" }, "in " + fmtDur(left))));
   } else {
     pair = h("div", { class: "card pair-card" },
       h("div", { class: "pair-steps" },

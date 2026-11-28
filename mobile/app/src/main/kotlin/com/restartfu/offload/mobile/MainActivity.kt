@@ -19,6 +19,7 @@ import com.restartfu.offload.mobile.ui.OffloadTheme
 
 class Holder(app: Application) : AndroidViewModel(app) {
     private val prefs = Preferences(app)
+    private val tailnet = VpnTailnet(app)
     val model = AppModel(
         KeystorePairingStore(app),
         object : AppModel.Prefs {
@@ -27,6 +28,8 @@ class Holder(app: Application) : AndroidViewModel(app) {
             override var lastAddress by prefs::lastAddress
         },
         viewModelScope,
+        makeDashboard = { HttpDashboard(tailnet, it) },
+        pairer = { address, code, name -> HttpDashboard(tailnet) { null }.pair(address, code, name) },
     )
 }
 

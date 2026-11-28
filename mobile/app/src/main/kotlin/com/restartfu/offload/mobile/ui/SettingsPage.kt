@@ -80,11 +80,24 @@ fun SettingsPage(model: AppModel, appVersion: String = "0.1.0") {
             DangerButton(
                 "Forget this computer",
                 {
+                    val name = p?.name ?: "the computer"
                     model.ask = Ask(
-                        "Forget ${p?.name ?: "this computer"}?",
+                        "Forget $name?",
                         "This phone will need a new pairing code to connect again. The computer forgets this phone's key too.",
                         "Forget", keep = "Stay paired",
-                    ) { scope.launch { model.unpair() } }
+                    ) {
+                        scope.launch {
+                            try {
+                                model.unpair()
+                            } catch (e: Exception) {
+                                model.ask = Ask(
+                                    "Couldn't tell $name",
+                                    "It didn't answer, so it still accepts this phone's key. You can forget it on this phone only, then remove this phone under Devices in the dashboard.",
+                                    "Forget on this phone only", keep = "Stay paired",
+                                ) { model.unpairHere() }
+                            }
+                        }
+                    }
                 },
                 Modifier.fillMaxWidth(),
             )

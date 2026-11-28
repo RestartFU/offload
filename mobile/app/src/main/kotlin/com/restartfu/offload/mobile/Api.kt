@@ -6,10 +6,12 @@ import java.net.HttpURLConnection
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
+import java.net.Proxy
 import java.net.URL
 import java.net.URLEncoder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -27,7 +29,8 @@ data class Pairing(val address: String, val token: String, val name: String)
 
 /**
  * Talks to `offload dashboard` on the paired computer. Every request goes to an address on the
- * tailnet, which WireGuard encrypts; anything else is refused before a byte is sent.
+ * tailnet, through the VPN that routes to it and never a proxy, so WireGuard carries it; anything
+ * else is refused before a byte is sent.
  */
 interface Dashboard {
     suspend fun info(): Info
@@ -92,32 +95,52 @@ fun tailnetAddress(host: String): InetAddress {
     return all.firstOrNull(::onTailnet) ?: throw NotOnTailnet(host)
 }
 
-class HttpDashboard(private val pairing: () -> Pairing?) : Dashboard {
+/** Opens connections to the paired computer, and nowhere but the tailnet. */
+interface Tailnet {
+    /** A connection to [path] on [host], not yet connected. Throws when [host] isn't a tailnet address. */
+    fun open(host: String, port: Int, path: String): HttpURLConnection
+}
 
-    private fun url(address: String, path: String): URL {
-        val (host, port) = splitAddress(address) ?: throw IOException("\"$address\" isn't an address")
-        val ip = tailnetAddress(host)
-        val literal = if (ip is Inet6Address) "[${ip.hostAddress?.substringBefore('%')}]" else ip.hostAddress
-        return URL("http://$literal:$port$path")
-    }
+internal fun tailnetUrl(ip: InetAddress, port: Int, path: String): URL {
+    val literal = if (ip is Inet6Address) "[${ip.hostAddress?.substringBefore('%')}]" else ip.hostAddress
+    return URL("http://$literal:$port$path")
+}
 
-    private fun open(method: String, path: String, body: JSONObject? = null, token: String? = null, address: String? = null, readTimeout: Int = 15_000): HttpURLConnection {
+/**
+ * Goes by the address alone, over whatever network is up. For the JVM, where there is no VPN to
+ * ask; the app uses [VpnTailnet]. Never through a proxy, which would be handed the token.
+ */
+object DirectTailnet : Tailnet {
+    override fun open(host: String, port: Int, path: String) =
+        tailnetUrl(tailnetAddress(host), port, path).openConnection(Proxy.NO_PROXY) as HttpURLConnection
+}
+
+class HttpDashboard(private val tailnet: Tailnet, private val pairing: () -> Pairing?) : Dashboard {
+
+    /** Builds the request without touching the network yet, so a caller can arrange to cancel it first. */
+    private fun connect(method: String, path: String, token: String? = null, address: String? = null, readTimeout: Int = 15_000): Pair<HttpURLConnection, String> {
         val p = pairing()
         val addr = address ?: p?.address ?: throw ApiException(401, "Not paired")
-        val u = url(addr, path)
-        val c = u.openConnection() as HttpURLConnection
+        val (host, port) = splitAddress(addr) ?: throw IOException("\"$addr\" isn't an address")
+        val c = tailnet.open(host, port, path)
         c.instanceFollowRedirects = false
+        c.useCaches = false
         c.connectTimeout = 8_000
         c.readTimeout = readTimeout
         c.requestMethod = method
         c.setRequestProperty("Accept", "application/json")
         (token ?: p?.token)?.takeIf { it.isNotEmpty() }?.let { c.setRequestProperty("Authorization", "Bearer $it") }
-        if (body != null) {
-            c.doOutput = true
-            c.setRequestProperty("Content-Type", "application/json")
-            c.outputStream.use { it.write(body.toString().toByteArray()) }
-        }
+        return c to addr
+    }
+
+    /** Sends the request and waits for the answer to start; anything but success is thrown. */
+    private fun send(c: HttpURLConnection, addr: String, body: JSONObject? = null): HttpURLConnection {
         val code = try {
+            if (body != null) {
+                c.doOutput = true
+                c.setRequestProperty("Content-Type", "application/json")
+                c.outputStream.use { it.write(body.toString().toByteArray()) }
+            }
             c.responseCode
         } catch (e: IOException) {
             c.disconnect()
@@ -137,20 +160,25 @@ class HttpDashboard(private val pairing: () -> Pairing?) : Dashboard {
         else -> e.message ?: "Can't reach $address"
     }
 
-    private fun json(method: String, path: String, body: JSONObject? = null): String =
-        open(method, path, body).let { c -> try { c.inputStream.bufferedReader().readText() } finally { c.disconnect() } }
+    private fun json(method: String, path: String, body: JSONObject? = null, readTimeout: Int = 15_000): String {
+        val (c, addr) = connect(method, path, readTimeout = readTimeout)
+        return send(c, addr, body).let { try { it.inputStream.bufferedReader().readText() } finally { it.disconnect() } }
+    }
 
     private fun q(s: String) = URLEncoder.encode(s, "UTF-8")
+
+    // Each call waits a little longer than the dashboard gives its own calls to runners and to
+    // GitHub (up to 90 s for an add), so a slow change is reported, not cut off half done.
 
     override suspend fun info() = io { parseInfo(JSONObject(json("GET", "/api/info"))) }
     override suspend fun fleet() = io { parseFleet(JSONObject(json("GET", "/api/fleet"))) }
     override suspend fun series(runner: String, range: String) = io { parseSeries(JSONObject(json("GET", "/api/series?host=${q(runner)}&range=${q(range)}"))) }
-    override suspend fun ledger(sinceRfc3339: String) = io { parseLedger(JSONObject(json("GET", "/api/ledger?since=${q(sinceRfc3339)}"))) }
+    override suspend fun ledger(sinceRfc3339: String) = io { parseLedger(JSONObject(json("GET", "/api/ledger?since=${q(sinceRfc3339)}", readTimeout = 25_000))) }
     override suspend fun stop(runner: String, kind: String, id: String) = io {
-        json("POST", "/api/stop", JSONObject().put("host", runner).put("kind", kind).put("id", id)); Unit
+        json("POST", "/api/stop", JSONObject().put("host", runner).put("kind", kind).put("id", id), readTimeout = 25_000); Unit
     }
     override suspend fun pause(runner: String, paused: Boolean) = io {
-        json("POST", "/api/pause", JSONObject().put("host", runner).put("paused", paused)); Unit
+        json("POST", "/api/pause", JSONObject().put("host", runner).put("paused", paused), readTimeout = 25_000); Unit
     }
 
     private fun results(s: String): List<Pair<String, String>> {
@@ -159,28 +187,33 @@ class HttpDashboard(private val pairing: () -> Pairing?) : Dashboard {
     }
 
     override suspend fun githubRemove(owner: String, forget: Boolean) = io {
-        results(json("POST", "/api/github/remove", JSONObject().put("owner", owner).put("forget", forget)))
+        results(json("POST", "/api/github/remove", JSONObject().put("owner", owner).put("forget", forget), readTimeout = 45_000))
     }
 
     override suspend fun githubAdd(add: GitHubAdd) = io {
         val body = JSONObject().put("owner", add.owner).put("token", add.token).put("labels", JSONArray(add.labels))
             .put("system_labels", add.systemLabels).put("shared", add.shared).put("on", JSONArray(add.on))
         add.max?.let { body.put("max", it) }
-        results(json("POST", "/api/github/add", body))
+        results(json("POST", "/api/github/add", body, readTimeout = 105_000))
     }
 
     override suspend fun forgetThisDevice() = io { json("DELETE", "/api/device"); Unit }
 
     override suspend fun logs(runner: String, kind: String, id: String, stream: String, onText: (String) -> Unit) = withContext(Dispatchers.IO) {
-        val c = open("GET", "/api/logs?host=${q(runner)}&kind=$kind&id=${q(id)}&stream=$stream&tail=65536", readTimeout = 0)
-        // A blocked read can't be cancelled, so leaving the page closes the connection under it.
+        val (c, addr) = connect("GET", "/api/logs?host=${q(runner)}&kind=$kind&id=${q(id)}&stream=$stream&tail=65536", readTimeout = 0)
+        // A blocked connect or read can't be cancelled, so leaving the page closes the connection
+        // under it, and so does an answer that takes too long to start.
         val closer = launch { try { awaitCancellation() } finally { c.disconnect() } }
+        val slow = launch { delay(20_000); c.disconnect() }
         try {
+            send(c, addr)
+            slow.cancel()
             readLogs(c.inputStream, onText)
         } catch (e: IOException) {
             ensureActive()
             throw e
         } finally {
+            slow.cancel()
             closer.cancel()
             c.disconnect()
         }
@@ -188,9 +221,9 @@ class HttpDashboard(private val pairing: () -> Pairing?) : Dashboard {
 
     /** Pairs with the dashboard at [address] using the code it shows, returning the new pairing. */
     suspend fun pair(address: String, code: String, deviceName: String): Pairing = io {
-        val c = open("POST", "/api/pair", JSONObject().put("code", code).put("name", deviceName), token = "", address = address)
-        val o = JSONObject(c.inputStream.bufferedReader().readText())
-        c.disconnect()
+        val (c, addr) = connect("POST", "/api/pair", token = "", address = address)
+        send(c, addr, JSONObject().put("code", code).put("name", deviceName))
+        val o = try { JSONObject(c.inputStream.bufferedReader().readText()) } finally { c.disconnect() }
         val info = parseInfo(o.optJSONObject("info") ?: JSONObject())
         Pairing(address.trim(), o.getString("token"), info.name.ifEmpty { address.trim() })
     }

@@ -1,6 +1,9 @@
 package com.restartfu.offload.mobile
 
 import java.net.InetAddress
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -8,6 +11,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 
 @RunWith(RobolectricTestRunner::class)
 class ModelTest {
@@ -56,6 +60,37 @@ class ModelTest {
         assertFalse(onTailnet(InetAddress.getByName("192.168.1.10")))
         assertTrue(onTailnet(InetAddress.getByName("fd7a:115c:a1e0::5")))
         assertFalse(onTailnet(InetAddress.getByName("fd7a:115c:a1e1::5")))
+    }
+
+    private fun model(fake: FakeDashboard, store: MemoryStore = MemoryStore(Pairing("laptop", "t0k3n", "laptop"))) = AppModel(
+        store, MemoryPrefs(), CoroutineScope(SupervisorJob()), { fake }, { _, _, _ -> error("not pairing") }, { Fixtures.NOW.toEpochMilli() },
+    )
+
+    @Test fun aNewerDashboardIsRefusedEveryTime() = runBlocking {
+        val fake = FakeDashboard().apply { apiLevel = API_LEVEL + 1 }
+        val m = model(fake)
+        assertFalse(m.refresh())
+        assertFalse("the second try read the fleet anyway", m.refresh())
+        assertNull(m.fleet)
+        fake.apiLevel = API_LEVEL
+        assertTrue(m.refresh())
+        assertEquals(3, fake.infoCalls)
+    }
+
+    @Test fun forgettingNeedsTheComputersAnswer() = runBlocking {
+        val fake = FakeDashboard().apply { failWith = "unreachable" }
+        val store = MemoryStore(Pairing("laptop", "t0k3n", "laptop"))
+        val m = model(fake, store)
+        assertTrue(runCatching { m.unpair() }.isFailure)
+        assertEquals("t0k3n", store.p?.token)
+        m.unpairHere()
+        assertNull(store.p)
+        assertNull(m.pairing)
+    }
+
+    @Test fun noVpnNoConnection() {
+        val e = runCatching { VpnTailnet(RuntimeEnvironment.getApplication()).open("100.64.0.1", 7421, "/api/info") }.exceptionOrNull()
+        assertTrue("$e", e is java.io.IOException && e.message!!.contains("Tailscale is off"))
     }
 
     @Test fun logStreamSkipsItsHeader() {

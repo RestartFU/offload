@@ -219,9 +219,11 @@ It follows the system's light or dark setting; the switch at the top right picks
 remembered by the browser.
 
 The page is served on loopback only and the dashboard talks to runners with this machine's
-identity. The link it prints carries a key, so other local users can't use it. The key is kept
-in `~/.config/offload/dashboard/`, so a bookmarked link keeps working after a restart; delete
-`key` there to change it. Runners sample usage
+identity. The link it prints carries a per-run key, so other local users can't use it. With
+`--keep-key` the key is kept in `~/.config/offload/dashboard/key` instead, so a bookmarked link
+keeps working after a restart. Your browser then holds a key that stays valid, and hands it to
+whatever answers on that loopback port while the dashboard is down, so use it where no other
+user runs services on this machine. Runners sample usage
 every 5 seconds and keep a week of it. They also keep a ledger of finished jobs
 (`storage.ledger.retain`, 30 days by default). A runner from before this version shows its
 status only; `offload host upgrade` brings it up to date.
@@ -234,15 +236,21 @@ pause runners, cancel jobs, stop sessions and add or remove organizations.
 
 The phone talks to the dashboard on your computer over Tailscale, which must be on on both.
 Pair it once: under **Devices** in the dashboard press **Pair a phone**, then type the address
-and the one-time code it shows into the app. The code lasts ten minutes and one try. The phone
-gets a key of its own, kept in Android Keystore, so it stays paired across restarts of the app
-and the dashboard until you forget it, in the app's Settings or under Devices. The dashboard has
-to be running for the phone to connect (`offload dashboard --no-open` in a user service keeps it
-up); it listens on this machine's tailnet addresses at the same port, 7421, and serves only the
-API there, to paired devices. `--no-remote` turns that off. If the phone can't connect, check
-that a firewall allows port 7421 on `tailscale0`.
+and the one-time code it shows into the app. The code lasts ten minutes and forgives a few
+typos. The phone gets a key of its own, kept in Android Keystore, so it stays paired across
+restarts of the app and the dashboard until you forget it, in the app's Settings or under
+Devices. Forgetting it also ends anything it has open. The app only connects through Tailscale's
+VPN on the phone, never over another network or a proxy.
 
-Build the app with `offload run --get mobile/app/build/outputs/apk -- mobile/build.sh :app:assembleDebug`
+The dashboard has to be running for the phone to connect (`offload dashboard --no-open` in a
+user service keeps it up). It listens on this machine's tailnet addresses at the page's port,
+7421, and serves only the API there, to paired devices; started before Tailscale, it begins
+once Tailscale is up. `--no-remote` turns that off. Of several dashboards on one machine, the
+first serves phones and manages devices. If the phone can't connect, check that a firewall
+allows port 7421 on `tailscale0`.
+
+Build the app on an x86-64 runner with
+`offload run --platform linux/amd64 --get mobile/app/build/outputs/apk -- mobile/build.sh :app:assembleDebug`
 and install it with `adb install`. The script fetches JDK 21 and the Android SDK on first use.
 
 ## Agents

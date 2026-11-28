@@ -44,8 +44,8 @@ class AppModel(
     private val store: PairingStore,
     private val prefs: Prefs,
     private val scope: CoroutineScope,
-    private val makeDashboard: (() -> Pairing?) -> Dashboard = { HttpDashboard(it) },
-    private val pairer: suspend (String, String, String) -> Pairing = { a, c, n -> HttpDashboard { null }.pair(a, c, n) },
+    private val makeDashboard: (() -> Pairing?) -> Dashboard,
+    private val pairer: suspend (String, String, String) -> Pairing,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     /** The per-phone settings the model needs; [Preferences] in the app. */
@@ -141,11 +141,21 @@ class AppModel(
         poll()
     }
 
-    /** Forgets the computer here, and asks it to forget this phone's key when it can. */
+    /**
+     * Has the computer forget this phone's key, then forgets the computer here. Throws, and
+     * changes nothing, when the computer couldn't be told: its copy of the key would stay valid.
+     */
     suspend fun unpair() {
-        runCatching { dashboard.forgetThisDevice() }
+        try {
+            dashboard.forgetThisDevice()
+        } catch (e: ApiException) {
+            if (e.code != 401) throw e // 401: it had forgotten already
+        }
         dropPairing(null)
     }
+
+    /** Forgets the computer on this phone only. The computer keeps accepting the key until it is forgotten under Devices. */
+    fun unpairHere() = dropPairing(null)
 
     internal fun dropPairing(reason: String?) {
         poller?.cancel()
@@ -186,9 +196,11 @@ class AppModel(
                         return@launch
                     }
                     failures++
+                    info = null
                     link = Link.Down(e.message ?: "The dashboard refused", clock() + backoff(failures))
                 } catch (e: Exception) {
                     failures++
+                    info = null // read again once it answers: it may have been upgraded meanwhile
                     link = Link.Down(e.message ?: "Can't reach the computer", clock() + backoff(failures))
                 }
                 delay(if (failures == 0) 2_000 else backoff(failures))
@@ -196,15 +208,13 @@ class AppModel(
         }
     }
 
-    /** Reads the computer's info (once) and the fleet. False when this app is too old for it. */
+    /** Reads the computer's info and the fleet. False when this app is too old for it. */
     suspend fun refresh(): Boolean {
-        if (info == null) {
-            val i = dashboard.info()
-            info = i
-            if (i.apiLevel > API_LEVEL) {
-                link = Link.Down("${i.name} runs a newer offload than this app understands. Update the app.", 0)
-                return false
-            }
+        val i = info ?: dashboard.info().also { info = it }
+        if (i.apiLevel > API_LEVEL) {
+            info = null // asked again next time: the app or the computer may have changed by then
+            link = Link.Down("${i.name} runs a newer offload than this app understands. Update the app.", 0)
+            return false
         }
         fleet = dashboard.fleet()
         link = Link.Live
@@ -276,10 +286,15 @@ class AppModel(
         }
     }
 
+    // A change that failed or timed out may still have reached some runners, so the fleet is read
+    // again either way.
     suspend fun removeGitHub(owner: String, forget: Boolean): String {
-        val res = dashboard.githubRemove(owner, forget)
+        val res = try {
+            dashboard.githubRemove(owner, forget)
+        } finally {
+            fleet = runCatching { dashboard.fleet() }.getOrDefault(fleet)
+        }
         val bad = res.filter { it.second.isNotEmpty() }
-        fleet = runCatching { dashboard.fleet() }.getOrDefault(fleet)
         return when {
             bad.isNotEmpty() -> "Couldn't remove $owner from " + bad.joinToString { "${it.first} (${it.second})" }
             forget -> "Removed $owner here. Delete its scale sets in GitHub's runner settings too."
@@ -287,10 +302,10 @@ class AppModel(
         }
     }
 
-    suspend fun addGitHub(add: GitHubAdd): List<Pair<String, String>> {
-        val res = dashboard.githubAdd(add)
+    suspend fun addGitHub(add: GitHubAdd): List<Pair<String, String>> = try {
+        dashboard.githubAdd(add)
+    } finally {
         fleet = runCatching { dashboard.fleet() }.getOrDefault(fleet)
-        return res
     }
 
     fun workload(runner: String, id: String): Workload? =

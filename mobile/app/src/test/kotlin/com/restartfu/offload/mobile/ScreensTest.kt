@@ -336,6 +336,20 @@ class ScreensTest {
 
     @Test fun settingsForget() { shoot("51-settings-forget") { click("Settings"); click("Forget this computer") } }
 
+    @Test fun forgetWhileTheComputerIsAway() {
+        val fake = FakeDashboard()
+        val m = shoot("53-forget-unreachable", dashboard = fake) {
+            click("Settings")
+            fake.failWith = "Nothing answers at laptop."
+            click("Forget this computer")
+            click("Forget")
+            Thread.sleep(200)
+            settle()
+            check(shows("still accepts this phone's key"))
+        }
+        check(!fake.forgotten && m.pairing != null) { "the phone dropped a key the computer still accepts" }
+    }
+
     @Test fun forgetDropsThePairing() {
         val fake = FakeDashboard()
         val m = shoot("52-forgotten-here", dashboard = fake) {

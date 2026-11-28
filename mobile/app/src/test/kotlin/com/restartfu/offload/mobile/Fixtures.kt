@@ -203,7 +203,13 @@ class FakeDashboard(
     val stopped = mutableListOf<String>()
     var forgotten = false
 
-    override suspend fun info() = failWith?.let { throw java.io.IOException(it) } ?: Info("laptop", "v0.9.3", API_LEVEL)
+    var apiLevel = API_LEVEL
+    var infoCalls = 0
+    override suspend fun info(): Info {
+        failWith?.let { throw java.io.IOException(it) }
+        infoCalls++
+        return Info("laptop", "v0.9.3", apiLevel)
+    }
     override suspend fun fleet(): Fleet {
         failWith?.let { throw java.io.IOException(it) }
         return parseFleet(fleetJson())
@@ -214,7 +220,10 @@ class FakeDashboard(
     override suspend fun pause(runner: String, paused: Boolean) {}
     override suspend fun githubRemove(owner: String, forget: Boolean) = listOf("fsn-build" to "", "hel-build" to "")
     override suspend fun githubAdd(add: GitHubAdd) = add.on.map { it to "" }
-    override suspend fun forgetThisDevice() { forgotten = true }
+    override suspend fun forgetThisDevice() {
+        failWith?.let { throw java.io.IOException(it) }
+        forgotten = true
+    }
     override suspend fun logs(runner: String, kind: String, id: String, stream: String, onText: (String) -> Unit) {
         onText(if (kind == "session") "[mcp] listening on stdio\n[mcp] tools: launch, join, screenshot, chat\n[client] joined play.example.net:19132\n" else if (stream == "stderr") Fixtures.LOG else Fixtures.OUT)
         awaitCancellation()

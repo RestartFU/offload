@@ -258,12 +258,14 @@ serves a page with no build step (plain JS and SVG, embedded in the binary).
 Because it acts with those credentials, it guards them:
 
 - It listens on loopback only and checks `Host` (no DNS rebinding).
-- Every API request carries a key in an `X-Offload-Key` header. The key isn't a cookie,
+- Every API request carries a per-run key in an `X-Offload-Key` header. The key isn't a cookie,
   because cookies are shared by every port on `127.0.0.1`: any other local web server the
   browser visited would receive it. The printed link carries the key in its fragment
   (`#key=…`), which browsers never send to a server, and the page keeps it in its own origin's
-  storage. The key lives in a 0600 file, like the runner tokens, so a restart doesn't make the
-  user open a new link.
+  storage. A key that outlived the run would be a standing credential in that storage, served
+  to whatever takes the port once the dashboard stops, and a loopback origin gives the browser
+  no way to tell the two apart. So keeping it (`--keep-key`) is the developer's choice, off by
+  default.
 - The browser is opened on a private (0600) HTML file that redirects to the link, never on the
   link itself: command lines are visible to other users in `ps`.
 - Changes (cancel, stop) also need an `X-Offload-Dashboard` header and a same-origin request.
@@ -273,15 +275,25 @@ Because it acts with those credentials, it guards them:
 Phones reach the same API on a second listener, on this machine's tailnet addresses, and the
 dashboard is the only thing they talk to: it already holds the runner tokens, and pairing a
 phone with every runner would spread those credentials to a device that is easier to lose.
-That listener serves no page and refuses anything that looks like a browser (`Origin`,
-`Sec-Fetch-Site`), so tailnet identity, which a browser on another device carries for every
-page, never reaches it. Each request needs a device token, stored hashed in
-`dashboard/devices.json`; the browser key is not accepted there. A token comes only from a
-one-time code made by the page on loopback: eight characters, ten minutes, and used up by one
-wrong guess, so a job on another runner, which shares the tailnet identity, can't pair itself.
-The phone keeps its token in Android Keystore and refuses addresses outside the tailnet ranges,
-so the token never crosses a network WireGuard doesn't encrypt. Forgetting a device on either
-side removes its hash.
+
+- That listener serves no page and refuses anything that looks like a browser (`Origin`,
+  `Sec-Fetch-Site`), so tailnet identity, which a browser on another device carries for every
+  page, never reaches it. Each request needs a device token, stored hashed in
+  `dashboard/devices.json`; the browser key is not accepted there.
+- A token comes only from a one-time code made by the page on loopback (eight characters, ten
+  minutes). Jobs on other runners share the tailnet, so wrong codes are counted per peer
+  address: five and that peer waits for the next code, forty in all and the code is gone. A job
+  can neither guess the code nor use it up before the phone gets to it.
+- Forgetting a device removes its hash and cancels its open requests. A log stream reconnects
+  to the runner inside one request, so it would otherwise outlive the device.
+- One dashboard process owns the devices (a lock in the config directory held for its
+  lifetime). A second one, on a fallback port, would keep serving a phone the first was told to
+  forget and write it back; it runs without phones and says so.
+- The phone keeps its token in Android Keystore. A tailnet address alone proves nothing there:
+  with Tailscale off, `100.64.0.0/10` is whatever the phone's network says it is (carriers use
+  that range). The app resolves the name through the VPN, requires that VPN to have its own
+  route to the address, binds the socket to it and never uses a proxy, so the token only
+  travels inside WireGuard.
 
 The dashboard reads session output through `/v1/sessions/{id}/observe/{stream}`, which doesn't
 count as an attached client. The client streams count as attached, which keeps an idle session
