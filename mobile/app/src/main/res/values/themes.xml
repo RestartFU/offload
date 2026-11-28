@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The frames before Compose paints wear the backdrop of the system's night mode. -->
+    <style name="Theme.Offload" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/ground</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">@bool/ground_is_light</item>
+    </style>
+    <color name="ground">#E4E7F4</color>
+    <bool name="ground_is_light">true</bool>
+    <color name="ic_launcher_background">#0B0B0B</color>
+</resources>

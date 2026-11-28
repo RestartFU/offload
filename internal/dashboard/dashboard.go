@@ -1,6 +1,7 @@
 // Package dashboard serves `offload dashboard`: a local web page showing every runner, its
 // cores and memory, the jobs and sessions on it, and statistics from its ledger. It runs on
-// the laptop, talks to runners with the client's own identity, and listens on loopback only.
+// the laptop and talks to runners with the client's own identity. The page is served on
+// loopback only; paired phones reach the same API over the tailnet with a token of their own.
 package dashboard
 
 import (
@@ -20,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -39,6 +41,9 @@ type Options struct {
 	Addr    string // loopback address to listen on, e.g. "127.0.0.1:7421"
 	Open    bool   // open the browser
 	Version string // this binary's version, compared with the runners'
+	Remote  bool   // also listen on this machine's tailnet addresses, for paired phones
+	KeepKey bool   // keep the browser key across restarts instead of making one per run
+	Dir     string // where paired devices (and a kept key) live; "" is the client's config dir
 }
 
 // keyHeader carries the per-run key on every API request. The page keeps the key in its own
@@ -47,10 +52,12 @@ type Options struct {
 const keyHeader = "X-Offload-Key"
 
 type server struct {
-	opts  Options
-	token string
-	host  string // the Host header the page is served under, e.g. "127.0.0.1:7421"
-	fleet *fleet
+	opts    Options
+	token   string
+	host    string // the Host header the page is served under, e.g. "127.0.0.1:7421"
+	fleet   *fleet
+	devices *devices // nil when another dashboard on this machine owns them
+	remote  *remote
 }
 
 // Run serves the dashboard until ctx ends.
@@ -66,6 +73,22 @@ func Run(ctx context.Context, opts Options) error {
 	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
 		return fmt.Errorf("the dashboard listens on loopback only (got %s): it acts with this machine's identity", host)
 	}
+	dir := opts.Dir
+	if dir == "" {
+		dir = filepath.Join(client.ConfigDir(), "dashboard")
+	}
+	var key string
+	if opts.KeepKey {
+		key, err = loadKey(filepath.Join(dir, "key"))
+	} else {
+		b := make([]byte, 24)
+		if _, err = rand.Read(b); err == nil {
+			key = hex.EncodeToString(b)
+		}
+	}
+	if err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", opts.Addr)
 	if err != nil && port != "0" {
 		ln, err = net.Listen("tcp", net.JoinHostPort(host, "0")) // the usual port is taken: any port
@@ -73,24 +96,43 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
-	b := make([]byte, 24)
-	if _, err := rand.Read(b); err != nil {
+	s := &server{opts: opts, token: key, host: ln.Addr().String(), fleet: newFleet(cfg), remote: &remote{}}
+	// One dashboard owns the paired devices: a second one would keep serving a phone the first
+	// was told to forget, and write it back. One that serves no phones leaves them alone.
+	if !opts.Remote {
+		s.remote.fail("this dashboard was started with --no-remote: phones are paired, served and forgotten by one started without it")
+	} else if owner, err := tryLock(filepath.Join(dir, "lock")); err != nil {
+		return err
+	} else if !owner {
+		s.remote.fail("another offload dashboard on this machine serves phones: pair and forget devices there")
+	} else if s.devices, err = loadDevices(dir); err != nil {
 		return err
 	}
-	s := &server{opts: opts, token: hex.EncodeToString(b), host: ln.Addr().String(), fleet: newFleet(cfg)}
 	go s.fleet.run(ctx)
 
 	// The key travels in the fragment: browsers don't send it to the server or keep it in
 	// Referer. The page moves it to its own origin's storage and sends it with each API call.
 	link := "http://" + s.host + "/#key=" + s.token
-	fmt.Printf("offload dashboard: %s\n(the link holds this session's key; Ctrl-C stops the dashboard)\n", link)
+	what := "this session's key"
+	if opts.KeepKey {
+		what = "this computer's dashboard key"
+	}
+	fmt.Printf("offload dashboard: %s\n(the link holds %s; Ctrl-C stops the dashboard)\n", link, what)
 	if opts.Open {
 		if err := openBrowser(ctx, link); err != nil {
 			fmt.Printf("could not open a browser (%v); open the link above\n", err)
 		}
 	}
-	srv := &http.Server{Handler: s.routes(), ReadHeaderTimeout: 10 * time.Second}
-	go func() { <-ctx.Done(); _ = srv.Close() }()
+	mux := s.routes()
+	srv := &http.Server{Handler: s.guard(mux), ReadHeaderTimeout: 10 * time.Second}
+	// Unpaired peers reach this one (to pair), so a request has to arrive whole within half a
+	// minute. Answers aren't bounded: a log stream stays open.
+	dev := &http.Server{Handler: s.deviceGuard(mux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute}
+	go func() { <-ctx.Done(); _ = srv.Close(); _ = dev.Close() }()
+	if s.devices != nil {
+		_, bound, _ := net.SplitHostPort(s.host) // the port the page got, which may not be the one asked for
+		go s.serveTailnet(ctx, bound, dev)
+	}
 	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -143,7 +185,7 @@ func openBrowser(ctx context.Context, link string) error {
 	return nil
 }
 
-func (s *server) routes() http.Handler {
+func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	static, _ := fs.Sub(uiFiles, "ui")
 	files := http.FileServerFS(static)
@@ -156,7 +198,12 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/pause", s.handlePause)
 	mux.HandleFunc("POST /api/github/add", s.handleGitHubAdd)
 	mux.HandleFunc("POST /api/github/remove", s.handleGitHubRemove)
-	return s.guard(mux)
+	mux.HandleFunc("GET /api/info", s.handleInfo)
+	mux.HandleFunc("GET /api/devices", s.handleDevices)
+	mux.HandleFunc("POST /api/devices/pair", s.handleDevicesPair)
+	mux.HandleFunc("POST /api/devices/cancel", s.handleDevicesCancel)
+	mux.HandleFunc("POST /api/devices/forget", s.handleDevicesForget)
+	return mux
 }
 
 // guard keeps the dashboard to this browser session. It acts with this machine's tailnet
@@ -185,7 +232,7 @@ func (s *server) guard(next http.Handler) http.Handler {
 			return
 		}
 		if !s.tokenOK(r.Header.Get(keyHeader)) {
-			writeErr(w, http.StatusUnauthorized, "open the link offload dashboard printed (it carries this session's key)")
+			writeErr(w, http.StatusUnauthorized, "open the link offload dashboard printed (it carries the dashboard's key)")
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {

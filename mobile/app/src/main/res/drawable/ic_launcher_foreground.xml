@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Four cores, the dashboard's mark: one busy, two half, one idle. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#8B8FF8" android:pathData="M35,35h16v16h-16z" />
+    <path android:fillColor="#8B8FF8" android:fillAlpha="0.55" android:pathData="M57,35h16v16h-16z" />
+    <path android:fillColor="#8B8FF8" android:fillAlpha="0.55" android:pathData="M35,57h16v16h-16z" />
+    <path android:fillColor="#8B8FF8" android:fillAlpha="0.25" android:pathData="M57,57h16v16h-16z" />
+</vector>
