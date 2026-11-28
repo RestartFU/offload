@@ -244,7 +244,7 @@ func GitHubAdd(o GitHubOptions) error {
 		how = "the token you gave"
 	}
 	key := api.GitHubKey(owner)
-	hint := !strings.Contains(owner, "/") && o.Shared == nil && !githubKnown(ctx, all, key)
+	hint := !strings.Contains(owner, "/") && o.Shared == nil && githubNew(ctx, all, key)
 	fmt.Printf("Taking GitHub jobs for %s on %s, with %s.\n\n", owner, joinNames(hosts), how)
 	width := 0
 	for _, h := range hosts {
@@ -525,22 +525,22 @@ func GitHubRemove(raw string, on []string, forget bool) error {
 	return failed
 }
 
-// githubKnown reports whether any runner already takes the owner's jobs. It only decides a hint,
-// so a runner that doesn't answer within a few seconds counts as not having it.
-func githubKnown(ctx context.Context, hosts []*Host, key string) bool {
+// githubNew reports whether every runner confirmed it doesn't take the owner's jobs yet. It only
+// decides a hint, so it waits a few seconds at most and a runner that doesn't answer means no.
+func githubNew(ctx context.Context, hosts []*Host, key string) bool {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	found := make(chan bool, len(hosts))
+	free := make(chan bool, len(hosts))
 	for _, h := range hosts {
 		go func() {
 			pools, err := githubPools(ctx, h)
-			found <- err == nil && githubFind(pools, key) != nil
+			free <- err == nil && githubFind(pools, key) == nil
 		}()
 	}
 	for range hosts {
-		if <-found {
-			return true
+		if !<-free {
+			return false
 		}
 	}
-	return false
+	return true
 }

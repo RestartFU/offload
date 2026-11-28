@@ -876,29 +876,21 @@ const workloadHash = (r, id) => `#/${r.jobs.some((j) => j.id === id && j.spec.gi
 const ghPool = (r, owner) => (r.github || []).find((p) => p.owner.toLowerCase() === (owner || "").toLowerCase());
 const ghSettings = (owner) => owner.includes("/") ? `https://github.com/${owner}/settings/actions/runners` : `https://github.com/organizations/${owner}/settings/actions/runners`;
 const agoCoarse = (t) => { const x = since(t); return x < 60 ? "just now" : x < 3600 ? Math.round(x / 60) + "m ago" : fmtDur(x) + " ago"; };
-// Every offload runner is self-hosted Linux, so these never tell its runners apart: the copyable
-// runs-on line leaves them out when anything else is left.
-const GH_EVERYWHERE = ["self-hosted", "linux"];
 const GH_ARCHS = ["x64", "arm64", "arm"];
 const ghLabels = (p) => {
   const out = [], seen = new Set();
   for (const l of [...(p.system_labels || []), ...(p.labels || [])]) if (!seen.has(l.toLowerCase())) { seen.add(l.toLowerCase()); out.push(l); }
   return out;
 };
-const ghRunsOn = (labels) => {
-  const own = labels.filter((l) => !GH_EVERYWHERE.includes(l.toLowerCase()));
-  return "runs-on: " + runsOn(own.length ? own : labels);
-};
 const labelChips = (labels) => labels.map((l, i) => [i ? " " : "", h("code", { class: "label" }, l)]).flat();
 const ghArch = (r) => ({ amd64: "x64", arm64: "arm64", arm: "arm" })[r.status?.arch] || r.status?.arch || "";
-// The labels chosen runners start with: base (GitHub's usual ones and offload, or what the owner's
-// runners share), its architecture replaced by the chosen runners' when they all share one.
-function ghDefaultLabels(runners, base = ["self-hosted", "linux", "offload"]) {
+// The labels chosen runners start with: GitHub's usual ones and offload, or what the owner's runners
+// share. An architecture label is the chosen runners' when they all share one, and left out if not.
+function ghDefaultLabels(runners, base) {
   const archs = [...new Set(runners.map(ghArch).filter(Boolean))];
-  const out = base.filter((l) => !GH_ARCHS.includes(l.toLowerCase()));
-  const at = out.findIndex((l) => l.toLowerCase() === "linux") + 1;
-  out.splice(at, 0, ...(archs.length === 1 ? archs : []));
-  return out;
+  const arch = archs.length === 1 ? archs : [];
+  if (!base) return ["self-hosted", "linux", ...arch, "offload"];
+  return base.flatMap((l) => GH_ARCHS.includes(l.toLowerCase()) ? arch : [l]);
 }
 const runsOn = (labels) => (!labels?.length ? "offload" : labels.length === 1 ? labels[0] : "[" + labels.join(", ") + "]");
 const extIcon = () => glyphSVG(s("path", { d: "M6.5 3.5H4A1.5 1.5 0 0 0 2.5 5v7A1.5 1.5 0 0 0 4 13.5h7a1.5 1.5 0 0 0 1.5-1.5V9.5M9 2.5h4.5V7M13.5 2.5 7.5 8.5" }));
@@ -1124,7 +1116,7 @@ function ownerCard(owner, list) {
   const display = list.map(([, p]) => p.name).find(Boolean);
   const key = (p) => ghLabels(p).map((l) => l.toLowerCase()).sort().join(",");
   const sameLabels = list.every(([, p]) => key(p) === key(first));
-  const snippet = ghRunsOn(ghLabels(first));
+  const snippet = "runs-on: " + runsOn(first.labels);
   const sameCaches = list.every(([, p]) => !!p.shared === !!first.shared);
   const finished = sum(list, ([, p]) => p.runs);
   const last = list.map(([, p]) => p.last_run).filter(Boolean).sort().pop();
@@ -1143,7 +1135,7 @@ function ownerCard(owner, list) {
         h("span", { class: "n" }, r.name),
         poolChip(p),
         h("div", { class: "room" }, slots(p), h("span", { class: p.state === "failed" ? "crit-text" : "muted" }, roomText(p)),
-          sameLabels ? null : h("span", { class: "runs-on-row" }, ...labelChips(ghLabels(p)), copyBtn(ghRunsOn(ghLabels(p)))),
+          sameLabels ? null : h("span", { class: "runs-on-row" }, ...labelChips(ghLabels(p)), copyBtn("runs-on: " + runsOn(p.labels))),
           sameCaches ? null : h("span", { class: p.shared ? "" : "muted" }, p.shared ? "shared caches" : "clean caches"),
           null)))),
     sameLabels ? h("div", { class: "gh-also muted" }, "Labels ", ...labelChips(ghLabels(first)),
@@ -1308,7 +1300,7 @@ function renderGhForm() {
     if (f.labels.value !== want) f.labels.value = want;
   }
   const boxLabels = f.labels.value.split(",").map((x) => x.trim()).filter(Boolean);
-  f.preview.textContent = boxLabels.length ? ghRunsOn(boxLabels) : "runs-on: …";
+  f.preview.textContent = boxLabels.length ? "runs-on: " + runsOn(boxLabels) : "runs-on: …";
   const archs = [...new Set(chosen.map(ghArch).filter(Boolean))];
   f.archNote.textContent = archs.length > 1 ? ` The chosen runners differ in architecture (${archs.join(", ")}): list one only if every chosen runner has it.` : "";
   f.submit.disabled = !!state.ghFormBusy || (existing && ghRunners().every((r) => holders.has(r.status.id)));
