@@ -82,6 +82,7 @@ type Host struct {
 	named    bool           // Name comes from client.toml
 	estimate *api.Resources // what this runner said the job at hand would get (see estimate)
 	placed   int            // earlier shards of this run that went here (see markPlaced)
+	shard    bool           // choosing for a shard: a runner that can start it now comes first
 }
 
 // dialRaw opens a plain connection to the runner (for stream upgrades).
@@ -606,11 +607,12 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 
 // pick is Pick; with argv and no profile, each runner is judged by the profile it would match
 // for that command (as it will when it gets the job), not by its global defaults.
-// Earlier shards of the run on a runner count against it, but never so much that a shard queues
-// while a runner could start it now: then only those runners are considered.
+// Earlier shards of the run on a runner count against it. A shard never queues while a runner
+// could start it now: then only those runners are considered, so one slow shard can't hold up
+// the whole run.
 func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []string) (*Host, error) {
 	h, ready, err := pickScored(hosts, want, profile, key, kind, argv)
-	if err == nil && !ready[h] && len(ready) > 0 && slices.ContainsFunc(hosts, func(x *Host) bool { return x.placed > 0 }) {
+	if err == nil && !ready[h] && len(ready) > 0 && slices.ContainsFunc(hosts, func(x *Host) bool { return x.shard }) {
 		var now []*Host
 		for _, x := range hosts {
 			if ready[x] {

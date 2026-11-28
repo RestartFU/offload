@@ -30,9 +30,9 @@ func shardTestChild() {
 		os.Exit(99)
 	}
 	openShardReport()
-	reportPlaced(&Host{URL: fmt.Sprintf("http://r%d", i)})
+	reportPlaced(&Host{URL: fmt.Sprintf("http://r%d", i), Status: &api.Status{OS: "linux", Arch: fmt.Sprintf("a%d", i)}})
 	w := &lineWriter{w: os.Stdout, prefix: fmt.Sprintf("[%d/%d] ", i, n)}
-	fmt.Fprintf(w, "shard %d of %d after [%s]\npartial", i, n, os.Getenv(shardPlacedEnv))
+	fmt.Fprintf(w, "shard %d of %d after [%s] on [%s]\npartial", i, n, os.Getenv(shardPlacedEnv), os.Getenv(shardPlatformEnv))
 	if w.flush() != nil {
 		os.Exit(98)
 	}
@@ -59,9 +59,9 @@ func TestFanOutPlacesShardsInTurn(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
 	sort.Strings(lines)
 	want := []string{
-		"[1/3] partial", "[1/3] shard 1 of 3 after []",
-		"[2/3] partial", "[2/3] shard 2 of 3 after [http://r1]",
-		"[3/3] partial", "[3/3] shard 3 of 3 after [http://r1 http://r2]",
+		"[1/3] partial", "[1/3] shard 1 of 3 after [] on []",
+		"[2/3] partial", "[2/3] shard 2 of 3 after [http://r1] on [linux/a1]",
+		"[3/3] partial", "[3/3] shard 3 of 3 after [http://r1 http://r2] on [linux/a1]",
 	}
 	if fmt.Sprint(lines) != fmt.Sprint(want) {
 		t.Fatalf("stdout:\n%s", b)
@@ -108,6 +108,7 @@ func TestPickSpreadsShards(t *testing.T) {
 	want := api.Resources{CPU: 2, Mem: 1 << 30}
 	vps := testHost("vps", 22, api.Resources{}, api.Resources{}, "repo")
 	zeno := testHost("zeno", 6, api.Resources{}, api.Resources{})
+	vps.shard, zeno.shard = true, true // as markPlaced leaves them
 	if h, _ := pick([]*Host{vps, zeno}, want, "", "repo", "job", nil); h.Name != "vps" {
 		t.Fatalf("picked %s; want the warm, bigger vps first", h.Name)
 	}
@@ -139,6 +140,45 @@ func TestLineWriterBoundsLongLines(t *testing.T) {
 	first, _, _ := strings.Cut(buf.String(), "\n")
 	if len(first)+1 != pipeBuf || strings.Count(buf.String(), "\n") != 2 {
 		t.Fatalf("first write %d bytes, %d lines", len(first)+1, strings.Count(buf.String(), "\n"))
+	}
+}
+
+// A long line arriving with its newline in the same write is still cut at pipeBuf.
+func TestLineWriterBoundsLongLinesWithNewline(t *testing.T) {
+	var buf bytes.Buffer
+	l := &lineWriter{w: &buf, prefix: "> "}
+	l.Write(append(bytes.Repeat([]byte("x"), pipeBuf), '\n'))
+	for _, line := range strings.SplitAfter(buf.String(), "\n") {
+		if len(line) > pipeBuf {
+			t.Fatalf("a write of %d bytes", len(line))
+		}
+	}
+}
+
+func TestLineWriterTimedWriteErrorStopsFollowing(t *testing.T) {
+	stopped := make(chan struct{})
+	l := &lineWriter{w: failingWriter{}, onErr: func() { close(stopped) }}
+	l.Write([]byte("partial"))
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a failed timed write didn't stop following")
+	}
+	if l.flush() == nil {
+		t.Fatal("the error must reach follow")
+	}
+}
+
+func TestIsOutput(t *testing.T) {
+	dir := t.TempDir()
+	log, other := filepath.Join(dir, "log.txt"), filepath.Join(dir, "a.go")
+	os.WriteFile(log, nil, 0o644)
+	os.WriteFile(other, nil, 0o644)
+	f, _ := os.OpenFile(log, os.O_WRONLY, 0)
+	defer f.Close()
+	fi, _ := f.Stat()
+	if !isOutput(log, []os.FileInfo{fi}) || isOutput(other, []os.FileInfo{fi}) {
+		t.Fatal("only the file output goes to is skipped")
 	}
 }
 

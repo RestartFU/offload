@@ -12,6 +12,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,9 +27,10 @@ const (
 	MaxShards = 64
 	// Each shard is this same command line run again by a child process, which finds its shard
 	// here ("i/n") and reports on fd 3 which runner took its job.
-	shardOfEnv     = "OFFLOAD_SHARD_OF"
-	shardPlacedEnv = "OFFLOAD_SHARD_PLACED" // runners earlier shards went to, space separated
-	shardSourceEnv = "OFFLOAD_SHARD_SOURCE" // sourceDigest of the tree when the run started
+	shardOfEnv       = "OFFLOAD_SHARD_OF"
+	shardPlacedEnv   = "OFFLOAD_SHARD_PLACED"   // runners earlier shards went to, space separated
+	shardSourceEnv   = "OFFLOAD_SHARD_SOURCE"   // sourceDigest of the tree when the run started
+	shardPlatformEnv = "OFFLOAD_SHARD_PLATFORM" // os/arch of the first shard's runner
 )
 
 // outPrefix is "[i/n] " in a shard's process: its job's output and its status lines carry it.
@@ -75,13 +77,38 @@ func sourceDigest(ws *Workspace) string {
 	slices.SortFunc(files, func(a, b api.FileEntry) int { return strings.Compare(a.Path, b.Path) })
 	h := sha256.New()
 	fmt.Fprintf(h, "%s\x00", ws.Dir)
-	if ws.Git != nil {
-		fmt.Fprintf(h, "%s\x00", ws.Git.Head)
+	if g := ws.Git; g != nil {
+		fmt.Fprintf(h, "%s\x00%s\x00", g.Head, g.Branch)
+		for _, t := range slices.Sorted(maps.Keys(g.Tags)) {
+			fmt.Fprintf(h, "%s=%s\x00", t, g.Tags[t])
+		}
 	}
 	for _, f := range files {
 		fmt.Fprintf(h, "%s\x00%s\x00%o\x00%s\x00", f.Path, f.Hash, f.Mode, f.Link)
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// dropOutputs leaves this process's own stdout and stderr out of a shard's source: with
+// `> log.txt` inside the tree, that file grows while later shards upload it.
+func dropOutputs(ws *Workspace) {
+	var outputs []os.FileInfo
+	for _, f := range []*os.File{os.Stdout, os.Stderr} {
+		if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
+			outputs = append(outputs, fi)
+		}
+	}
+	if len(outputs) == 0 {
+		return
+	}
+	ws.Manifest = slices.DeleteFunc(ws.Manifest, func(f api.FileEntry) bool {
+		return isOutput(filepath.Join(ws.Root, filepath.FromSlash(f.Path)), outputs)
+	})
+}
+
+func isOutput(p string, outputs []os.FileInfo) bool {
+	fi, err := os.Lstat(p)
+	return err == nil && slices.ContainsFunc(outputs, func(o os.FileInfo) bool { return os.SameFile(fi, o) })
 }
 
 var (
@@ -114,7 +141,11 @@ func placeKey(h *Host) string {
 func reportPlaced(h *Host) {
 	shardReportOnce.Do(func() {
 		if shardReport != nil {
-			fmt.Fprintln(shardReport, placeKey(h))
+			plat := ""
+			if h.Status != nil {
+				plat = h.Status.OS + "/" + h.Status.Arch
+			}
+			fmt.Fprintln(shardReport, placeKey(h), plat)
 			shardReport.Close()
 		}
 	})
@@ -122,6 +153,9 @@ func reportPlaced(h *Host) {
 
 // markPlaced counts the earlier shards on each candidate, which pick holds against it.
 func markPlaced(hosts []*Host) {
+	for _, h := range hosts {
+		h.shard = true
+	}
 	placed := map[string]int{}
 	for _, k := range strings.Fields(os.Getenv(shardPlacedEnv)) {
 		placed[k]++
@@ -146,6 +180,7 @@ func runShards(ctx context.Context, o RunOptions) (int, error) {
 		if err != nil {
 			return 1, fmt.Errorf("reading workspace: %w", err)
 		}
+		dropOutputs(ws)
 		env = append(env, shardSourceEnv+"="+sourceDigest(ws))
 	}
 	codes, err := fanOut(ctx, self, os.Args[1:], env, o.Shards, os.Stdout, os.Stderr)
@@ -182,6 +217,7 @@ func fanOut(ctx context.Context, self string, args, env []string, n int, stdout,
 	codes := make([]int, n)
 	var wg sync.WaitGroup
 	var placed []string
+	platform := ""
 	var startErr error
 	for k := range n {
 		if ctx.Err() != nil {
@@ -194,7 +230,8 @@ func fanOut(ctx context.Context, self string, args, env []string, n int, stdout,
 			break
 		}
 		cmd := exec.Command(self, args...)
-		cmd.Env = append(append(os.Environ(), env...), fmt.Sprintf("%s=%d/%d", shardOfEnv, k+1, n), shardPlacedEnv+"="+strings.Join(placed, " "))
+		cmd.Env = append(append(os.Environ(), env...), fmt.Sprintf("%s=%d/%d", shardOfEnv, k+1, n),
+			shardPlacedEnv+"="+strings.Join(placed, " "), shardPlatformEnv+"="+platform)
 		cmd.Stdout, cmd.Stderr, cmd.ExtraFiles = stdout, stderr, []*os.File{w}
 		mu.Lock()
 		err = cmd.Start()
@@ -218,8 +255,11 @@ func fanOut(ctx context.Context, self string, args, env []string, n int, stdout,
 		}()
 		line, _ := bufio.NewReader(r).ReadString('\n')
 		r.Close()
-		if p := strings.TrimSpace(line); p != "" {
-			placed = append(placed, p)
+		if f := strings.Fields(line); len(f) > 0 {
+			placed = append(placed, f[0])
+			if platform == "" && len(f) > 1 {
+				platform = f[1]
+			}
 		}
 	}
 	if startErr != nil {
@@ -255,7 +295,8 @@ type lineWriter struct {
 	mu     sync.Mutex
 	buf    []byte
 	timer  *time.Timer
-	err    error // from a write the timer made
+	err    error  // from a write the timer made
+	onErr  func() // called when the timer's write fails, so following stops
 }
 
 const (
@@ -271,21 +312,20 @@ func (l *lineWriter) Write(p []byte) (int, error) {
 	}
 	n, limit := len(p), pipeBuf-len(l.prefix)-1
 	for len(p) > 0 {
-		i := bytes.IndexByte(p, '\n')
-		if i < 0 {
-			room := limit - len(l.buf)
-			if len(p) < room {
-				l.buf = append(l.buf, p...)
-				if l.timer == nil {
-					l.timer = time.AfterFunc(partialWait, l.flushPartial)
-				}
-				return n, nil
-			}
-			l.buf = append(l.buf, p[:room]...)
-			p = p[room:]
-		} else {
+		room := limit - len(l.buf)
+		switch i := bytes.IndexByte(p, '\n'); {
+		case i >= 0 && i <= room:
 			l.buf = append(l.buf, p[:i]...)
 			p = p[i+1:]
+		case len(p) < room:
+			l.buf = append(l.buf, p...)
+			if l.timer == nil {
+				l.timer = time.AfterFunc(partialWait, l.flushPartial)
+			}
+			return n, nil
+		default:
+			l.buf = append(l.buf, p[:room]...)
+			p = p[room:]
 		}
 		if err := l.emit(); err != nil {
 			return 0, err
@@ -299,7 +339,9 @@ func (l *lineWriter) flushPartial() {
 	defer l.mu.Unlock()
 	l.timer = nil
 	if len(l.buf) > 0 && l.err == nil {
-		l.err = l.emit()
+		if l.err = l.emit(); l.err != nil && l.onErr != nil {
+			l.onErr()
+		}
 	}
 }
 
