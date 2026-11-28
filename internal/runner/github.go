@@ -60,17 +60,18 @@ type githubPool struct {
 	dir   string
 	token string
 
-	gh         githubAPI
-	cancel     context.CancelFunc
-	done       chan struct{} // closed when its listener goroutine has returned
-	restarting bool          // a restart waits for the old listener to let go of its session
-	forget     bool          // remove without deleting the scale set on GitHub (rm --forget)
-	slots      map[int]string
-	failures   int       // runner jobs in a row that ended without taking a GitHub job
-	pauseTil   time.Time // after repeated failures: accept no jobs until then
-	envFail    string    // why the environment build failed, until envRetry
-	envRetry   time.Time
-	listener   *listener.Listener
+	gh           githubAPI
+	cancel       context.CancelFunc
+	done         chan struct{} // closed when its listener goroutine has returned
+	restarting   bool          // a restart waits for the old listener to let go of its session
+	systemLabels bool          // see githubPoolRecord.SystemLabels
+	forget       bool          // remove without deleting the scale set on GitHub (rm --forget)
+	slots        map[int]string
+	failures     int       // runner jobs in a row that ended without taking a GitHub job
+	pauseTil     time.Time // after repeated failures: accept no jobs until then
+	envFail      string    // why the environment build failed, until envRetry
+	envRetry     time.Time
+	listener     *listener.Listener
 }
 
 // githubPoolRecord is what pool.json keeps (0600, in a 0700 directory), the token included: one
@@ -93,6 +94,10 @@ type githubPoolRecord struct {
 	Removing   bool          `json:"removing,omitempty"`
 	Forget     bool          `json:"forget,omitempty"`
 	Token      string        `json:"token"`
+	// SystemLabels: the scale set also carries GitHub's default self-hosted labels. Pools from
+	// before they existed get them only when added again: widening which workflows reach a pool
+	// is the operator's choice.
+	SystemLabels bool `json:"system_labels,omitempty"`
 }
 
 func (s *Server) githubDir() string { return filepath.Join(s.cfg.StateDir, "github") }
@@ -119,7 +124,8 @@ func githubScaleSetName(runner, id string) string {
 func (p *githubPool) record() githubPoolRecord {
 	return githubPoolRecord{Owner: p.Owner, Name: p.Name, Avatar: p.Avatar, URL: p.URL, ScaleSet: p.ScaleSet, ScaleSetID: p.ScaleSetID, Labels: p.Labels,
 		Max: p.Max, Resources: p.Resources, TokenFrom: p.TokenFrom, Shared: p.Shared, CreatedAt: p.CreatedAt, Runs: p.Runs,
-		LastRun: p.LastRun, Removing: p.State == api.GitHubRemoving, Forget: p.forget, Token: p.token}
+		LastRun: p.LastRun, Removing: p.State == api.GitHubRemoving, Forget: p.forget, Token: p.token,
+		SystemLabels: p.systemLabels}
 }
 
 func (p *githubPool) save() error {
@@ -161,7 +167,7 @@ func (s *Server) restoreGitHub() {
 }
 
 func (s *Server) newPool(key, dir string, rec githubPoolRecord, token string) *githubPool {
-	return &githubPool{key: key, dir: dir, token: token, slots: map[int]string{}, GitHubPool: api.GitHubPool{
+	return &githubPool{key: key, dir: dir, token: token, slots: map[int]string{}, systemLabels: rec.SystemLabels, GitHubPool: api.GitHubPool{
 		Owner: rec.Owner, Name: rec.Name, Avatar: rec.Avatar, URL: rec.URL, ScaleSet: rec.ScaleSet, ScaleSetID: rec.ScaleSetID, Labels: rec.Labels, Max: rec.Max,
 		Resources: rec.Resources, TokenFrom: rec.TokenFrom, Shared: rec.Shared, CreatedAt: rec.CreatedAt, Runs: rec.Runs, LastRun: rec.LastRun,
 		State: api.GitHubPreparing, Detail: "connecting to GitHub",
@@ -307,26 +313,32 @@ func (s *Server) listenPool(ctx context.Context, p *githubPool, done chan struct
 		return errors.New("replaced")
 	}
 	p.State, p.Detail = api.GitHubPreparing, "connecting to GitHub"
-	url, token, name, labels, owner := p.URL, p.token, p.ScaleSet, append([]string(nil), p.Labels...), p.Owner
+	url, token, name, labels, owner := p.URL, p.token, p.ScaleSet, p.scaleSetLabels(), p.Owner
 	s.mu.Unlock()
 	c, err := s.githubClient(url, token)
 	if err != nil {
 		return err
 	}
-	ss, err := ensureScaleSet(ctx, c, name, scaleSetLabels(labels))
+	ss, err := ensureScaleSet(ctx, c, name, labels)
 	if err != nil {
 		return err
 	}
-	login, display, avatar, perr := githubProfile(ctx, token, owner)
-	if perr != nil {
-		log.Printf("github %s: its name and avatar on GitHub: %v", owner, perr)
-	}
+	go func() { // the name and avatar are for show: jobs never wait for them
+		login, display, avatar, err := githubProfile(ctx, token, owner)
+		if err != nil {
+			log.Printf("github %s: its name and avatar on GitHub: %v", owner, err)
+			return
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if p.done == done && p.State != api.GitHubRemoving && strings.EqualFold(login, p.Owner) { // same key; only the spelling changes
+			p.Owner, p.Name, p.Avatar = login, display, avatar
+			p.save()
+		}
+	}()
 	s.mu.Lock()
 	if p.done == done {
 		p.ScaleSetID, p.gh = ss.ID, c
-		if perr == nil && strings.EqualFold(login, p.Owner) { // the same key; only the spelling changes
-			p.Owner, p.Name, p.Avatar = login, display, avatar
-		}
 		p.save()
 		p.Detail = "installing the GitHub Actions runner"
 	}
@@ -841,8 +853,18 @@ func downloadActionsRunner(ctx context.Context, ver, dir string) error {
 func (s *Server) githubViewLocked(p *githubPool) api.GitHubPool {
 	v := p.GitHubPool
 	v.Labels = append([]string(nil), p.Labels...)
-	v.SystemLabels = githubSystemLabels()
+	if p.systemLabels {
+		v.SystemLabels = githubSystemLabels()
+	}
 	return v
+}
+
+// scaleSetLabels are the labels the pool's scale set carries.
+func (p *githubPool) scaleSetLabels() []string {
+	if p.systemLabels {
+		return scaleSetLabels(p.Labels)
+	}
+	return append([]string(nil), p.Labels...)
 }
 
 // githubSystemLabels are the labels GitHub gives every self-hosted runner unless told otherwise.
@@ -1020,7 +1042,7 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	if ss != nil && ss.Name == name {
 		rec.ScaleSetID = ss.ID
 	}
-	rec.Token = req.Token
+	rec.Token, rec.SystemLabels = req.Token, true // adding (again) takes GitHub's default labels
 	if err := writeFileJSON(filepath.Join(dir, "pool.json"), rec); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -1030,6 +1052,7 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		s.github[key] = p
 	} else {
 		p.token, p.Labels, p.Max, p.Resources, p.TokenFrom, p.Shared, p.ScaleSetID = req.Token, rec.Labels, rec.Max, rec.Resources, rec.TokenFrom, rec.Shared, rec.ScaleSetID
+		p.systemLabels = true
 	}
 	p.State, p.Detail = api.GitHubPreparing, "connecting to GitHub"
 	s.restartPoolLocked(p)

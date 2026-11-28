@@ -873,7 +873,7 @@ function renderTable() {
 
 // ---------- GitHub ----------
 const workloadHash = (r, id) => `#/${r.jobs.some((j) => j.id === id && j.spec.github) ? "github" : "containers"}/${encodeURIComponent(r.name)}/${encodeURIComponent(id)}`;
-const ghPool = (r, owner) => (r.github || []).find((p) => p.owner === owner);
+const ghPool = (r, owner) => (r.github || []).find((p) => p.owner.toLowerCase() === (owner || "").toLowerCase());
 const ghSettings = (owner) => owner.includes("/") ? `https://github.com/${owner}/settings/actions/runners` : `https://github.com/organizations/${owner}/settings/actions/runners`;
 const agoCoarse = (t) => { const x = since(t); return x < 60 ? "just now" : x < 3600 ? Math.round(x / 60) + "m ago" : fmtDur(x) + " ago"; };
 const runsOn = (labels) => (!labels?.length ? "offload" : labels.length === 1 ? labels[0] : "[" + labels.join(", ") + "]");
@@ -1101,6 +1101,11 @@ function ownerCard(owner, list) {
   const snippet = "runs-on: " + runsOn(first.labels);
   const sameLabels = list.every(([, p]) => runsOn(p.labels) === runsOn(first.labels));
   const sameCaches = list.every(([, p]) => !!p.shared === !!first.shared);
+  // GitHub's default labels: the ones every runner has here; the rest (an architecture) per runner.
+  const sys = list.map(([, p]) => p.system_labels || []);
+  const shared = sys[0].filter((l) => sys.every((x) => x.includes(l)));
+  const own = (p) => (p.system_labels || []).filter((l) => !shared.includes(l));
+  const sharedAll = list.every(([, p]) => !own(p).length);
   const finished = sum(list, ([, p]) => p.runs);
   const last = list.map(([, p]) => p.last_run).filter(Boolean).sort().pop();
   const per = first.resources;
@@ -1119,9 +1124,10 @@ function ownerCard(owner, list) {
         poolChip(p),
         h("div", { class: "room" }, slots(p), h("span", { class: p.state === "failed" ? "crit-text" : "muted" }, roomText(p)),
           sameLabels ? null : h("span", { class: "runs-on-row" }, h("code", {}, "runs-on: " + runsOn(p.labels)), copyBtn("runs-on: " + runsOn(p.labels))),
-          sameCaches ? null : h("span", { class: p.shared ? "" : "muted" }, p.shared ? "shared caches" : "clean caches"))))),
-    (first.system_labels || []).length ? h("div", { class: "gh-also muted" }, "Also matches GitHub's self-hosted labels: ",
-      ...first.system_labels.map((l, i) => [i ? ", " : "", h("code", {}, l)]).flat()) : null,
+          sameCaches ? null : h("span", { class: p.shared ? "" : "muted" }, p.shared ? "shared caches" : "clean caches"),
+          own(p).length ? h("span", { class: "muted" }, "also ", ...own(p).map((l, i) => [i ? ", " : "", h("code", {}, l)]).flat()) : null)))),
+    shared.length ? h("div", { class: "gh-also muted" }, "Also matches GitHub's self-hosted labels: ",
+      ...shared.map((l, i) => [i ? ", " : "", h("code", {}, l)]).flat(), sharedAll ? "" : " (and each runner's own, below)") : null,
     h("div", { class: "runner-foot gh-foot" },
       h("span", {}, "Each job ", h("b", {}, `${fmtCores(per.cpu)}–${fmtCores(per.cpu_max)} cores`), " · ", h("b", {}, fmtBytes(per.mem))),
       h("span", {}, h("b", {}, finished), " finished", last ? " · last one " + agoCoarse(last) : ""),

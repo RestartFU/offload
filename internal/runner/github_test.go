@@ -336,3 +336,16 @@ func TestGitHubAvatarHost(t *testing.T) {
 		}
 	}
 }
+
+// GitHub's default labels widen which workflows reach a pool: a pool from before them keeps its
+// own labels until it is added again.
+func TestGitHubSystemLabelsOnlyWhenChosen(t *testing.T) {
+	_, p, _ := newGitHubServer(t)
+	if got := p.scaleSetLabels(); len(got) != 1 || got[0] != "offload" {
+		t.Fatalf("older pool's scale set labels %v", got)
+	}
+	p.systemLabels = true
+	if got := p.scaleSetLabels(); len(got) != 4 || got[0] != "self-hosted" {
+		t.Fatalf("labels %v", got)
+	}
+}
