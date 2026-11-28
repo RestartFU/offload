@@ -12,11 +12,13 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -114,7 +116,23 @@ func isOutput(p string, outputs []os.FileInfo) bool {
 var (
 	shardReport     *os.File
 	shardReportOnce sync.Once
+	shardReportMu   sync.Mutex
 )
+
+var errDetached = errors.New("another shard's output closed, so this one stopped following")
+
+// detachOnSignal ends ctx with errDetached on SIGUSR1, which the parent sends every shard once
+// one of them found the shared output closed: a quiet shard would never find out itself.
+func detachOnSignal(ctx context.Context) context.Context {
+	ctx, detach := context.WithCancelCause(ctx)
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGUSR1)
+	go func() {
+		<-c
+		detach(errDetached)
+	}()
+	return ctx
+}
 
 // openShardReport takes fd 3 for reporting, but only if it is the pipe a parent passed: with
 // the variable set by hand, fd 3 may be anything this process opened.
@@ -140,15 +158,23 @@ func placeKey(h *Host) string {
 // reportPlaced tells the parent which runner took this shard's job, once.
 func reportPlaced(h *Host) {
 	shardReportOnce.Do(func() {
-		if shardReport != nil {
-			plat := ""
-			if h.Status != nil {
-				plat = h.Status.OS + "/" + h.Status.Arch
-			}
-			fmt.Fprintln(shardReport, placeKey(h), plat)
-			shardReport.Close()
+		plat := ""
+		if h.Status != nil {
+			plat = h.Status.OS + "/" + h.Status.Arch
 		}
+		report(placeKey(h) + " " + plat)
 	})
+}
+
+// reportClosed tells the parent this shard's output is closed.
+func reportClosed() { report("closed") }
+
+func report(line string) {
+	shardReportMu.Lock()
+	defer shardReportMu.Unlock()
+	if shardReport != nil {
+		fmt.Fprintln(shardReport, line)
+	}
 }
 
 // markPlaced counts the earlier shards on each candidate, which pick holds against it.
@@ -201,16 +227,24 @@ func runShards(ctx context.Context, o RunOptions) (int, error) {
 
 // fanOut runs n children of this binary with args, child i as shard i. Each starts after the
 // previous one reported its runner on fd 3 (or exited) and learns where the earlier ones went.
-// An interrupt is passed on to every child, which cancels its own job.
+// An interrupt is passed on to every child, which cancels its own job. A child that reports its
+// output closed makes them all detach, and no more start.
 func fanOut(ctx context.Context, self string, args, env []string, n int, stdout, stderr *os.File) ([]int, error) {
 	var mu sync.Mutex
 	var started []*exec.Cmd
-	interrupt := func() {
+	signalAll := func(sig os.Signal) {
 		mu.Lock()
 		defer mu.Unlock()
 		for _, c := range started {
-			_ = c.Process.Signal(os.Interrupt)
+			_ = c.Process.Signal(sig)
 		}
+	}
+	interrupt := func() { signalAll(os.Interrupt) }
+	var closed sync.Once
+	var detached atomic.Bool
+	detach := func() {
+		detached.Store(true)
+		signalAll(syscall.SIGUSR1)
 	}
 	defer context.AfterFunc(ctx, interrupt)()
 
@@ -222,6 +256,10 @@ func fanOut(ctx context.Context, self string, args, env []string, n int, stdout,
 	for k := range n {
 		if ctx.Err() != nil {
 			codes[k] = 130
+			continue
+		}
+		if detached.Load() {
+			codes[k] = 1
 			continue
 		}
 		r, w, err := os.Pipe()
@@ -253,9 +291,25 @@ func fanOut(ctx context.Context, self string, args, env []string, n int, stdout,
 			defer wg.Done()
 			codes[k] = exitCode(cmd.Wait())
 		}()
-		line, _ := bufio.NewReader(r).ReadString('\n')
-		r.Close()
-		if f := strings.Fields(line); len(f) > 0 {
+		br := bufio.NewReader(r)
+		line, _ := br.ReadString('\n')
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer r.Close()
+			for {
+				l, err := br.ReadString('\n')
+				if strings.TrimSpace(l) == "closed" {
+					closed.Do(detach)
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		if strings.TrimSpace(line) == "closed" {
+			closed.Do(detach)
+		} else if f := strings.Fields(line); len(f) > 0 {
 			placed = append(placed, f[0])
 			if platform == "" && len(f) > 1 {
 				platform = f[1]

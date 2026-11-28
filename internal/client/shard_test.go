@@ -16,7 +16,11 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	if os.Getenv("OFFLOAD_TEST_SHARD_CHILD") != "" {
+	switch os.Getenv("OFFLOAD_TEST_SHARD_CHILD") {
+	case "detach":
+		detachTestChild()
+	case "":
+	default:
 		shardTestChild()
 	}
 	os.Exit(m.Run())
@@ -40,6 +44,34 @@ func shardTestChild() {
 		os.Exit(3)
 	}
 	os.Exit(0)
+}
+
+// detachTestChild follows "forever"; the last shard finds the shared output closed.
+func detachTestChild() {
+	i, n, _ := shardChild()
+	ctx := detachOnSignal(context.Background())
+	openShardReport()
+	reportPlaced(&Host{URL: fmt.Sprintf("http://r%d", i)})
+	if i == n {
+		reportClosed()
+	}
+	select {
+	case <-ctx.Done():
+		if errors.Is(context.Cause(ctx), errDetached) {
+			os.Exit(7)
+		}
+	case <-time.After(time.Minute):
+	}
+	os.Exit(1)
+}
+
+// One shard finding the output closed detaches every shard, quiet ones included.
+func TestFanOutDetachesAllOnClosedOutput(t *testing.T) {
+	t.Setenv("OFFLOAD_TEST_SHARD_CHILD", "detach")
+	codes, err := fanOut(context.Background(), os.Args[0], []string{"-test.run=^$"}, nil, 2, os.Stdout, os.Stderr)
+	if err != nil || fmt.Sprint(codes) != "[7 7]" {
+		t.Fatalf("codes %v, %v; want both detached", codes, err)
+	}
 }
 
 func TestFanOutPlacesShardsInTurn(t *testing.T) {

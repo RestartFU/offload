@@ -112,6 +112,9 @@ func Run(o RunOptions) (int, error) {
 	signal.Ignore(syscall.SIGPIPE)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
+	if outPrefix != "" {
+		ctx = detachOnSignal(ctx)
+	}
 	cfg, err := LoadConfig()
 	if err != nil {
 		return 1, err
@@ -201,10 +204,16 @@ func Run(o RunOptions) (int, error) {
 		}
 		h, j, err := submit(ctx, cfg, o, spec, ws, pendingBaseline)
 		if err != nil {
+			if errors.Is(context.Cause(ctx), errDetached) { // before it started: submit cancelled it
+				return 1, fmt.Errorf("%w; it hadn't started, so it was cancelled", errDetached)
+			}
 			if ctx.Err() != nil {
 				return 130, nil
 			}
 			return 1, err
+		}
+		if outPrefix != "" && spec.Platform == "" && h.Status != nil { // retries and moves too
+			spec.Platform = h.Status.OS + "/" + h.Status.Arch
 		}
 		ref := RefName(Discover(ctx, cfg), h) + ":" + j.ID
 		if o.Detach {
@@ -216,6 +225,9 @@ func Run(o RunOptions) (int, error) {
 			relocate = func(q api.Job) bool { return moveQueued(ctx, cfg, h, spec, q, o.Quiet) }
 		}
 		code, done, err := follow(ctx, h, j.ID, o.Quiet, true, cfg, relocate)
+		if errors.Is(err, syscall.EPIPE) {
+			reportClosed() // the other shards share this output: they stop following too
+		}
 		if errors.Is(err, errMoved) {
 			_ = os.Remove(baselinePath(j.ID)) // never ran: nothing of it to write back
 			moves++
@@ -368,6 +380,10 @@ func submit(ctx context.Context, cfg *Config, o RunOptions, spec api.JobSpec, ws
 				if ctx.Err() != nil { // interrupted: give the reserved job back now
 					cancelJob(h, j.ID)
 					return nil, j, ctx.Err()
+				}
+				if outPrefix != "" { // a shard without it could test other code than the rest
+					cancelJob(h, j.ID)
+					return nil, j, fmt.Errorf("git history not sent: %w", err)
 				}
 				logf(false, "git history not sent (%v); the job runs without .git", err)
 			}
@@ -559,6 +575,9 @@ func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bo
 		return 0, nil, errMoved
 	}
 	if ctx.Err() != nil {
+		if errors.Is(context.Cause(ctx), errDetached) {
+			return 1, nil, fmt.Errorf("%w (it keeps running: offload attach %s:%s)", errDetached, h.Name, id)
+		}
 		if cancelOnInterrupt {
 			logf(quiet, "cancelling %s:%s", h.Name, id)
 			if err := cancelJob(h, id); err != nil {

@@ -266,7 +266,9 @@ func cmdRun(args []string) (int, error) {
 	fs.BoolVar(&o.Quiet, "q", false, "")
 	fs.IntVar(&o.Shards, "shards", 0, "")
 	_ = fs.Parse(fl)
-	if o.Shards < 0 || o.Shards > client.MaxShards {
+	shardsSet := false
+	fs.Visit(func(f *flag.Flag) { shardsSet = shardsSet || f.Name == "shards" })
+	if o.Shards < 0 || o.Shards > client.MaxShards || shardsSet && o.Shards == 0 {
 		return 2, fmt.Errorf("--shards wants 1 to %d", client.MaxShards)
 	}
 	if rest == nil {
