@@ -1029,6 +1029,9 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		if changed {
 			log.Printf("%s by %s", map[bool]string{true: "paused", false: "resumed"}[req.Paused], callerOf(r))
+			if !req.Paused {
+				go s.prebuildBase()
+			}
 		}
 	}
 	s.pauseMu.Unlock()

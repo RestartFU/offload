@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -141,5 +142,63 @@ func TestBridgeNeverStopsWithoutInitialize(t *testing.T) {
 	b.fromServer([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
 	if d := b.idleFor(); d != 0 {
 		t.Fatalf("idle for %s without an initialize to replay", d)
+	}
+}
+
+// A session that can't start again (its runner paused, say) fails that request, not the bridge.
+func TestBridgeSurvivesFailedRestart(t *testing.T) {
+	inR, inW := io.Pipe()
+	out := &lineSink{lines: make(chan string, 16)}
+	opened := make(chan *fakeSession, 2)
+	tick := make(chan time.Time)
+	opens := 0
+	b := &bridge{idle: time.Nanosecond, tick: tick, out: out, open: func(w io.Writer) (mcpSession, error) {
+		if opens++; opens == 2 {
+			return nil, errors.New("vps: paused")
+		}
+		f := &fakeSession{w: w, got: make(chan string, 16), end: make(chan error, 1), stopped: make(chan struct{})}
+		opened <- f
+		return f, nil
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx, inR) }()
+	send := func(s string) {
+		t.Helper()
+		if _, err := io.WriteString(inW, s+"\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first := recv(t, opened)
+	send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	recv(t, first.got)
+	first.reply(t, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+	recv(t, out.lines)
+	tick <- time.Now()
+	recv(t, first.stopped)
+
+	send(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}`)
+	var resp struct {
+		ID    int `json:"id"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(recv(t, out.lines)), &resp); err != nil || resp.ID != 2 || !strings.Contains(resp.Error.Message, "vps: paused") {
+		t.Fatalf("failed restart answered %+v (%v), want an error for id 2", resp, err)
+	}
+
+	send(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}`)
+	third := recv(t, opened)
+	recv(t, third.got) // the replayed initialize
+	if got := recv(t, third.got); got != `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}` {
+		t.Fatalf("after a failed restart, sent %s", got)
+	}
+	inW.Close()
+	third.end <- nil
+	if err := recv(t, done); err != nil {
+		t.Fatal(err)
 	}
 }

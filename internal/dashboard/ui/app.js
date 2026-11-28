@@ -366,7 +366,9 @@ function renderOverview() {
   const runners = scoped();
   $("#ov-alerts").replaceChildren(...alertsFor(runners, state.fleet.version).map(([k, msg]) => h("div", { class: "alert " + k, role: k === "critical" ? "alert" : null }, icon(k), h("div", {}, msg))));
   renderKPIs(runners);
+  const focused = document.activeElement?.dataset?.pause;
   $("#ov-runners").replaceChildren(...runners.map(runnerCard));
+  if (focused != null) [...document.querySelectorAll("#ov-runners [data-pause]")].find((b) => b.dataset.pause === focused)?.focus();
   renderQueue(runners);
 }
 
@@ -482,7 +484,8 @@ function pauseBtn(r) {
   const label = (paused ? "Resume " : "Pause ") + r.name;
   const glyph = paused ? s("path", { d: "M5.5 3.5v9l7-4.5z", fill: "currentColor", "stroke-linejoin": "round" })
     : s("path", { d: "M5.5 3.5v9M10.5 3.5v9", stroke: "currentColor", "stroke-width": 2.2, "stroke-linecap": "round" });
-  return h("button", { class: "icon-btn", type: "button", "aria-label": label, title: paused ? label : label + ": start no new work, let running work finish", disabled: busy, onclick: async () => {
+  return h("button", { class: "icon-btn", type: "button", "data-pause": r.name, "aria-label": label, title: paused ? label : label + ": start no new work, let running work finish", "aria-disabled": busy ? "true" : null, onclick: async () => {
+    if (state.pausing.get(r.name) === "") return;
     state.pausing.set(r.name, ""); render();
     try {
       const res = await api("/api/pause", { method: "POST", headers: { "Content-Type": "application/json", "X-Offload-Dashboard": "1" }, body: JSON.stringify({ host: r.name, paused: !paused }) });

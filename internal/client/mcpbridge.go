@@ -117,7 +117,16 @@ func (b *bridge) run(ctx context.Context, in io.Reader) error {
 					continue // a notification or an answer meant for the stopped server
 				}
 				if cur, err = b.wake(); err != nil {
-					return err
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					// Say why and stay up: the runner may take work again (a resume, free room).
+					fmt.Fprintf(os.Stderr, "offload: couldn't start the session again: %v\n", err)
+					msg, _ := json.Marshal("offload couldn't start the session again: " + err.Error())
+					if err := b.emit(fmt.Appendf(nil, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":%s}}`+"\n", m.ID, msg)); err != nil {
+						return err
+					}
+					continue
 				}
 			}
 			b.record(m, l.line)

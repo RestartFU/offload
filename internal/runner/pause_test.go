@@ -14,8 +14,9 @@ import (
 func TestPauseRefusesNewWorkUntilResumed(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &Config{StateDir: dir, memCap: 8 << 30, defMem: 1 << 30, memReserve: -1}
-	cfg.Capacity.CPU, cfg.Defaults.CPU = 4, 1
-	s := &Server{cfg: cfg, jobs: map[string]*job{}, sessions: map[string]*session{}, wake: make(chan struct{}, 1)}
+	cfg.Capacity.CPU, cfg.Defaults.CPU, cfg.Container.Runtime = 4, 1, "host"
+	s := &Server{cfg: cfg, jobs: map[string]*job{}, sessions: map[string]*session{}, wake: make(chan struct{}, 1),
+		builds: map[string]*envBuild{}, readyImages: map[string]bool{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/admin/pause", s.handlePause)
 	mux.HandleFunc("POST /v1/jobs", s.handleCreateJob)
