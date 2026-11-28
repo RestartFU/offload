@@ -33,7 +33,7 @@ func shardTestChild() {
 	if !ok {
 		os.Exit(99)
 	}
-	openShardReport()
+	openShardPipes()
 	reportPlaced(&Host{URL: fmt.Sprintf("http://r%d", i), Status: &api.Status{OS: "linux", Arch: fmt.Sprintf("a%d", i)}})
 	w := &lineWriter{w: os.Stdout, prefix: fmt.Sprintf("[%d/%d] ", i, n)}
 	fmt.Fprintf(w, "shard %d of %d after [%s] on [%s]\npartial", i, n, os.Getenv(shardPlacedEnv), os.Getenv(shardPlatformEnv))
@@ -49,8 +49,8 @@ func shardTestChild() {
 // detachTestChild follows "forever"; the last shard finds the shared output closed.
 func detachTestChild() {
 	i, n, _ := shardChild()
-	ctx := detachOnSignal(context.Background())
-	openShardReport()
+	openShardPipes()
+	ctx := watchDetach(context.Background())
 	reportPlaced(&Host{URL: fmt.Sprintf("http://r%d", i)})
 	if i == n {
 		reportClosed()
@@ -117,21 +117,24 @@ func TestAsShard(t *testing.T) {
 	}
 }
 
-func TestSourceDigest(t *testing.T) {
-	ws := &Workspace{Dir: ".", Git: &api.GitRef{Head: "abc"}, Manifest: []api.FileEntry{{Path: "a", Hash: "1"}, {Path: "b", Hash: "2"}}}
-	d := sourceDigest(ws)
-	ws.Manifest[0], ws.Manifest[1] = ws.Manifest[1], ws.Manifest[0]
-	if sourceDigest(ws) != d {
-		t.Fatal("the order files were listed in must not matter")
+func TestSourceChanges(t *testing.T) {
+	src := func(head string, files ...api.FileEntry) shardSource {
+		return shardSource{Dir: ".", Git: &api.GitRef{Head: head}, Manifest: files}
 	}
-	ws.Manifest[0].Hash = "3"
-	if sourceDigest(ws) == d {
-		t.Fatal("a changed file must change the digest")
+	a, b := api.FileEntry{Path: "a", Hash: "1"}, api.FileEntry{Path: "b", Hash: "2"}
+	if got := sourceChanges(src("h", a, b), src("h", b, a)); len(got) != 0 {
+		t.Fatalf("the order files were listed in must not matter: %v", got)
 	}
-	ws.Manifest[0].Hash = "2"
-	ws.Manifest = append(ws.Manifest, api.FileEntry{Path: "new_test.go", Hash: "4"})
-	if sourceDigest(ws) == d {
-		t.Fatal("a new file must change the digest")
+	b2 := b
+	b2.Hash = "3"
+	if got := sourceChanges(src("h", a, b), src("h", a, b2, api.FileEntry{Path: "c"})); fmt.Sprint(got) != "[b c]" {
+		t.Fatalf("got %v; want the changed and the new file", got)
+	}
+	if got := sourceChanges(src("h", a, b), src("h", a)); fmt.Sprint(got) != "[b]" {
+		t.Fatalf("got %v; want the removed file", got)
+	}
+	if got := sourceChanges(src("h", a), src("i", a)); fmt.Sprint(got) != "[git]" {
+		t.Fatalf("got %v; want git", got)
 	}
 }
 
@@ -246,7 +249,7 @@ func TestLineWriterFlushReportsErrors(t *testing.T) {
 
 func TestLineWriterKeepsLinesWhole(t *testing.T) {
 	var buf bytes.Buffer
-	l := &lineWriter{w: &buf, prefix: "[1/2] "}
+	l := &lineWriter{w: &buf, prefix: "[1/2] ", wait: time.Hour}
 	l.Write([]byte("a\nb"))
 	l.Write([]byte("c\nd\n"))
 	l.Write([]byte("e"))

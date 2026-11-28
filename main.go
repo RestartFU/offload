@@ -199,7 +199,7 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "offload: %v\n", err)
+		fmt.Fprintf(os.Stderr, client.OutPrefix()+"offload: %v\n", err)
 		if code == 0 {
 			code = 1
 		}

@@ -97,7 +97,7 @@ func Run(o RunOptions) (int, error) {
 		if o.Platform == "" { // the first shard's: a suite's tests can differ by architecture
 			o.Platform = os.Getenv(shardPlatformEnv)
 		}
-		openShardReport()
+		openShardPipes()
 		outPrefix = fmt.Sprintf("[%d/%d] ", i, n)
 		o = asShard(o, i, n)
 	}
@@ -113,7 +113,7 @@ func Run(o RunOptions) (int, error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 	if outPrefix != "" {
-		ctx = detachOnSignal(ctx)
+		ctx = watchDetach(ctx)
 	}
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -164,8 +164,10 @@ func Run(o RunOptions) (int, error) {
 		if outPrefix != "" {
 			dropOutputs(ws)
 		}
-		if shardSource != "" && sourceDigest(ws) != shardSource {
-			return 1, errors.New("the source changed while the shards were starting, so they would test different code; run again")
+		if shardSource != "" {
+			if err := checkShardSource(shardSource, ws); err != nil {
+				return 1, err
+			}
 		}
 		spec.WorkspaceKey, spec.Manifest, spec.Dir = ws.Key, ws.Manifest, ws.Dir
 		spec.GitTree, spec.IgnoreRules, spec.IgnoreGlobal = ws.GitTree, ws.IgnoreRules, ws.IgnoreGlobal
@@ -904,7 +906,11 @@ func finish(ctx context.Context, h *Host, ref string, j *api.Job, ws *Workspace,
 			artErr = fmt.Errorf("%d artifact(s) not written over local changes (saved beside them)", kept)
 		}
 		if len(j.ArtifactsMissing) > 0 && artErr == nil {
-			artErr = fmt.Errorf("the job didn't produce %s (the other artifacts were downloaded)", strings.Join(j.ArtifactsMissing, ", "))
+			got := "downloaded"
+			if o.KeepOutputs {
+				got = "kept"
+			}
+			artErr = fmt.Errorf("the job didn't produce %s (the other artifacts were %s)", strings.Join(j.ArtifactsMissing, ", "), got)
 		}
 	}
 	if j.StartedAt != nil && j.FinishedAt != nil && j.State == api.StateExited {
