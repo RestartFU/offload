@@ -133,12 +133,15 @@ func githubHosts(hosts []*Host, on []string, forAdd bool) ([]*Host, error) {
 	return out, nil
 }
 
+// errNoGitHub is a runner from before GitHub support: it has no pools.
+var errNoGitHub = errors.New("too old for GitHub jobs")
+
 func githubPools(ctx context.Context, h *Host) ([]api.GitHubPool, error) {
 	var pools []api.GitHubPool
 	err := h.do(ctx, "GET", "/v1/github", nil, &pools)
 	var ae *APIError
 	if errors.As(err, &ae) && ae.Code == 404 {
-		return nil, fmt.Errorf("%s is too old for GitHub jobs: run `offload host upgrade %s`", h.Name, h.Name)
+		return nil, fmt.Errorf("%w: run `offload host upgrade %s`", errNoGitHub, h.Name)
 	}
 	return pools, err
 }
@@ -324,6 +327,9 @@ func GitHubList() error {
 	var owners []string
 	for _, h := range hosts {
 		pools, err := githubPools(ctx, h)
+		if errors.Is(err, errNoGitHub) {
+			continue
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", h.Name, err)
 			continue
@@ -400,6 +406,7 @@ func GitHubRemove(raw string, on []string, forget bool) error {
 	for _, h := range hosts {
 		pools, err := githubPools(ctx, h)
 		switch {
+		case errors.Is(err, errNoGitHub): // it can't have any
 		case err != nil:
 			unchecked = append(unchecked, fmt.Sprintf("%s (%v)", h.Name, err))
 		case githubFind(pools, key) != nil:

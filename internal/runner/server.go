@@ -52,6 +52,7 @@ type Server struct {
 	slots    map[string][]*slot
 	github   map[string]*githubPool // GitHub Actions runner pools, by owner key
 	serveCtx context.Context        // Serve's context, for pools added while it runs
+	githubOp sync.Mutex             // one github add or rm at a time: neither races the other on GitHub
 	cpuUse   map[int]int
 	features map[string]bool
 	history  map[string]*histEntry

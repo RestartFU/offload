@@ -203,15 +203,15 @@ func TestGitHubFailingRunnersPause(t *testing.T) {
 // Pools and their runners' slots come back after a restart.
 func TestGitHubRestore(t *testing.T) {
 	s, p, f := newGitHubServer(t)
-	if err := os.WriteFile(filepath.Join(p.dir, "token"), []byte("TOKEN\n"), 0o600); err != nil || p.save() != nil {
+	if err := p.save(); err != nil {
 		t.Fatal(err)
 	}
 	if err := (&githubScaler{s: s, p: p, session: f}).Scale(context.Background(), stats(1)); err != nil {
 		t.Fatal(err)
 	}
 	j := s.githubJobsLocked(p)[0]
-	if fi, err := os.Stat(filepath.Join(p.dir, "token")); err != nil || fi.Mode().Perm() != 0o600 {
-		t.Fatalf("token file: %v %v", fi, err)
+	if fi, err := os.Stat(filepath.Join(p.dir, "pool.json")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("pool record with the token: %v %v", fi, err)
 	}
 	s2 := &Server{cfg: s.cfg, jobs: map[string]*job{j.ID: j}, github: map[string]*githubPool{}}
 	s2.restoreGitHub()
@@ -265,6 +265,18 @@ func TestGitHubOrgJobsStartClean(t *testing.T) {
 	argv := strings.Join(s.containerArgv(j, map[string]string{}, j.dir, ""), " ")
 	if strings.Contains(argv, "/opt/offload/go/pkg/mod") || !strings.Contains(argv, j.GitHub.Dir+"/containers:/var/lib/containers") {
 		t.Fatalf("org job mounts shared caches or misses its own store: %s", argv)
+	}
+	p.Shared = true
+	if err := (&githubScaler{s: s, p: p, session: f}).Scale(context.Background(), stats(2)); err != nil {
+		t.Fatal(err)
+	}
+	for _, sj := range s.githubJobsLocked(p) {
+		if sj.GitHub.Slot >= 0 {
+			argv := strings.Join(s.containerArgv(sj, map[string]string{}, sj.dir, ""), " ")
+			if !strings.Contains(argv, s.cacheDir("github", "acme", "go-mod")+":/opt/offload/go/pkg/mod") {
+				t.Fatalf("shared pool's caches aren't its own runner-owned tree: %s", argv)
+			}
+		}
 	}
 	w := httptest.NewRecorder()
 	s.handleCreateJob(w, httptest.NewRequest("POST", "/v1/jobs", strings.NewReader(`{"argv":["true"],"github":"acme"}`)))

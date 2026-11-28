@@ -176,7 +176,8 @@ keepalive doesn't wake it. Server state, such as a running game, doesn't survive
 - **Capacity counts the runner's real room** (CPU with overbooking, memory room, queued work)
   in units of one GitHub job, booked at its learned peak. Several pools on one runner each see
   the same room; the few jobs that over-assigns wait in offload's queue like any job.
-- **The token is stored on the runner,** unlike job secrets: the listener needs it for as long
+- **The token is stored on the runner,** in the pool's record (one atomic 0600 write, so settings
+  and token never disagree after a crash), unlike job secrets: the listener needs it for as long
   as the pool exists. It defaults to the client's gh login because that is the setup with no
   extra steps; a fine-grained token with only the runners permission is the narrow option.
 - **Shared, read-only actions runner.** The runner installs the release itself (checked daily)
@@ -185,8 +186,9 @@ keepalive doesn't wake it. Server state, such as a running game, doesn't survive
   so its mounts can't depend on the repository. Writable state (work directory with checkouts and
   tool cache, the inner image store, dependency caches, a rustup layer) therefore persists only
   where every job is the same trust domain: a repository's pool, or an organization added with
-  `--shared-cache`. There it lives in slots, one job at a time; otherwise each job gets its own,
-  deleted when it ends. The slot and paths come from the runner's own job record: a client's job
+  `--shared-cache`. There it lives in slots, one job at a time, and its dependency caches in
+  `cache/github/<owner>`, a tree no client's workspace key can name; otherwise each job gets its
+  own, deleted when it ends. The slot and paths come from the runner's own job record: a client's job
   can't name a GitHub pool.
 - **A removal finishes only once GitHub confirms it** (or the scale set is already gone), so a
   timeout never leaves a scale set nobody knows about. A token that no longer works would block

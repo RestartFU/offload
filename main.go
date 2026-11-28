@@ -378,7 +378,7 @@ func cmdGitHub(args []string) error {
 		res := resourceFlags(fs)
 		_ = fs.Parse(args[2:])
 		if fs.NArg() > 0 {
-			die("offload github add: unexpected " + strings.Join(fs.Args(), " ") + " (flags go after ORG[/REPO])")
+			die("offload github add: unexpected arguments after the flags (give one ORG[/REPO], then flags)")
 		}
 		fs.Visit(func(f *flag.Flag) {
 			switch f.Name {
@@ -407,7 +407,7 @@ func cmdGitHub(args []string) error {
 		forget := fs.Bool("forget", false, "remove here even if GitHub can't be told (a revoked token)")
 		_ = fs.Parse(args[2:])
 		if fs.NArg() > 0 {
-			die("offload github rm: unexpected " + strings.Join(fs.Args(), " ") + " (one ORG[/REPO], then flags)")
+			die("offload github rm: unexpected arguments after the flags (give one ORG[/REPO], then flags)")
 		}
 		fs.Visit(func(f *flag.Flag) {
 			if f.Name == "on" && len(list(*on)) == 0 {

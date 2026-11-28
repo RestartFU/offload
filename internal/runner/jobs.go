@@ -1432,9 +1432,6 @@ func (s *Server) gcRepoStoresLocked() {
 	for _, j := range s.jobs {
 		if !api.Terminal(j.State) {
 			inUse[j.Spec.WorkspaceKey] = true
-			if j.Spec.GitHub != "" {
-				inUse[githubScope(j.Spec.GitHub)] = true
-			}
 		}
 	}
 	for _, list := range s.slots {

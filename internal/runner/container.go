@@ -588,6 +588,8 @@ func (s *Server) workloadMounts(scope, rustupLayer string) []string {
 	base := ""
 	if name, ok := strings.CutPrefix(scope, "session:"); ok && validKey(name) {
 		base = s.cacheDir("sessions", name)
+	} else if key, ok := strings.CutPrefix(scope, "github:"); ok && validKey(key) {
+		base = s.cacheDir("github", key) // runner-owned: no client's workspace key can name it
 	} else if scope != "" && validKey(scope) {
 		base = s.cacheDir("scoped", scope)
 	}

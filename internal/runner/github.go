@@ -71,7 +71,8 @@ type githubPool struct {
 	listener   *listener.Listener
 }
 
-// githubPoolRecord is what pool.json keeps; the token lives in its own 0600 file.
+// githubPoolRecord is what pool.json keeps (0600, in a 0700 directory), the token included: one
+// atomic write keeps settings and token together.
 type githubPoolRecord struct {
 	Owner      string        `json:"owner"`
 	URL        string        `json:"url"`
@@ -87,11 +88,14 @@ type githubPoolRecord struct {
 	LastRun    *time.Time    `json:"last_run,omitempty"`
 	Removing   bool          `json:"removing,omitempty"`
 	Forget     bool          `json:"forget,omitempty"`
+	Token      string        `json:"token"`
 }
 
 func (s *Server) githubDir() string { return filepath.Join(s.cfg.StateDir, "github") }
 
-func githubScope(key string) string { return "github-" + key }
+// githubScope names a pool's dependency caches (cache/github/<key>), apart from the caches of
+// clients' workspaces, whose keys clients choose.
+func githubScope(key string) string { return "github:" + key }
 
 var scaleSetNameRE = regexp.MustCompile(`[^a-z0-9-]+`)
 
@@ -111,7 +115,7 @@ func githubScaleSetName(runner, id string) string {
 func (p *githubPool) record() githubPoolRecord {
 	return githubPoolRecord{Owner: p.Owner, URL: p.URL, ScaleSet: p.ScaleSet, ScaleSetID: p.ScaleSetID, Labels: p.Labels,
 		Max: p.Max, Resources: p.Resources, TokenFrom: p.TokenFrom, Shared: p.Shared, CreatedAt: p.CreatedAt, Runs: p.Runs,
-		LastRun: p.LastRun, Removing: p.State == api.GitHubRemoving, Forget: p.forget}
+		LastRun: p.LastRun, Removing: p.State == api.GitHubRemoving, Forget: p.forget, Token: p.token}
 }
 
 func (p *githubPool) save() error {
@@ -137,8 +141,7 @@ func (s *Server) restoreGitHub() {
 		if !validKey(key) || api.GitHubKey(rec.Owner) != key {
 			continue
 		}
-		tok, _ := os.ReadFile(filepath.Join(dir, "token"))
-		p := s.newPool(key, dir, rec, strings.TrimSpace(string(tok)))
+		p := s.newPool(key, dir, rec, rec.Token)
 		if rec.Removing {
 			p.State, p.forget = api.GitHubRemoving, rec.Forget
 		}
@@ -662,11 +665,6 @@ func (s *Server) startGitHubRunner(ctx context.Context, p *githubPool) error {
 		return fail(err)
 	}
 	s.jobs[j.ID] = j
-	if slot >= 0 {
-		marker := s.cacheDir("scoped", githubScope(p.key), ".used")
-		_ = os.MkdirAll(filepath.Dir(marker), 0o755)
-		_ = os.WriteFile(marker, nil, 0o644)
-	}
 	s.kick()
 	return nil
 }
@@ -894,6 +892,8 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repo := strings.Contains(owner, "/")
+	s.githubOp.Lock()
+	defer s.githubOp.Unlock()
 	// Local checks first: nothing changes on GitHub for a request this runner would refuse.
 	s.mu.Lock()
 	p := s.github[key]
@@ -947,19 +947,9 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	if ss != nil && ss.Name == name {
 		rec.ScaleSetID = ss.ID
 	}
-	// The token and the settings commit together: stage the token, save the record, swap it in.
-	tok := filepath.Join(dir, "token")
-	if err := os.WriteFile(tok+".new", []byte(req.Token+"\n"), 0o600); err != nil {
-		writeErr(w, 500, "storing the token: "+err.Error())
-		return
-	}
+	rec.Token = req.Token
 	if err := writeFileJSON(filepath.Join(dir, "pool.json"), rec); err != nil {
-		_ = os.Remove(tok + ".new")
 		writeErr(w, 500, err.Error())
-		return
-	}
-	if err := os.Rename(tok+".new", tok); err != nil {
-		writeErr(w, 500, "storing the token: "+err.Error())
 		return
 	}
 	if p == nil {
@@ -978,6 +968,8 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 // runner's scale set on GitHub, then the pool's files. ?forget=1 skips GitHub (a revoked token
 // can't delete it), so a removal can always finish.
 func (s *Server) handleGitHubRemove(w http.ResponseWriter, r *http.Request) {
+	s.githubOp.Lock()
+	defer s.githubOp.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.github[r.PathValue("key")]
@@ -1060,7 +1052,7 @@ func (s *Server) finishRemoval(p *githubPool) {
 	}
 	err := removeAll(p.dir)
 	if err == nil {
-		err = removeAll(s.cacheDir("scoped", githubScope(p.key)))
+		err = removeAll(s.cacheDir("github", p.key))
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
