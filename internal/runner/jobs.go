@@ -1464,6 +1464,23 @@ func (s *Server) gcRepoStoresLocked() {
 			discard(filepath.Join(work, k))
 		}
 	}
+	busyGitHub := map[string]bool{}
+	for _, j := range s.jobs {
+		if !api.Terminal(j.State) && j.Spec.GitHub != "" {
+			busyGitHub[j.Spec.GitHub] = true
+		}
+	}
+	entries, _ = os.ReadDir(s.cacheDir("github"))
+	for _, e := range entries { // GitHub pools' dependency caches: cache/github/<pool>
+		k := e.Name()
+		if !e.IsDir() || busyGitHub[k] {
+			continue
+		}
+		if stale(s.cacheDir("github", k, ".used")) {
+			log.Printf("gc: removing GitHub dependency caches of %s (unused for %s)", k, s.cfg.cacheRetain)
+			discard(s.cacheDir("github", k))
+		}
+	}
 	entries, _ = os.ReadDir(s.cacheDir("scoped"))
 	for _, e := range entries {
 		k := e.Name()

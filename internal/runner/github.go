@@ -665,6 +665,11 @@ func (s *Server) startGitHubRunner(ctx context.Context, p *githubPool) error {
 		return fail(err)
 	}
 	s.jobs[j.ID] = j
+	if slot >= 0 { // dates the pool's dependency caches for age-based GC
+		marker := s.cacheDir("github", p.key, ".used")
+		_ = os.MkdirAll(filepath.Dir(marker), 0o755)
+		_ = os.WriteFile(marker, nil, 0o644)
+	}
 	s.kick()
 	return nil
 }

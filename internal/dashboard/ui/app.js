@@ -155,6 +155,7 @@ const state = {
   ledger: null, ledgerFor: "", ledgerErrors: null, ledgerTruncated: [],
   cfilter: { state: store("cstate") || "active", kind: "", runner: "", q: "" },
   gfilter: { state: store("gstate") || "active", owner: "" },
+  ghFormOpen: false, ghFormBusy: false, ghFormMsg: null, ghNotice: null, ghArmed: "", ghBusyKey: "",
   copied: "", // the snippet a copy button just copied
   sel: null, // {runner, id}
   stopping: new Map(), // "runner/id" -> "" while stopping, or the error
@@ -944,43 +945,67 @@ function renderTabCounts() {
   a.setAttribute("aria-label", `GitHub, ${n} job${n === 1 ? "" : "s"} running`);
 }
 
-let ghBuilt = "";
+// The GitHub view is a fixed skeleton: its filters and the add form are built once and kept, so a
+// refresh never takes focus or typing away; only the live parts are redrawn.
+let ghFiltersKey = "";
+const plusIcon = () => glyphSVG(s("path", { d: "M8 3v10M3 8h10" }));
+const ghAlert = (kind, ...kids) => h("div", { class: "alert " + kind, role: kind === "critical" ? "alert" : null }, icon(kind), h("div", {}, kids));
+
+function ghRunners() {
+  // Runners that can take GitHub jobs: answering, current, with containers, and not this machine's own.
+  return (state.fleet?.runners || []).filter((r) => r.online && r.current && r.status?.runtime === "container" && r.url !== "http://local");
+}
+
 function renderGitHubView() {
   const main = $("#main");
   if (mainBuilt !== "github") {
-    mainBuilt = "github"; ghBuilt = "";
-    main.replaceChildren(h("div", { class: "alerts", id: "gh-alerts" }), h("section", { id: "gh-jobs" }), h("section", { id: "gh-owners" }));
+    mainBuilt = "github"; ghFiltersKey = "";
+    main.replaceChildren(
+      h("div", { class: "alerts", id: "gh-alerts" }),
+      h("section", { id: "gh-jobs" }, h("div", { class: "section-head" }, h("h2", {}, "Jobs")), h("div", { class: "filters", id: "gh-filters" }), h("div", { id: "gh-jobs-body" })),
+      h("section", { id: "gh-owners" },
+        h("div", { class: "section-head" }, h("h2", {}, "Organizations and repositories"), h("span", { class: "muted", id: "gh-owners-sub" }),
+          h("button", { type: "button", class: "btn primary push", id: "gh-add-btn", onclick: () => openGhForm() }, plusIcon(), "Add organization")),
+        ghFormEl(), h("div", { id: "gh-owners-body" })));
   }
   if (!state.fleet) {
-    $("#gh-jobs").replaceChildren(h("div", { class: "card empty-state" }, state.fleetErr || "Loading…"));
+    $("#gh-jobs-body").replaceChildren(h("div", { class: "card empty-state" }, state.fleetErr || "Loading…"));
     return;
   }
   const owners = new Map();
   for (const r of state.fleet.runners) for (const p of r.github || []) (owners.get(p.owner) || owners.set(p.owner, []).get(p.owner)).push([r, p]);
-  if (!owners.size) {
-    // Recent jobs stay reachable (their logs) after the last organization is removed.
-    const recent = ghWorkloads().length > 0;
-    $("#gh-alerts").replaceChildren();
-    if (recent) renderGitHubJobs([]); else $("#gh-jobs").replaceChildren();
-    $("#gh-owners").replaceChildren(ghOnboarding());
-    return;
-  }
   const alerts = [];
+  if (state.ghNotice) alerts.push(ghAlert(state.ghNotice.kind, state.ghNotice.text));
   for (const [owner, list] of owners) for (const [r, p] of list) {
-    if (p.state === "failed") alerts.push(h("div", { class: "alert critical", role: "alert" }, icon("critical"), h("div", {}, h("b", {}, r.name), ` isn't taking ${owner}'s jobs: ${p.detail || "unknown problem"}`)));
-    if (!r.online) alerts.push(h("div", { class: "alert warning" }, icon("warning"), h("div", {}, h("b", {}, r.name), ` isn't answering, so its ${owner} jobs below are what it last reported`)));
+    if (p.state === "failed") alerts.push(ghAlert("critical", h("b", {}, r.name), ` isn't taking ${owner}'s jobs: ${p.detail || "unknown problem"}`));
+    if (p.state === "removing" && (p.detail || "").startsWith("couldn't")) alerts.push(ghAlert("warning", h("b", {}, r.name), ": " + p.detail));
+    if (!r.online) alerts.push(ghAlert("warning", h("b", {}, r.name), ` isn't answering, so its ${owner} jobs below are what it last reported`));
   }
   $("#gh-alerts").replaceChildren(...alerts);
-  renderGitHubJobs([...owners.keys()]);
-  $("#gh-owners").replaceChildren(
-    h("div", { class: "section-head" }, h("h2", {}, "Organizations and repositories"),
-      h("span", { class: "muted" }, "Every runner below tells GitHub how many jobs fit; GitHub sends each job to one with room")),
-    h("div", { class: "grid gh-owners" }, [...owners].sort((a, b) => a[0].localeCompare(b[0])).map(([owner, list]) => ownerCard(owner, list))));
+  const jobs = $("#gh-jobs");
+  jobs.hidden = !owners.size && !ghWorkloads().length; // recent jobs stay reachable after the last removal
+  if (!jobs.hidden) renderGitHubJobs([...owners.keys()].sort());
+  $("#gh-owners-sub").textContent = owners.size ? "Every runner below tells GitHub how many jobs fit; GitHub sends each job to one with room" : "";
+  $("#gh-add-btn").hidden = !owners.size || state.ghFormOpen;
+  $("#gh-owners-body").replaceChildren(owners.size
+    ? h("div", { class: "grid gh-owners" }, [...owners].sort((a, b) => a[0].localeCompare(b[0])).map(([owner, list]) => ownerCard(owner, list)))
+    : state.ghFormOpen ? "" : ghOnboarding());
+  renderGhForm(owners);
 }
 
 function renderGitHubJobs(owners) {
   const f = state.gfilter;
   if (f.owner && !owners.includes(f.owner)) f.owner = "";
+  const key = owners.join("\n") + "|" + f.state + "|" + f.owner;
+  if (key !== ghFiltersKey) {
+    ghFiltersKey = key;
+    $("#gh-filters").replaceChildren(...[
+      segmented([["active", "Active"], ["finished", "Finished"], ["all", "All"]], f.state, (v) => { f.state = v; store("gstate", v); render(); }, "State"),
+      owners.length > 1 ? h("select", { "aria-label": "Organization or repository", onchange: (e) => { f.owner = e.target.value; render(); } },
+        h("option", { value: "" }, "Everywhere"), owners.map((o) => h("option", { value: o, selected: o === f.owner }, o))) : null,
+      h("span", { class: "gh-summary", id: "gh-summary" }),
+    ].filter(Boolean));
+  }
   const all = ghWorkloads();
   const active = all.filter(isActive);
   const running = active.filter((w) => w.github.job).length, starting = active.length - running;
@@ -988,18 +1013,13 @@ function renderGitHubJobs(owners) {
   for (const r of state.fleet.runners) if (r.online) for (const p of r.github || []) if (p.state === "listening") room += Math.max(0, p.capacity - p.running - p.starting);
   const done = all.filter((w) => !isActive(w) && w.github.job);
   const ok = done.filter((w) => w.github.result === "succeeded").length;
-  const summary = [
-    h("b", {}, running), " running", starting ? [" · ", h("b", {}, starting), " starting"] : null,
+  $("#gh-summary").replaceChildren(...[
+    h("b", {}, running), " running", starting ? [" · ", h("b", {}, starting), " starting"] : "",
     " · room for ", h("b", {}, room), " more",
-    done.length ? [" · ", h("b", {}, done.length), " finished in the last hour, ", h("b", {}, pct(ok / done.length)), " succeeded"] : null,
-  ];
+    done.length ? [" · ", h("b", {}, done.length), " finished in the last hour, ", h("b", {}, pct(ok / done.length)), " succeeded"] : "",
+  ].flat());
   const list = all.filter((w) => (f.state === "all" || (f.state === "active") === isActive(w)) && (!f.owner || w.github.owner === f.owner))
     .sort((a, b) => (isActive(b) - isActive(a)) || new Date(b.created) - new Date(a.created));
-  const filters = h("div", { class: "filters" },
-    segmented([["active", "Active"], ["finished", "Finished"], ["all", "All"]], f.state, (v) => { f.state = v; store("gstate", v); render(); }, "State"),
-    owners.length > 1 ? h("select", { "aria-label": "Organization or repository", onchange: (e) => { f.owner = e.target.value; render(); } },
-      h("option", { value: "" }, "Everywhere"), owners.map((o) => h("option", { value: o, selected: o === f.owner }, o))) : null,
-    h("span", { class: "gh-summary", role: "status" }, summary));
   let body;
   if (!list.length) {
     body = h("div", { class: "card empty-state" }, f.state === "active"
@@ -1026,9 +1046,41 @@ function renderGitHubJobs(owners) {
           h("td", { class: "r" }, g.url ? h("a", { class: "icon-link", href: g.url, target: "_blank", rel: "noopener noreferrer", title: "Open the run on GitHub", "aria-label": `Open ${g.job} on GitHub`, onclick: (e) => e.stopPropagation() }, extIcon()) : null));
       }))));
   }
-  $("#gh-jobs").replaceChildren(h("div", { class: "section-head" }, h("h2", {}, "Jobs")), filters, body);
+  $("#gh-jobs-body").replaceChildren(body);
 }
 const ghFirstLabels = () => { for (const r of state.fleet?.runners || []) for (const p of r.github || []) return p.labels; return null; };
+
+// Two-step buttons (remove, forget): the first click arms it for a few seconds.
+let ghArmTimer;
+function armedBtn(key, label, confirmLabel, run) {
+  const armed = state.ghArmed === key;
+  return h("button", { type: "button", class: "btn danger" + (armed ? " confirm" : ""), disabled: state.ghBusyKey === key, onclick: () => {
+    if (!armed) { state.ghArmed = key; clearTimeout(ghArmTimer); ghArmTimer = setTimeout(() => { state.ghArmed = ""; render(); }, 4000); render(); return; }
+    state.ghArmed = ""; run();
+  } }, state.ghBusyKey === key ? "Working…" : armed ? confirmLabel : label);
+}
+
+async function ghRemove(owner, forget) {
+  const key = (forget ? "forget:" : "rm:") + owner;
+  state.ghBusyKey = key; render();
+  try {
+    const res = await api("/api/github/remove", { method: "POST", headers: { "Content-Type": "application/json", "X-Offload-Dashboard": "1" }, body: JSON.stringify({ owner, forget }) });
+    const bad = res.results.filter((x) => x.error);
+    ghNotice(bad.length ? "critical" : "info", bad.length
+      ? `Couldn't remove ${owner} from ${bad.map((x) => `${x.runner} (${x.error})`).join(", ")}`
+      : forget ? `Removed ${owner} here. Delete its scale sets under Runner settings on GitHub too.` : `Removing ${owner}: its runners stop, then its scale sets are deleted on GitHub.`);
+  } catch (e) {
+    ghNotice("critical", `Couldn't remove ${owner}: ${e.message}`);
+  } finally {
+    state.ghBusyKey = ""; render();
+  }
+}
+let ghNoticeTimer;
+function ghNotice(kind, text) {
+  state.ghNotice = { kind, text };
+  clearTimeout(ghNoticeTimer);
+  if (kind !== "critical") ghNoticeTimer = setTimeout(() => { state.ghNotice = null; render(); }, 10000);
+}
 
 function ownerCard(owner, list) {
   const first = list[0][1];
@@ -1036,6 +1088,8 @@ function ownerCard(owner, list) {
   const finished = sum(list, ([, p]) => p.runs);
   const last = list.map(([, p]) => p.last_run).filter(Boolean).sort().pop();
   const per = first.resources;
+  const removing = list.some(([, p]) => p.state === "removing");
+  const stuck = list.some(([, p]) => p.state === "removing" && (p.detail || "").startsWith("couldn't"));
   return h("div", { class: "card gh-owner" },
     h("div", { class: "gh-owner-head" },
       h("h3", {}, owner),
@@ -1046,11 +1100,14 @@ function ownerCard(owner, list) {
         h("span", { class: "n" }, r.name),
         poolChip(p),
         h("div", { class: "room" }, slots(p), h("span", { class: p.state === "failed" ? "crit-text" : "muted" }, roomText(p)))))),
-    h("div", { class: "runner-foot" },
+    h("div", { class: "runner-foot gh-foot" },
       h("span", {}, "Each job ", h("b", {}, `${fmtCores(per.cpu)}–${fmtCores(per.cpu_max)} cores`), " · ", h("b", {}, fmtBytes(per.mem))),
       h("span", {}, h("b", {}, finished), " finished", last ? " · last one " + agoCoarse(last) : ""),
       h("span", {}, first.shared ? "Warm caches shared by its jobs" : "Clean caches every job"),
-      h("span", {}, first.token_from === "gh" ? "With your gh login" : "With a token")));
+      h("span", {}, first.token_from === "gh" ? "With your gh login" : "With a token"),
+      h("span", { class: "gh-actions" },
+        stuck ? armedBtn("forget:" + owner, "Remove here only", "Confirm: GitHub keeps its scale sets", () => ghRemove(owner, true)) : null,
+        removing ? null : armedBtn("rm:" + owner, "Remove", "Confirm remove: stops its running jobs", () => ghRemove(owner, false)))));
 }
 
 function ghOnboarding() {
@@ -1058,13 +1115,154 @@ function ghOnboarding() {
   const use = "runs-on: offload";
   return h("div", { class: "card onboarding" },
     h("h2", {}, "Run your GitHub Actions jobs on these runners"),
-    h("p", { class: "muted" }, "Each job gets a fresh container sized like any offload job, and GitHub sends it to whichever runner has room. Docker builds work, and checkouts, tool and dependency caches stay warm between jobs."),
+    h("p", { class: "muted" }, "Each job gets a fresh container sized like any offload job, and GitHub sends it to whichever runner has room. Docker builds work."),
     h("ol", { class: "steps" },
-      h("li", {}, h("div", { class: "what" }, "Connect an organization or repository. Offload uses your GitHub CLI login."),
-        h("div", { class: "snippet" }, h("code", {}, add), copyBtn(add))),
+      h("li", {}, h("div", { class: "what" }, "Connect an organization or repository. Offload uses your GitHub CLI login, or a token."),
+        h("div", { class: "snippet" }, h("button", { type: "button", class: "btn primary", onclick: () => openGhForm() }, plusIcon(), "Add organization"),
+          h("span", { class: "muted small-or" }, "or run"), h("code", {}, add), copyBtn(add))),
       h("li", {}, h("div", { class: "what" }, "Point workflows at it."),
-        h("div", { class: "snippet" }, h("code", {}, use), copyBtn(use)))),
-    h("p", { class: "muted small" }, "Prefer a narrower credential? Pass ", h("code", {}, "--token"), " a fine-grained token with only “Self-hosted runners: write”."));
+        h("div", { class: "snippet" }, h("code", {}, use), copyBtn(use)))));
+}
+
+// ---- the add form
+let ghForm;
+function ghFormEl() {
+  if (ghForm) return ghForm.root;
+  const f = {};
+  const field = (label, forId, control, hint) => h("div", { class: "gh-field" },
+    h("label", { for: forId }, label), h("div", { class: "control" }, control, hint ? h("div", { class: "hint" }, hint) : null));
+  const radio = (name, value, label, desc, checked) => {
+    const input = h("input", { type: "radio", name, value, checked, onchange: () => renderGhForm() });
+    return [input, h("label", { class: "choice" }, input, h("span", {}, h("b", {}, label), desc ? h("span", { class: "muted" }, desc) : null))];
+  };
+  f.owner = h("input", { type: "text", id: "gh-f-owner", placeholder: "ORG or ORG/REPO", autocomplete: "off", spellcheck: "false", "aria-describedby": "gh-f-owner-hint", oninput: () => renderGhForm() });
+  f.labels = h("input", { type: "text", id: "gh-f-labels", value: "offload", autocomplete: "off", spellcheck: "false", oninput: () => renderGhForm() });
+  f.preview = h("code", {});
+  let c;
+  [f.cacheClean, c] = radio("gh-cache", "clean", "Clean for every job", " Each job starts empty. Safe when the repositories don't all trust each other.", true);
+  const cacheClean = c;
+  [f.cacheShared, c] = radio("gh-cache", "shared", "Shared by its repositories", " Checkouts, dependency caches and docker images stay warm. One repository can affect what the next one runs.", false);
+  f.cacheNote = h("div", { class: "hint" });
+  f.cacheChoices = h("div", { class: "choices" }, cacheClean, c);
+  [f.authGh, c] = radio("gh-auth", "gh", "Your GitHub CLI login", " From gh on this machine. Needs the admin:org scope for an organization.", true);
+  const authGh = c;
+  [f.authToken, c] = radio("gh-auth", "token", "A token", " A fine-grained token with only “Self-hosted runners: write” is the narrowest.", false);
+  f.token = h("input", { type: "password", id: "gh-f-token", placeholder: "github_pat_…", autocomplete: "off", "aria-label": "Token" });
+  f.tokenRow = h("div", { class: "token-row" }, f.token);
+  f.runners = h("div", { class: "choices inline" });
+  f.max = h("input", { type: "number", id: "gh-f-max", min: 0, step: 1, placeholder: "As many as fit", inputmode: "numeric" });
+  f.result = h("div", { class: "gh-form-result", "aria-live": "polite" });
+  f.submit = h("button", { type: "submit", class: "btn primary" }, "Add");
+  f.root = h("form", { class: "card gh-form", hidden: true, novalidate: true, onsubmit: (e) => { e.preventDefault(); submitGhForm(); }, onkeydown: (e) => { if (e.key === "Escape") { e.stopPropagation(); closeGhForm(); } } },
+    h("div", { class: "gh-form-head" }, h("h3", {}, "Add an organization or repository"),
+      h("button", { type: "button", class: "icon-btn", "aria-label": "Close", onclick: closeGhForm }, s("svg", { viewBox: "0 0 16 16", width: 16, height: 16, "aria-hidden": "true" }, s("path", { d: "M4 4l8 8M12 4l-8 8", stroke: "currentColor", "stroke-width": 1.8, "stroke-linecap": "round" })))),
+    field("Organization or repository", "gh-f-owner", f.owner, h("span", { id: "gh-f-owner-hint" }, "As on GitHub, like ", h("code", {}, "acme"), " or ", h("code", {}, "acme/app"), ".")),
+    field("Workflows use", "gh-f-labels", f.labels, ["Labels, comma-separated. Workflows then say ", f.preview]),
+    h("fieldset", { class: "gh-field" }, h("legend", {}, "Caches"), h("div", { class: "control" }, f.cacheChoices, f.cacheNote)),
+    h("fieldset", { class: "gh-field" }, h("legend", {}, "Connect with"), h("div", { class: "control" }, h("div", { class: "choices" }, authGh, c), f.tokenRow)),
+    h("fieldset", { class: "gh-field" }, h("legend", {}, "Runners"), h("div", { class: "control" }, f.runners)),
+    field("Most jobs at once", "gh-f-max", f.max, "Per runner. Empty takes as many as fit."),
+    f.result,
+    h("div", { class: "gh-form-actions" }, f.submit, h("button", { type: "button", class: "btn", onclick: closeGhForm }, "Cancel")));
+  f.runnerKey = null;
+  ghForm = f;
+  return f.root;
+}
+
+function openGhForm() {
+  state.ghFormOpen = true; state.ghFormMsg = null;
+  render();
+  ghForm.root.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  ghForm.owner.focus();
+}
+function closeGhForm() {
+  state.ghFormOpen = false; state.ghFormMsg = null;
+  if (ghForm) ghForm.token.value = "";
+  render();
+  $("#gh-add-btn")?.focus();
+}
+
+function ghOwnerInput() {
+  return ghForm.owner.value.trim().replace(/^https:\/\/(www\.)?github\.com\//i, "").replace(/\/+$/, "");
+}
+
+function renderGhForm(owners) {
+  const f = ghForm;
+  if (!f) return;
+  f.root.hidden = !state.ghFormOpen;
+  if (!state.ghFormOpen) return;
+  const owner = ghOwnerInput();
+  const labels = f.labels.value.split(",").map((x) => x.trim()).filter(Boolean);
+  f.preview.textContent = "runs-on: " + runsOn(labels);
+  const existing = owners && [...owners.keys()].find((o) => o.toLowerCase() === owner.toLowerCase());
+  const repo = owner.includes("/");
+  const existingShared = existing && owners.get(existing)[0][1].shared;
+  f.cacheChoices.hidden = repo;
+  f.cacheClean.disabled = f.cacheShared.disabled = !!existing;
+  if (existing) (existingShared ? f.cacheShared : f.cacheClean).checked = true;
+  f.cacheNote.textContent = repo ? "A repository's jobs keep warm caches: they are all the same repository's code."
+    : existing ? `Chosen when ${existing} was added; remove it to change this.` : "";
+  f.tokenRow.hidden = !f.authToken.checked;
+  const runners = ghRunners();
+  const key = runners.map((r) => r.name).join("\n");
+  if (key !== f.runnerKey) {
+    const was = new Map([...f.runners.querySelectorAll("input")].map((i) => [i.value, i.checked]));
+    f.runnerKey = key;
+    f.runners.replaceChildren(...(runners.length ? runners.map((r) => {
+      const input = h("input", { type: "checkbox", value: r.name, checked: was.has(r.name) ? was.get(r.name) : true });
+      return h("label", { class: "choice" }, input, h("span", {}, h("b", {}, r.name), h("span", { class: "muted" }, ` ${fmtCores(r.status.capacity.cpu)} cores`)));
+    }) : [h("span", { class: "muted" }, "No runner can take GitHub jobs: they need podman, and must be up to date.")]));
+  }
+  f.submit.disabled = !!state.ghFormBusy;
+  f.submit.textContent = state.ghFormBusy ? "Adding…" : existing ? "Update" : "Add";
+  const m = state.ghFormMsg;
+  f.result.replaceChildren(...(m ? ghFormMessage(m) : []));
+}
+
+function ghFormMessage(m) {
+  const lines = [];
+  const text = (t) => {
+    const cmd = (t.match(/gh auth refresh[^\n]*/) || [])[0];
+    return [h("div", { class: "msg" }, t.replace(/\n\n\s*gh auth refresh[^\n]*\n\n/, " ").trim()), cmd ? h("div", { class: "snippet" }, h("code", {}, cmd), copyBtn(cmd)) : null];
+  };
+  if (m.error) lines.push(ghAlert("critical", text(m.error)));
+  for (const r of m.results || []) {
+    lines.push(r.error ? ghAlert("critical", h("b", {}, r.runner), ": ", text(r.error)) : ghAlert("good", h("b", {}, r.runner), ": connecting to GitHub"));
+  }
+  return lines;
+}
+
+async function submitGhForm() {
+  const f = ghForm;
+  if (state.ghFormBusy) return;
+  const owner = ghOwnerInput();
+  const fail = (error, el) => { state.ghFormMsg = { error }; render(); el?.focus(); };
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)?$/.test(owner)) return fail("Enter an organization (acme) or a repository (acme/app).", f.owner);
+  const on = [...f.runners.querySelectorAll("input:checked")].map((i) => i.value);
+  if (!on.length) return fail("Pick at least one runner.", f.runners.querySelector("input"));
+  const token = f.authToken.checked ? f.token.value.trim() : "";
+  if (f.authToken.checked && !token) return fail("Paste the token, or connect with your GitHub CLI login.", f.token);
+  const max = f.max.value === "" ? 0 : Number(f.max.value);
+  if (!Number.isInteger(max) || max < 0) return fail("Most jobs at once is a whole number, or empty.", f.max);
+  const body = { owner, token, on, max, labels: f.labels.value.split(",").map((x) => x.trim()).filter(Boolean) };
+  if (!owner.includes("/") && !f.cacheShared.disabled) body.shared = f.cacheShared.checked;
+  state.ghFormBusy = true; state.ghFormMsg = null; render();
+  try {
+    const res = await api("/api/github/add", { method: "POST", headers: { "Content-Type": "application/json", "X-Offload-Dashboard": "1" }, body: JSON.stringify(body) });
+    const bad = res.results.filter((x) => x.error);
+    if (!bad.length) {
+      f.owner.value = ""; f.token.value = "";
+      state.ghFormOpen = false;
+      ghNotice("good", `Connected ${owner} on ${res.results.map((x) => x.runner).join(", ")}. Each runner shows Preparing until it is ready; workflows use ${"runs-on: " + runsOn(body.labels)}.`);
+    } else {
+      state.ghFormMsg = { results: res.results };
+    }
+  } catch (e) {
+    state.ghFormMsg = { error: e.message };
+  } finally {
+    state.ghFormBusy = false;
+    render();
+  }
 }
 
 function ghDrawerHead(w) {

@@ -198,7 +198,8 @@ A local web page covering every runner:
   limit. Open one to follow its logs, see its details, or cancel it.
 - **GitHub.** GitHub Actions jobs running on the runners, with links to their runs, and each
   connected organization or repository: which runners take its jobs, how many more fit, and the
-  `runs-on` line to copy.
+  `runs-on` line to copy. Add an organization or repository there (with this machine's gh login
+  or a pasted token) and remove one, as `offload github add` and `rm` do.
 - **Activity.** Statistics on finished jobs: success rate, out-of-memory kills, wait times,
   CPU time, warm-file rate, and per command its run times and how much of its guaranteed CPU it
   really uses.

@@ -72,6 +72,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; }
 body {
   background: var(--page);
@@ -293,7 +294,50 @@ td.gh-job { min-width: 260px; }
 .snippet { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .gh-head-sub { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 8px; font-size: 13px; }
 .drawer-head h2 { overflow-wrap: anywhere; }
+.btn.primary { background: var(--ink); color: var(--page); border-color: var(--ink); }
+.btn.primary:hover { background: color-mix(in srgb, var(--ink) 86%, var(--page)); }
+.btn.primary:disabled { opacity: .55; }
+.btn svg { width: 14px; height: 14px; }
+.section-head .push { margin-left: auto; align-self: center; }
+.gh-foot { align-items: center; }
+.gh-actions { margin-left: auto; display: inline-flex; gap: 8px; }
+.gh-actions .btn { padding: 3px 10px; font-size: 12.5px; }
+.small-or { font-size: 12.5px; }
+.gh-form { margin-bottom: 16px; padding: 18px 22px 20px; max-width: 880px; }
+.gh-form-head { display: flex; align-items: center; margin-bottom: 6px; }
+.gh-form-head h3 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
+.gh-field { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 4px 18px; padding: 12px 0; border: 0; border-top: 1px solid var(--grid); margin: 0; min-width: 0; }
+.gh-field:first-of-type { border-top: 0; }
+.gh-field > label, .gh-field > legend { padding: 6px 0 0; font-weight: 550; float: left; }
+.gh-field .control { min-width: 0; display: grid; gap: 8px; }
+.gh-field .hint { color: var(--ink-2); font-size: 12.5px; }
+.gh-field .hint code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; color: var(--ink); }
+input[type="text"], input[type="password"], input[type="number"] {
+  height: 34px; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 0 10px; font-size: 13.5px; width: 100%; max-width: 420px;
+}
+input[type="text"]:focus-visible, input[type="password"]:focus-visible, input[type="number"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+input::placeholder { color: color-mix(in srgb, var(--ink-2) 80%, transparent); }
+input[type="number"] { max-width: 180px; }
+.choices { display: grid; gap: 8px; }
+.choices.inline { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.choice { display: flex; align-items: flex-start; gap: 9px; cursor: pointer; line-height: 1.4; }
+.choice input { margin: 3px 0 0; accent-color: var(--accent); flex: none; }
+.choice b { font-weight: 550; }
+.choice .muted { font-size: 12.5px; }
+.choices:has(input:disabled) .choice { cursor: default; opacity: .6; }
+.token-row input { max-width: 420px; font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace; }
+.gh-form-result { display: grid; gap: 8px; }
+.gh-form-result:not(:empty) { margin: 6px 0 4px; }
+.gh-form-result .msg { white-space: pre-wrap; }
+.gh-form-result .snippet { margin-top: 6px; }
+.gh-form-actions { display: flex; gap: 10px; padding-top: 14px; border-top: 1px solid var(--grid); }
+.gh-form-actions .btn { padding: 6px 16px; }
+.alert.good svg { color: var(--good); }
+::selection { background: color-mix(in srgb, var(--accent) 28%, transparent); }
 @media (max-width: 760px) {
+  .gh-field { grid-template-columns: 1fr; }
+  .gh-actions { margin-left: 0; }
+  .gh-form { padding: 16px; }
   .gh-summary { margin-left: 0; flex-basis: 100%; }
   .gh-runners { grid-template-columns: max-content 1fr; }
   .gh-runner .room { grid-column: 1 / -1; margin-top: -4px; }

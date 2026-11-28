@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -279,6 +280,37 @@ func (f *fleet) snapshot(version string) fleetView {
 	}
 	sort.Slice(v.Runners, func(a, b int) bool { return v.Runners[a].Name < v.Runners[b].Name })
 	return v
+}
+
+// currentHosts are the runners answering on this protocol, each with its latest status.
+func (f *fleet) currentHosts() []*client.Host {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*client.Host
+	for _, r := range f.runners {
+		if r.currentLocked() {
+			h, st := *r.host, *r.Status
+			h.Status = &st
+			out = append(out, &h)
+		}
+	}
+	return out
+}
+
+// githubHolders are the runners that take GitHub jobs for owner, as they last reported.
+func (f *fleet) githubHolders(owner string) []*client.Host {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*client.Host
+	for _, r := range f.runners {
+		for _, p := range r.GitHub {
+			if r.Online && strings.EqualFold(p.Owner, owner) {
+				out = append(out, r.host)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (f *fleet) host(name string) *client.Host {

@@ -39,13 +39,20 @@ func githubToken(ctx context.Context, owner, src string) (token, from string, er
 		token, err = resolveValue(src)
 		return strings.TrimSpace(token), "token", err
 	}
+	token, err = GitHubLoginToken(ctx, owner)
+	return token, "gh", err
+}
+
+// GitHubLoginToken is this machine's GitHub CLI token, checked for the scope GitHub wants for
+// managing owner's runners (admin:org, or repo for a repository).
+func GitHubLoginToken(ctx context.Context, owner string) (string, error) {
 	if _, err := exec.LookPath("gh"); err != nil {
-		return "", "", errors.New("offload uses your GitHub CLI login, and gh isn't installed: install it and run `gh auth login`, or pass --token")
+		return "", errors.New("offload uses your GitHub CLI login, and gh isn't installed: install it and run `gh auth login`, or use a token")
 	}
 	out, err := exec.CommandContext(ctx, "gh", "auth", "token", "--hostname", "github.com").Output()
-	token = strings.TrimSpace(string(out))
+	token := strings.TrimSpace(string(out))
 	if err != nil || token == "" {
-		return "", "", errors.New("you're not logged in to the GitHub CLI: run `gh auth login`, or pass --token")
+		return "", errors.New("you're not logged in to the GitHub CLI: run `gh auth login`, or use a token")
 	}
 	need := "admin:org"
 	if strings.Contains(owner, "/") {
@@ -53,12 +60,44 @@ func githubToken(ctx context.Context, owner, src string) (token, from string, er
 	}
 	scopes, login, err := githubScopes(ctx, token)
 	if err != nil {
-		return "", "", fmt.Errorf("checking your gh login with GitHub: %w", err)
+		return "", fmt.Errorf("checking your gh login with GitHub: %w", err)
 	}
 	if scopes != nil && !scopes[need] {
-		return "", "", fmt.Errorf("your gh login (%s) can't manage the runners of %s: GitHub wants the %s scope for that. Grant it with:\n\n    gh auth refresh -h github.com -s %s\n\nthen run this again", login, owner, need, need)
+		return "", fmt.Errorf("your gh login (%s) can't manage the runners of %s: GitHub wants the %s scope for that. Grant it with:\n\n    gh auth refresh -h github.com -s %s\n\nthen try again", login, owner, need, need)
 	}
-	return token, "gh", nil
+	return token, nil
+}
+
+// GitHubTargets are the runners to add GitHub jobs to: the named ones, or every one that can.
+func GitHubTargets(hosts []*Host, on []string) ([]*Host, error) { return githubHosts(hosts, on, true) }
+
+// GitHubAddTo starts (or updates) taking GitHub jobs on one runner, with a message for the person
+// when it can't.
+func GitHubAddTo(ctx context.Context, h *Host, req api.GitHubAdd) (api.GitHubPool, error) {
+	var p api.GitHubPool
+	err := h.do(ctx, "POST", "/v1/github", req, &p)
+	var ae *APIError
+	if errors.As(err, &ae) {
+		if ae.Code == 404 {
+			return p, errors.New("too old for GitHub jobs: run `offload host upgrade " + h.Name + "`")
+		}
+		return p, errors.New(ae.Msg)
+	}
+	return p, err
+}
+
+// GitHubRemoveFrom stops taking owner's GitHub jobs on one runner (forget: without telling GitHub).
+func GitHubRemoveFrom(ctx context.Context, h *Host, owner string, forget bool) error {
+	path := "/v1/github/" + api.GitHubKey(owner)
+	if forget {
+		path += "?forget=1"
+	}
+	err := h.do(ctx, "DELETE", path, nil, nil)
+	var ae *APIError
+	if errors.As(err, &ae) {
+		return errors.New(ae.Msg)
+	}
+	return err
 }
 
 // githubScopes returns a classic or OAuth token's scopes (nil for a fine-grained token, which
@@ -220,18 +259,9 @@ func GitHubAdd(o GitHubOptions) error {
 		go func() {
 			defer wg.Done()
 			req := api.GitHubAdd{URL: owner, Token: token, TokenFrom: from, Labels: o.Labels, Max: o.Max, Resources: o.Resources, SharedCache: o.Shared}
-			var p api.GitHubPool
-			if err := h.do(ctx, "POST", "/v1/github", req, &p); err != nil {
-				var ae *APIError
-				msg := err.Error()
-				if errors.As(err, &ae) {
-					msg = ae.Msg
-					if ae.Code == 404 {
-						msg = "too old for GitHub jobs: run `offload host upgrade " + h.Name + "`"
-					}
-				}
+			if _, err := GitHubAddTo(ctx, h, req); err != nil {
 				mu.Lock()
-				line(h, "failed", msg)
+				line(h, "failed", err.Error())
 				mu.Unlock()
 				return
 			}
@@ -434,11 +464,7 @@ func GitHubRemove(raw string, on []string, forget bool) error {
 				fmt.Printf("  %s: "+format+"\n", append([]any{h.Name}, a...)...)
 				mu.Unlock()
 			}
-			path := "/v1/github/" + key
-			if forget {
-				path += "?forget=1"
-			}
-			if err := h.do(ctx, "DELETE", path, nil, nil); err != nil {
+			if err := GitHubRemoveFrom(ctx, h, owner, forget); err != nil {
 				report("%v", err)
 				mu.Lock()
 				failed = err
