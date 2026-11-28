@@ -193,10 +193,6 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		out.err(503, "runner is upgrading; try again in a few seconds")
 		return
 	}
-	if s.paused {
-		out.err(403, "runner is paused (resume it in offload dashboard)")
-		return
-	}
 	if why := s.neverFitsLocked(res); why != "" { // not a matter of waiting
 		out.err(http.StatusUnprocessableEntity, why)
 		return
@@ -207,6 +203,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		if tag, _, _ := envPlan(def); s.builds[tag] != nil {
 			s.builds[tag].sessionAsked = time.Now()
 		}
+	}
+	if s.paused { // 503: clients try another runner, or with --on wait for this one
+		out.err(http.StatusServiceUnavailable, "runner is paused (resume it in offload dashboard)")
+		return
 	}
 	// Capacity first: a full runner says so at once (503), and the client tries another.
 	live := 0
