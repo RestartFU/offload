@@ -88,6 +88,24 @@ class ModelTest {
         assertNull(m.pairing)
     }
 
+    @Test fun onlyTailscaleCarriesTheToken() {
+        fun ip(s: String) = InetAddress.getByName(s)
+        val laptop = ip("100.101.102.103")
+        val mine = listOf(ip("100.67.150.57"), ip("fd7a:115c:a1e0::39"))
+        assertTrue(carriedBy(laptop, mine, listOf(ip("100.64.0.0") to 10)))
+        assertTrue(carriedBy(laptop, mine, listOf(ip("100.100.100.100") to 32, ip("100.101.102.103") to 32)))
+        assertTrue(carriedBy(ip("fd7a:115c:a1e0::5"), mine, listOf(ip("fd7a:115c:a1e0::") to 48)))
+        // Another VPN taking all traffic without a default route: 0.0.0.0/1, or WireGuard's 64.0.0.0/2.
+        assertFalse(carriedBy(laptop, mine, listOf(ip("0.0.0.0") to 1, ip("128.0.0.0") to 1)))
+        assertFalse(carriedBy(laptop, mine, listOf(ip("64.0.0.0") to 2)))
+        assertFalse(carriedBy(laptop, mine, listOf(ip("0.0.0.0") to 0)))
+        assertFalse(carriedBy(laptop, mine, listOf(ip("100.64.0.0") to 9)))
+        // A route to some other peer only, or a VPN with no tailnet address of its own.
+        assertFalse(carriedBy(laptop, mine, listOf(ip("100.99.1.1") to 32)))
+        assertFalse(carriedBy(laptop, listOf(ip("10.8.0.2")), listOf(ip("100.64.0.0") to 10)))
+        assertFalse(carriedBy(ip("fd7a:115c:a1e0::5"), mine, listOf(ip("fd00::") to 8)))
+    }
+
     @Test fun noVpnNoConnection() {
         val e = runCatching { VpnTailnet(RuntimeEnvironment.getApplication()).open("100.64.0.1", 7421, "/api/info") }.exceptionOrNull()
         assertTrue("$e", e is java.io.IOException && e.message!!.contains("Tailscale is off"))

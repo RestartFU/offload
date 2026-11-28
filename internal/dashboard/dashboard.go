@@ -98,20 +98,15 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	s := &server{opts: opts, token: key, host: ln.Addr().String(), fleet: newFleet(cfg), remote: &remote{}}
 	// One dashboard owns the paired devices: a second one would keep serving a phone the first
-	// was told to forget, and write it back.
-	owner, err := tryLock(filepath.Join(dir, "lock"))
-	switch {
-	case err != nil:
+	// was told to forget, and write it back. One that serves no phones leaves them alone.
+	if !opts.Remote {
+		s.remote.fail("this dashboard was started with --no-remote: phones are paired, served and forgotten by one started without it")
+	} else if owner, err := tryLock(filepath.Join(dir, "lock")); err != nil {
 		return err
-	case !owner:
+	} else if !owner {
 		s.remote.fail("another offload dashboard on this machine serves phones: pair and forget devices there")
-	default:
-		if s.devices, err = loadDevices(dir); err != nil {
-			return err
-		}
-		if !opts.Remote {
-			s.remote.fail("phones can't reach this dashboard: it was started with --no-remote")
-		}
+	} else if s.devices, err = loadDevices(dir); err != nil {
+		return err
 	}
 	go s.fleet.run(ctx)
 
@@ -134,7 +129,7 @@ func Run(ctx context.Context, opts Options) error {
 	// minute. Answers aren't bounded: a log stream stays open.
 	dev := &http.Server{Handler: s.deviceGuard(mux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute}
 	go func() { <-ctx.Done(); _ = srv.Close(); _ = dev.Close() }()
-	if s.devices != nil && opts.Remote {
+	if s.devices != nil {
 		_, bound, _ := net.SplitHostPort(s.host) // the port the page got, which may not be the one asked for
 		go s.serveTailnet(ctx, bound, dev)
 	}

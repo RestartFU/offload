@@ -1574,7 +1574,7 @@ async function startLogs() {
 
 // ---------- devices ----------
 // Phones paired with this dashboard reach its API over the tailnet with a token of their own.
-// Pairing shows a one-time code (ten minutes, one try) to type into the phone.
+// Pairing shows a one-time code (good for ten minutes) to type into the phone.
 state.devices = null; state.devErr = null; state.devBusy = ""; state.devArmed = "";
 let devTimer, devArmTimer;
 async function loadDevices() {

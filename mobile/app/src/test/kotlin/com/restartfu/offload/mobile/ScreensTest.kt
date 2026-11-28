@@ -91,12 +91,22 @@ class ScreensTest {
     }
 
     inner class Screen {
+        /** The test holds Compose's clock: each tick gives the app's other threads a moment, then moves it on. */
         fun settle() {
             repeat(12) {
                 Thread.sleep(15)
                 compose.mainClock.advanceTimeBy(50)
             }
             ShadowLooper.idleMainLooper()
+        }
+
+        /** Lets the app work until [done] holds; what it waits for happens on other threads. */
+        fun await(what: String, done: () -> Boolean) {
+            repeat(200) {
+                if (done()) return
+                settle()
+            }
+            throw AssertionError("never happened: $what")
         }
 
         fun click(label: String) {
@@ -182,9 +192,7 @@ class ScreensTest {
             type(0, "laptop")
             type(1, "K7QM-4XPA")
             click("Pair")
-            Thread.sleep(200)
-            settle()
-            check(shows("Wrong pairing code"))
+            await("the dashboard's refusal shows") { shows("Wrong pairing code") }
         }
     }
 
@@ -193,8 +201,7 @@ class ScreensTest {
             type(0, "laptop")
             type(1, "K7QM-4XPD")
             click("Pair")
-            Thread.sleep(300)
-            settle()
+            await("paired") { it.pairing != null && shows("Free cores") }
         }
         check(m.pairing == paired)
     }
@@ -223,7 +230,7 @@ class ScreensTest {
         shoot("15-overview-runner-offline", dashboard = FakeDashboard({ Fixtures.fleet(offline = true) }))
     }
 
-    @Test fun overviewWeek() { shoot("16-overview-7d") { click("7d"); Thread.sleep(200); settle(); scrollToIndex(3) } }
+    @Test fun overviewWeek() { shoot("16-overview-7d") { m -> click("7d"); await("the week's series") { m.seriesFor == "7d" }; scrollToIndex(3) } }
 
     @Test fun disconnected() {
         shoot("17-disconnected", dashboard = FakeDashboard(failWith = "Nothing answers at laptop. Is offload dashboard running on the computer?"))
@@ -322,11 +329,11 @@ class ScreensTest {
 
     // ---------- activity ----------
 
-    @Test fun activity() { shoot("40-activity") { click("Activity"); click("24h"); Thread.sleep(200); settle() } }
+    @Test fun activity() { shoot("40-activity") { m -> click("Activity"); click("24h"); await("the day's ledger") { m.ledgerFor == "24h" } } }
 
-    @Test fun activityCommands() { shoot("41-activity-commands") { click("Activity"); click("24h"); Thread.sleep(200); settle(); scrollTo("By command") } }
+    @Test fun activityCommands() { shoot("41-activity-commands") { m -> click("Activity"); click("24h"); await("the day's ledger") { m.ledgerFor == "24h" }; scrollTo("By command") } }
 
-    @Test fun activityLight() { shoot("42-activity-light", light = true) { click("Activity"); click("24h"); Thread.sleep(200); settle() } }
+    @Test fun activityLight() { shoot("42-activity-light", light = true) { m -> click("Activity"); click("24h"); await("the day's ledger") { m.ledgerFor == "24h" } } }
 
     // ---------- settings ----------
 
@@ -343,9 +350,7 @@ class ScreensTest {
             fake.failWith = "Nothing answers at laptop."
             click("Forget this computer")
             click("Forget")
-            Thread.sleep(200)
-            settle()
-            check(shows("still accepts this phone's key"))
+            await("the second question") { shows("still accepts this phone's key") }
         }
         check(!fake.forgotten && m.pairing != null) { "the phone dropped a key the computer still accepts" }
     }
@@ -356,8 +361,7 @@ class ScreensTest {
             click("Settings")
             click("Forget this computer")
             click("Forget")
-            Thread.sleep(200)
-            settle()
+            await("forgotten on both sides") { fake.forgotten && it.pairing == null }
         }
         check(fake.forgotten && m.pairing == null)
     }

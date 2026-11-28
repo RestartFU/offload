@@ -41,10 +41,12 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.restartfu.offload.mobile.ApiException
 import com.restartfu.offload.mobile.AppModel
 import com.restartfu.offload.mobile.Ask
 import com.restartfu.offload.mobile.Link
 import com.restartfu.offload.mobile.ThemeChoice
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 @Composable
@@ -89,10 +91,13 @@ fun SettingsPage(model: AppModel, appVersion: String = "0.1.0") {
                         scope.launch {
                             try {
                                 model.unpair()
+                            } catch (e: CancellationException) {
+                                throw e
                             } catch (e: Exception) {
+                                val why = if (e is ApiException) "It refused (${e.message})" else "It didn't answer"
                                 model.ask = Ask(
                                     "Couldn't tell $name",
-                                    "It didn't answer, so it still accepts this phone's key. You can forget it on this phone only, then remove this phone under Devices in the dashboard.",
+                                    "$why, so it still accepts this phone's key. You can forget it on this phone only, then remove this phone under Devices in the dashboard.",
                                     "Forget on this phone only", keep = "Stay paired",
                                 ) { model.unpairHere() }
                             }
