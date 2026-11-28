@@ -178,9 +178,13 @@ keeps the settings you don't give. New labels take effect on a runner once the j
 finish, because GitHub can't relabel a scale set in use.
 
 The container is new for every job. Docker works through podman inside it (`docker build`,
-`run`, `login`, `push`; not `buildx` or `compose`), so `docker/setup-buildx-action` and
+`run`, `exec`, `login`, `push`; not `buildx` or `compose`), so `docker/setup-buildx-action` and
 `docker/build-push-action` fail there: build with `docker build` and push with `docker push`.
 Short image names without an alias, such as `golang:1.26`, default to Docker Hub.
+Each job has a network of its own with outbound access (rootless podman makes it, with pasta
+from the `passt` package; `github ls` says when it can't). With podman's default settings, what
+it and its containers listen on stays inside the job (reach it on `localhost`; `-p` changes
+nothing), and the runner's own `localhost` is out of reach.
 `gh` and `skopeo` are installed. A repository's jobs keep checkouts, the `actions/setup-*` tool cache, Go,
 cargo and npm caches and the inner image store warm between runs, each parallel job in a warm
 copy of its own. An organization's jobs start clean every time,
@@ -221,15 +225,45 @@ A local web page covering every runner:
 - **Activity.** Statistics on finished jobs: success rate, out-of-memory kills, wait times,
   CPU time, warm-file rate, and per command its run times and how much of its guaranteed CPU it
   really uses.
+- **Devices.** Phones paired with this dashboard, and the button that pairs another.
 
 It follows the system's light or dark setting; the switch at the top right picks one instead,
 remembered by the browser.
 
-The dashboard listens on loopback only and talks to runners with this machine's identity. The
-link it prints carries a per-run key, so other local users can't use it. Runners sample usage
+The page is served on loopback only and the dashboard talks to runners with this machine's
+identity. The link it prints carries a per-run key, so other local users can't use it. With
+`--keep-key` the key is kept in `~/.config/offload/dashboard/key` instead, so a bookmarked link
+keeps working after a restart. Your browser then holds a key that stays valid, and hands it to
+whatever answers on that loopback port while the dashboard is down, so use it where no other
+user runs services on this machine. Runners sample usage
 every 5 seconds and keep a week of it. They also keep a ledger of finished jobs
 (`storage.ledger.retain`, 30 days by default). A runner from before this version shows its
 status only; `offload host upgrade` brings it up to date.
+
+### On your phone
+
+The Android app in [`mobile/`](mobile) shows everything the dashboard does: runners and their
+cores, charts, containers with live logs, GitHub jobs and organizations, and activity. It can
+pause runners, cancel jobs, stop sessions and add or remove organizations.
+
+The phone talks to the dashboard on your computer over Tailscale, which must be on on both.
+Pair it once: under **Devices** in the dashboard press **Pair a phone**, then type the address
+and the one-time code it shows into the app. The code lasts ten minutes and forgives a few
+typos. The phone gets a key of its own, kept in Android Keystore, so it stays paired across
+restarts of the app and the dashboard until you forget it, in the app's Settings or under
+Devices. Forgetting it also ends anything it has open. The app only connects through Tailscale's
+VPN on the phone, never over another network or a proxy.
+
+The dashboard has to be running for the phone to connect (`offload dashboard --no-open` in a
+user service keeps it up). It listens on this machine's tailnet addresses at the page's port,
+7421, and serves only the API there, to paired devices; started before Tailscale, it begins
+once Tailscale is up. `--no-remote` turns that off. Of several dashboards on one machine, the
+first one started without `--no-remote` serves phones and manages devices. If the phone can't
+connect, check that a firewall allows port 7421 on `tailscale0`.
+
+Build the app on an x86-64 runner with
+`offload run --platform linux/amd64 --get mobile/app/build/outputs/apk -- mobile/build.sh :app:assembleDebug`
+and install it with `adb install`. The script fetches JDK 21 and the Android SDK on first use.
 
 ## Agents
 
@@ -255,7 +289,8 @@ main.go                 CLI
 internal/client         discovery, host choice, run/attach, source sync, MCP bridge
 internal/runner         daemon: API, scheduler, workspaces, systemd units, install
 internal/hook           Claude Code guard
-internal/dashboard      offload dashboard: local web UI (embedded, no build step)
+internal/dashboard      offload dashboard: local web UI (embedded, no build step), phone API
+mobile/                 Android app for the dashboard (Kotlin, Compose)
 internal/tsapi          tailscaled LocalAPI (whois, status)
 profiles/               default runner profiles (embedded)
 skill/offload           agent skill

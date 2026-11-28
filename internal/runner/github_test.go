@@ -65,6 +65,7 @@ func newGitHubServer(t *testing.T) (*Server, *githubPool, *fakeGitHub) {
 		ScaleSet: "offload-box", ScaleSetID: 7, Labels: []string{"offload"}, Resources: api.Resources{CPU: 2, CPUMax: 8, Mem: 8 << 30}, Shared: true}, "TOKEN")
 	f := &fakeGitHub{}
 	p.gh = f
+	p.usable = true
 	_ = os.MkdirAll(p.dir, 0o700)
 	s.github[key] = p
 	return s, p, f
@@ -185,6 +186,7 @@ func TestGitHubCapacity(t *testing.T) {
 func TestGitHubFailingRunnersPause(t *testing.T) {
 	s, p, f := newGitHubServer(t)
 	sc := &githubScaler{s: s, p: p, session: f}
+	s.githubNet = githubNet{tag: "img", ok: true, at: time.Now()}
 	for i := 0; i < 3; i++ {
 		if err := sc.Scale(context.Background(), stats(1)); err != nil {
 			t.Fatal(err)
@@ -196,6 +198,9 @@ func TestGitHubFailingRunnersPause(t *testing.T) {
 	}
 	if !time.Now().Before(p.pauseTil) {
 		t.Fatalf("not paused after %d failures", p.failures)
+	}
+	if s.githubNet.ok || !s.githubNet.at.IsZero() {
+		t.Fatalf("the network check stood after the runners kept failing: %+v", s.githubNet)
 	}
 	if err := sc.Scale(context.Background(), stats(1)); err != nil || len(s.githubJobsLocked(p)) != 0 {
 		t.Fatalf("started a runner while paused: %v", err)
@@ -267,6 +272,9 @@ func TestGitHubOrgJobsStartClean(t *testing.T) {
 	argv := strings.Join(s.containerArgv(j, map[string]string{}, j.dir, ""), " ")
 	if strings.Contains(argv, "/opt/offload/go/pkg/mod") || !strings.Contains(argv, j.GitHub.Dir+"/containers:/var/lib/containers") {
 		t.Fatalf("org job mounts shared caches or misses its own store: %s", argv)
+	}
+	if !strings.Contains(argv, "--cap-add SYS_PTRACE") || !strings.Contains(argv, "--network=private") || strings.Contains(argv, "--network=host") {
+		t.Fatalf("a GitHub job needs SYS_PTRACE for docker exec, and its own network namespace with it: %s", argv)
 	}
 	p.Shared = true
 	if err := (&githubScaler{s: s, p: p, session: f}).Scale(context.Background(), stats(2)); err != nil {
@@ -421,5 +429,48 @@ func TestGitHubRelabelDrains(t *testing.T) {
 	}
 	if err := sc.Scale(context.Background(), stats(0)); !errors.Is(err, errRelabel) || !p.drained {
 		t.Fatalf("once it finished: drained %v, %v", p.drained, err)
+	}
+}
+
+// A pool takes no GitHub jobs until podman has started the image with the network jobs get,
+// and while that fails it claims nothing, not even offers answering an earlier poll.
+func TestGitHubWaitsForItsNetwork(t *testing.T) {
+	s, p, f := newGitHubServer(t)
+	tag, _, _ := envPlan(githubEnv())
+	s.readyImages = map[string]bool{tag: true}
+	s.readyChecked = map[string]time.Time{tag: time.Now()}
+	defer func(probe func(context.Context, string, string, string, string) error) { githubNetProbe = probe }(githubNetProbe)
+	s.githubNet = githubNet{tag: tag, running: true} // the check is under way
+	s.tickGitHub()
+	if p.usable || p.Capacity != 0 {
+		t.Fatalf("before the check: usable %v, capacity %d", p.usable, p.Capacity)
+	}
+	githubNetProbe = func(context.Context, string, string, string, string) error {
+		return errors.New(`could not find "pasta"`)
+	}
+	s.checkGitHubNet(tag)
+	s.tickGitHub()
+	if p.State != api.GitHubFailed || !strings.Contains(p.Detail, `could not find "pasta"`) || p.Capacity != 0 {
+		t.Fatalf("failed check: %s %q capacity %d", p.State, p.Detail, p.Capacity)
+	}
+	offer := &scaleset.RunnerScaleSetMessage{JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 9}}}}
+	if err := (&githubScaler{s: s, p: p, session: f}).Scale(context.Background(), offer); err != nil || len(f.acquired) != 0 {
+		t.Fatalf("claimed %v without a working network: %v", f.acquired, err)
+	}
+	githubNetProbe = func(context.Context, string, string, string, string) error { return nil }
+	s.checkGitHubNet(tag)
+	s.tickGitHub()
+	if !p.usable || p.Capacity == 0 {
+		t.Fatalf("after a good check: usable %v capacity %d", p.usable, p.Capacity)
+	}
+
+	// A new image (a runner upgrade) is checked again, by starting it.
+	probed := make(chan string, 1)
+	githubNetProbe = func(_ context.Context, _, _, _, tag string) error { probed <- tag; return nil }
+	s.mu.Lock()
+	ok, _ := s.githubNetLocked("localhost/offload/env:new")
+	s.mu.Unlock()
+	if got := <-probed; ok || got != "localhost/offload/env:new" {
+		t.Fatalf("new image: ok %v before its check, probed %q", ok, got)
 	}
 }

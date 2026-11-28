@@ -421,3 +421,22 @@ pre.log .gap { color: #8a929c; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 @media (forced-colors: active) { .cell { border: 1px solid CanvasText; } .meter > span { background: Highlight; } }
+
+/* Devices */
+.pair-card { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; }
+.pair-card:has(> :only-child) { grid-template-columns: 1fr; }
+.pair-steps h3 { margin: 0 0 8px; font-size: 15px; }
+.pair-steps p { margin: 0 0 14px; max-width: 60ch; }
+.pair-steps ol { margin: 0 0 14px; padding-left: 20px; color: var(--ink-2); }
+.pair-steps li { margin: 4px 0; }
+.pair-actions { display: flex; gap: 8px; }
+.pair-values { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; margin: 0; align-items: baseline; }
+.pair-values dt { color: var(--ink-2); font-size: 13px; }
+.pair-values dd { margin: 0; overflow-wrap: anywhere; }
+.pair-values .big { font-size: 18px; }
+.pair-values .code { font-size: 32px; font-weight: 600; letter-spacing: 0.08em; }
+.device-list { padding: 0; }
+.device-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; }
+.device-row + .device-row { border-top: 1px solid var(--border); }
+.device-row .name { font-weight: 600; }
+@media (max-width: 760px) { .pair-card { grid-template-columns: 1fr; } }

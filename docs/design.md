@@ -223,7 +223,19 @@ keepalive doesn't wake it. Server state, such as a running game, doesn't survive
   it forever, so `rm --forget` is the way out.
 - **Nested podman, not a docker daemon.** Inner containers share the job container's
   namespaces and cgroup, so offload's limits cover them and nothing needs real privileges. The
-  job container gets the `nested_sandbox` permissions, as flatpak sessions do.
+  job container gets the `nested_sandbox` permissions, as flatpak sessions do, plus SYS_PTRACE:
+  `docker exec` opens the inner container's namespaces, and when its PID 1 has dropped root
+  (postgres) that takes ptrace access. All rootless containers share one user namespace, where
+  those capabilities hold, and a separate PID namespace doesn't fence them: a unix socket peer
+  hands out a pidfd. So a GitHub job gets its own network namespace (rootless podman's pasta)
+  with outbound access only. Its abstract sockets, ports and broadcasts stay inside the job,
+  and so do its inner containers and build steps, which share it. That and the runner's loopback
+  being out of reach hold with podman's default settings (pasta can be set to forward ports or
+  map the host's loopback); services on its other addresses are reachable as from any machine on
+  its network. Which helper podman uses, and where it finds it, depend on its version and
+  configuration, so before a pool takes jobs the runner starts the GitHub image that way once, in
+  a user unit as jobs are started. If that fails, the pool offers no room, even to an offer
+  answering an earlier poll, and shows podman's error. The failure pause clears the result.
 
 ## Client networking
 
@@ -284,12 +296,42 @@ Because it acts with those credentials, it guards them:
   because cookies are shared by every port on `127.0.0.1`: any other local web server the
   browser visited would receive it. The printed link carries the key in its fragment
   (`#key=…`), which browsers never send to a server, and the page keeps it in its own origin's
-  storage.
+  storage. A key that outlived the run would be a standing credential in that storage, served
+  to whatever takes the port once the dashboard stops, and a loopback origin gives the browser
+  no way to tell the two apart. So keeping it (`--keep-key`) is the developer's choice, off by
+  default.
 - The browser is opened on a private (0600) HTML file that redirects to the link, never on the
   link itself: command lines are visible to other users in `ps`.
 - Changes (cancel, stop) also need an `X-Offload-Dashboard` header and a same-origin request.
 - A strict CSP forbids inline script and style, and runner data goes into the page as text
   nodes only.
+
+Phones reach the same API on a second listener, on this machine's tailnet addresses, and the
+dashboard is the only thing they talk to: it already holds the runner tokens, and pairing a
+phone with every runner would spread those credentials to a device that is easier to lose.
+
+- That listener serves no page and refuses anything that looks like a browser (`Origin`,
+  `Sec-Fetch-Site`), so tailnet identity, which a browser on another device carries for every
+  page, never reaches it. Each request needs a device token, stored hashed in
+  `dashboard/devices.json`; the browser key is not accepted there.
+- A token comes only from a one-time code made by the page on loopback (eight characters, ten
+  minutes). Jobs on other runners share the tailnet, so wrong codes are counted per peer
+  address: five and that peer waits for the next code, forty in all and the code is gone. A job
+  can neither guess the code nor use it up before the phone gets to it.
+- Forgetting a device removes its hash and cancels its open requests. A log stream reconnects
+  to the runner inside one request, so it would otherwise outlive the device.
+- One dashboard process owns the devices (a lock in the config directory held for its
+  lifetime). A second one, on a fallback port, would keep serving a phone the first was told to
+  forget and write it back; it runs without phones and says so.
+- The phone keeps its token in Android Keystore. A tailnet address alone proves nothing there:
+  with Tailscale off, `100.64.0.0/10` is whatever the phone's network says it is (carriers use
+  that range), and other VPNs take it with catch-all routes such as `0.0.0.0/1`. The app
+  resolves the name through the VPN, requires that VPN to have a tailnet address of its own and
+  a route to the computer that lies inside Tailscale's ranges, binds the socket to it and never
+  uses a proxy, so the token travels inside the VPN's tunnel. Android doesn't say which app
+  owns a VPN, so this can't tell Tailscale from another overlay that hands out the same range
+  (and then only if the computer's address falls inside that overlay's routes). Closing that
+  would take the phone authenticating the dashboard before it sends the token.
 
 The dashboard reads session output through `/v1/sessions/{id}/observe/{stream}`, which doesn't
 count as an attached client. The client streams count as attached, which keeps an idle session

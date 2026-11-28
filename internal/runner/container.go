@@ -722,10 +722,12 @@ type runSpec struct {
 	ReadOnly                            []string // host paths mounted read-only at the same path
 	Volumes                             []string // "host:container"
 	Devices                             []string
+	CapAdd                              []string
 	Env                                 map[string]string
 	Interactive                         bool   // keep stdin (sessions)
 	NestedSandbox                       bool   // flatpak/bubblewrap inside: unmask /proc, no seccomp filter
 	ClientNet                           bool   // network through the client (own netns + TUN + user-space stack)
+	PrivateNet                          bool   // own netns with rootless podman's NAT (pasta) instead of the host's
 	CacheScope                          string // which scoped caches to mount (see workloadMounts)
 	RustupLayer                         string // this workload's own writable layer over rustup ("" = read-only)
 	DNSSearch                           []string
@@ -884,6 +886,8 @@ func (s *Server) podmanRun(r runSpec) []string {
 				r.Env["OFFLOAD_DNS_SEARCH"] = strings.Join(r.DNSSearch, " ")
 			}
 		}
+	} else if r.PrivateNet {
+		a = append(a, "--network=private")
 	} else {
 		a = append(a, "--network=host")
 	}
@@ -895,6 +899,9 @@ func (s *Server) podmanRun(r runSpec) []string {
 		// network namespace. Still rootless: these capabilities only cover namespaces the
 		// container owns, not the host's.
 		a = append(a, "--security-opt", "unmask=ALL", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN", "--cap-add", "NET_ADMIN")
+	}
+	for _, c := range r.CapAdd {
+		a = append(a, "--cap-add", c)
 	}
 	// Only this workload's own paths: never the runner's main socket or the shared runtime dir.
 	for _, p := range r.Same {
@@ -972,6 +979,11 @@ func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets s
 			r.RustupLayer = filepath.Join(g.Dir, "rustup")
 		}
 		r.NestedSandbox = true
+		// A network namespace of its own keeps its ports off the host and other jobs and its
+		// abstract unix sockets apart: through one, SYS_ADMIN and SYS_PTRACE (docker exec into
+		// containers that drop root) would reach another workload's namespaces by pidfd.
+		r.PrivateNet = true
+		r.CapAdd = []string{"SYS_PTRACE"}
 		if _, err := os.Stat("/dev/fuse"); err == nil {
 			r.Devices = append(r.Devices, "/dev/fuse")
 		}

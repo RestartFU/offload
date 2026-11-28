@@ -107,6 +107,9 @@ func configDir() string {
 	return filepath.Join(dir, "offload")
 }
 
+// ConfigDir is the client's configuration directory, ~/.config/offload.
+func ConfigDir() string { return configDir() }
+
 func stateDir() string {
 	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
 		return filepath.Join(d, "offload")

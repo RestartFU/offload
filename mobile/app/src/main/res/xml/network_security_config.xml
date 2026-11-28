@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The dashboard speaks plain HTTP over the tailnet, which WireGuard already encrypts. The app
+  only connects through the VPN that routes to the computer's tailnet address (Tailnet.kt).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
