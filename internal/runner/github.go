@@ -180,7 +180,7 @@ func (s *Server) startPoolLocked(ctx context.Context, p *githubPool) {
 	p.cancel, p.done = cancel, done
 	go func() {
 		defer close(done)
-		s.runPool(pctx, p)
+		s.runPool(pctx, p, done)
 	}()
 }
 
@@ -210,20 +210,24 @@ func (s *Server) restartPoolLocked(p *githubPool) {
 }
 
 // runPool keeps a pool connected to GitHub: it reconnects after errors, with a growing delay.
-func (s *Server) runPool(ctx context.Context, p *githubPool) {
+// done identifies this listener generation: a replaced or removed one never publishes state.
+func (s *Server) runPool(ctx context.Context, p *githubPool, done chan struct{}) {
 	delay := 5 * time.Second
 	for ctx.Err() == nil {
 		started := time.Now()
-		err := s.listenPool(ctx, p)
-		if ctx.Err() != nil {
+		err := s.listenPool(ctx, p, done)
+		s.mu.Lock()
+		current := p.done == done && p.State != api.GitHubRemoving
+		if current && ctx.Err() == nil {
+			p.State, p.Detail = api.GitHubFailed, githubProblem(err, p.Owner)
+		}
+		s.mu.Unlock()
+		if !current || ctx.Err() != nil {
 			return
 		}
 		if time.Since(started) > 10*time.Minute {
 			delay = 5 * time.Second
 		}
-		s.mu.Lock()
-		p.State, p.Detail, p.listener = api.GitHubFailed, githubProblem(err, p.Owner), nil
-		s.mu.Unlock()
 		log.Printf("github %s: %v (retrying in %s)", p.Owner, err, delay)
 		select {
 		case <-ctx.Done():
@@ -248,9 +252,9 @@ func githubProblem(err error, owner string) string {
 	return msg
 }
 
-func (s *Server) githubClient(p *githubPool) (*scaleset.Client, error) {
+func (s *Server) githubClient(url, token string) (*scaleset.Client, error) {
 	return scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
-		GitHubConfigURL: p.URL, PersonalAccessToken: p.token,
+		GitHubConfigURL: url, PersonalAccessToken: token,
 		SystemInfo: scaleset.SystemInfo{System: "offload", Version: s.version},
 	})
 }
@@ -284,24 +288,32 @@ func ensureScaleSet(ctx context.Context, c *scaleset.Client, name string, labels
 	return c.UpdateRunnerScaleSet(ctx, ss.ID, ss)
 }
 
-func (s *Server) listenPool(ctx context.Context, p *githubPool) error {
+// listenPool runs one connection to GitHub with the settings the pool had when it started.
+func (s *Server) listenPool(ctx context.Context, p *githubPool, done chan struct{}) error {
 	s.mu.Lock()
+	if p.done != done || p.State == api.GitHubRemoving {
+		s.mu.Unlock()
+		return errors.New("replaced")
+	}
 	p.State, p.Detail = api.GitHubPreparing, "connecting to GitHub"
+	url, token, name, labels := p.URL, p.token, p.ScaleSet, append([]string(nil), p.Labels...)
 	s.mu.Unlock()
-	c, err := s.githubClient(p)
+	c, err := s.githubClient(url, token)
 	if err != nil {
 		return err
 	}
-	ss, err := ensureScaleSet(ctx, c, p.ScaleSet, p.Labels)
+	ss, err := ensureScaleSet(ctx, c, name, labels)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
-	p.ScaleSetID, p.gh = ss.ID, c
-	p.save()
-	p.Detail = "installing the GitHub Actions runner"
+	if p.done == done {
+		p.ScaleSetID, p.gh = ss.ID, c
+		p.save()
+		p.Detail = "installing the GitHub Actions runner"
+	}
 	s.mu.Unlock()
-	if _, err := s.actionsRunner(ctx, p.token); err != nil {
+	if _, err := s.actionsRunner(ctx, token); err != nil {
 		return fmt.Errorf("installing the GitHub Actions runner: %w", err)
 	}
 	session, err := c.MessageSessionClient(ctx, ss.ID, s.cfg.Name)
@@ -318,6 +330,10 @@ func (s *Server) listenPool(ctx context.Context, p *githubPool) error {
 		return err
 	}
 	s.mu.Lock()
+	if p.done != done {
+		s.mu.Unlock()
+		return errors.New("replaced")
+	}
 	p.listener = l
 	s.mu.Unlock()
 	err = l.Run(ctx, &githubScaler{s: s, p: p, session: session})
@@ -457,7 +473,11 @@ func (sc *githubScaler) Scale(ctx context.Context, m *scaleset.RunnerScaleSetMes
 		// An offer can answer a poll made before a pause or before other work took the room:
 		// claim only what fits now. GitHub offers the rest to other scale sets.
 		s.mu.Lock()
-		room := s.githubCapacityLocked(p) - max(p.Assigned, len(s.githubJobsLocked(p)))
+		assigned := p.Assigned
+		if m.Statistics != nil { // this poll's count, not the previous one's
+			assigned = m.Statistics.TotalAssignedJobs
+		}
+		room := s.githubCapacityLocked(p) - max(assigned, len(s.githubJobsLocked(p)))
 		if time.Now().Before(p.pauseTil) || p.State == api.GitHubRemoving {
 			room = 0
 		}
@@ -559,6 +579,7 @@ func (s *Server) githubJobByRunnerLocked(p *githubPool, runner string) *job {
 func (s *Server) startGitHubRunner(ctx context.Context, p *githubPool) error {
 	id := newID("j-")
 	s.mu.Lock()
+	token := p.token
 	slot, dir := -1, filepath.Join(s.jobDir(id), "github")
 	if p.Shared {
 		slot = 0
@@ -586,7 +607,7 @@ func (s *Server) startGitHubRunner(ctx context.Context, p *githubPool) error {
 	jit, err := p.gh.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name, WorkFolder: work}, p.ScaleSetID)
 	var install string
 	if err == nil {
-		install, err = s.actionsRunner(ctx, p.token)
+		install, err = s.actionsRunner(ctx, token)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -624,6 +645,9 @@ func (s *Server) startGitHubRunner(ctx context.Context, p *githubPool) error {
 	fail := func(err error) error {
 		releaseLocked()
 		go removeAll(j.dir)
+		if j.GitHub.RunnerID != 0 {
+			go func(gh githubAPI, rid int64) { _ = gh.RemoveRunner(context.Background(), rid) }(p.gh, int64(j.GitHub.RunnerID))
+		}
 		return err
 	}
 	if err := os.MkdirAll(filepath.Join(j.dir, "tmp"), 0o700); err != nil {
@@ -701,6 +725,9 @@ func (s *Server) actionsRunner(ctx context.Context, token string) (string, error
 	actionsRunnerMu.Lock()
 	defer actionsRunnerMu.Unlock()
 	base := s.cacheDir("actions-runner")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return "", err
+	}
 	stamp := filepath.Join(base, "checked")
 	current := ""
 	if b, err := os.ReadFile(filepath.Join(base, "current")); err == nil {
@@ -866,14 +893,30 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "can't use "+owner)
 		return
 	}
-	name := githubScaleSetName(s.cfg.Name, runnerID(s.cfg.StateDir))
+	repo := strings.Contains(owner, "/")
+	// Local checks first: nothing changes on GitHub for a request this runner would refuse.
 	s.mu.Lock()
-	if p := s.github[key]; p != nil {
-		name = p.ScaleSet
+	p := s.github[key]
+	name := githubScaleSetName(s.cfg.Name, runnerID(s.cfg.StateDir))
+	shared := repo || (req.SharedCache != nil && *req.SharedCache)
+	problem, code := "", 0
+	switch {
+	case s.serveCtx == nil:
+		problem, code = "runner is starting; try again in a few seconds", 503
+	case p != nil && p.State == api.GitHubRemoving:
+		problem, code = owner+" is still being removed here; try again in a minute", http.StatusConflict
+	case p != nil && !repo && req.SharedCache != nil && *req.SharedCache != p.Shared:
+		// Runners already started keep the state they were given: changing it means starting over.
+		problem, code = "--shared-cache is chosen when "+owner+" is added: run offload github rm "+owner+" first", http.StatusConflict
+	case p != nil:
+		name, shared = p.ScaleSet, p.Shared
 	}
 	s.mu.Unlock()
-	probe := &githubPool{GitHubPool: api.GitHubPool{URL: canonical, Owner: owner}, token: req.Token}
-	c, err := s.githubClient(probe)
+	if problem != "" {
+		writeErr(w, code, problem)
+		return
+	}
+	c, err := s.githubClient(canonical, req.Token)
 	var ss *scaleset.RunnerScaleSet
 	if err == nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
@@ -887,19 +930,8 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.serveCtx == nil {
-		writeErr(w, 503, "runner is starting; try again in a few seconds")
-		return
-	}
-	p := s.github[key]
-	if p != nil && p.State == api.GitHubRemoving {
-		writeErr(w, http.StatusConflict, owner+" is still being removed here; try again in a minute")
-		return
-	}
-	shared := req.SharedCache || strings.Contains(owner, "/")
-	if p != nil && p.Shared != shared {
-		// Runners already started keep the state they were given: changing it means starting over.
-		writeErr(w, http.StatusConflict, "--shared-cache can only be chosen when "+owner+" is added: run offload github rm "+owner+" first")
+	if cur := s.github[key]; cur != p || (p != nil && p.State == api.GitHubRemoving) {
+		writeErr(w, http.StatusConflict, owner+" changed on this runner meanwhile; run the command again")
 		return
 	}
 	dir := filepath.Join(s.githubDir(), key)
@@ -907,35 +939,39 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if err := writeSecretFile(filepath.Join(dir, "token"), req.Token); err != nil {
+	rec := githubPoolRecord{Owner: owner, URL: canonical, ScaleSet: name, CreatedAt: time.Now()}
+	if p != nil {
+		rec = p.record()
+	}
+	rec.Labels, rec.Max, rec.Resources, rec.TokenFrom, rec.Shared = req.Labels, req.Max, res, req.TokenFrom, shared
+	if ss != nil && ss.Name == name {
+		rec.ScaleSetID = ss.ID
+	}
+	// The token and the settings commit together: stage the token, save the record, swap it in.
+	tok := filepath.Join(dir, "token")
+	if err := os.WriteFile(tok+".new", []byte(req.Token+"\n"), 0o600); err != nil {
+		writeErr(w, 500, "storing the token: "+err.Error())
+		return
+	}
+	if err := writeFileJSON(filepath.Join(dir, "pool.json"), rec); err != nil {
+		_ = os.Remove(tok + ".new")
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if err := os.Rename(tok+".new", tok); err != nil {
 		writeErr(w, 500, "storing the token: "+err.Error())
 		return
 	}
 	if p == nil {
-		p = s.newPool(key, dir, githubPoolRecord{Owner: owner, URL: canonical, ScaleSet: name, CreatedAt: time.Now()}, req.Token)
+		p = s.newPool(key, dir, rec, req.Token)
 		s.github[key] = p
-	}
-	p.token, p.Labels, p.Max, p.Resources, p.TokenFrom = req.Token, req.Labels, req.Max, res, req.TokenFrom
-	p.Shared = shared
-	if ss != nil && p.ScaleSet == ss.Name {
-		p.ScaleSetID = ss.ID
+	} else {
+		p.token, p.Labels, p.Max, p.Resources, p.TokenFrom, p.Shared, p.ScaleSetID = req.Token, rec.Labels, rec.Max, rec.Resources, rec.TokenFrom, rec.Shared, rec.ScaleSetID
 	}
 	p.State, p.Detail = api.GitHubPreparing, "connecting to GitHub"
-	if err := p.save(); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
 	s.restartPoolLocked(p)
 	log.Printf("github %s: taking jobs labeled %s as scale set %s", owner, strings.Join(p.Labels, ","), name)
 	writeJSON(w, s.githubViewLocked(p))
-}
-
-func writeSecretFile(path, value string) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(value+"\n"), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
 }
 
 // handleGitHubRemove stops taking an owner's jobs here: it stops the runners, deletes this
@@ -1039,15 +1075,17 @@ func (s *Server) finishRemoval(p *githubPool) {
 
 // deleteScaleSet deletes this runner's scale set for the pool on GitHub (done if it's gone).
 func (s *Server) deleteScaleSet(p *githubPool) error {
-	c, err := s.githubClient(p)
+	s.mu.Lock()
+	url, token, id, name := p.URL, p.token, p.ScaleSetID, p.ScaleSet
+	s.mu.Unlock()
+	c, err := s.githubClient(url, token)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	id := p.ScaleSetID
 	if id == 0 {
-		ss, err := c.GetRunnerScaleSet(ctx, 1, p.ScaleSet)
+		ss, err := c.GetRunnerScaleSet(ctx, 1, name)
 		if err != nil || ss == nil {
 			return err
 		}

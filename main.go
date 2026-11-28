@@ -374,9 +374,17 @@ func cmdGitHub(args []string) error {
 		labels := fs.String("labels", "offload", "labels workflows use in runs-on, comma-separated")
 		on := fs.String("on", "", "runners to use, comma-separated (default: all)")
 		fs.IntVar(&o.Max, "max", 0, "most GitHub jobs at once per runner (default: as many as fit)")
-		fs.BoolVar(&o.Shared, "shared-cache", false, "let the organization's repositories share warm caches")
+		shared := fs.Bool("shared-cache", false, "let the organization's repositories share warm caches")
 		res := resourceFlags(fs)
 		_ = fs.Parse(args[2:])
+		if fs.NArg() > 0 {
+			die("offload github add: unexpected " + strings.Join(fs.Args(), " ") + " (flags go after ORG[/REPO])")
+		}
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "shared-cache" {
+				o.Shared = shared
+			}
+		})
 		var err error
 		if o.Resources, err = res(); err != nil {
 			return err
@@ -393,6 +401,9 @@ func cmdGitHub(args []string) error {
 		on := fs.String("on", "", "runners, comma-separated (default: all)")
 		forget := fs.Bool("forget", false, "remove here even if GitHub can't be told (a revoked token)")
 		_ = fs.Parse(args[2:])
+		if fs.NArg() > 0 {
+			die("offload github rm: unexpected " + strings.Join(fs.Args(), " ") + " (one ORG[/REPO], then flags)")
+		}
 		return client.GitHubRemove(args[1], list(*on), *forget)
 	}
 	die(usage)

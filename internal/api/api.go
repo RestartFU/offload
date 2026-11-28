@@ -290,7 +290,8 @@ type GitHubAdd struct {
 	Resources Resources `json:"resources"`            // for each GitHub job
 	// SharedCache lets an organization's repositories share warm checkouts, caches and images.
 	// Without it each of its jobs starts clean; a repository's jobs always share them.
-	SharedCache bool `json:"shared_cache,omitempty"`
+	// Nil keeps an existing pool's choice (it is fixed once the pool exists).
+	SharedCache *bool `json:"shared_cache,omitempty"`
 }
 
 // GitHub runner pool states.
@@ -481,16 +482,16 @@ func GitHubOwner(raw string) (owner, canonical string, err error) {
 			}
 		}
 	}
-	ok := perr == nil && u.Scheme == "https" && u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == "" &&
+	ok := perr == nil && u.Scheme == "https" && (u.Host == "github.com" || u.Host == "www.github.com") && u.User == nil && u.RawQuery == "" && u.Fragment == "" &&
 		(len(parts) == 1 || len(parts) == 2)
 	for _, p := range parts {
 		ok = ok && githubNameRE.MatchString(p) && p != "." && p != ".."
 	}
 	if !ok {
-		return "", "", fmt.Errorf("%q is not a GitHub organization or repository: use ORG, ORG/REPO or https://github.com/ORG[/REPO]", raw)
+		return "", "", fmt.Errorf("%q is not a github.com organization or repository: use ORG, ORG/REPO or https://github.com/ORG[/REPO]", raw)
 	}
 	owner = strings.Join(parts, "/")
-	return owner, "https://" + u.Host + "/" + owner, nil
+	return owner, "https://github.com/" + owner, nil
 }
 
 // GitHubKey names an owner's GitHub runner pool on a runner: "acme" or "acme--app".

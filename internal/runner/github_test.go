@@ -203,7 +203,7 @@ func TestGitHubFailingRunnersPause(t *testing.T) {
 // Pools and their runners' slots come back after a restart.
 func TestGitHubRestore(t *testing.T) {
 	s, p, f := newGitHubServer(t)
-	if err := writeSecretFile(filepath.Join(p.dir, "token"), "TOKEN"); err != nil || p.save() != nil {
+	if err := os.WriteFile(filepath.Join(p.dir, "token"), []byte("TOKEN\n"), 0o600); err != nil || p.save() != nil {
 		t.Fatal(err)
 	}
 	if err := (&githubScaler{s: s, p: p, session: f}).Scale(context.Background(), stats(1)); err != nil {
@@ -294,5 +294,16 @@ func TestGitHubForgetSurvivesRestart(t *testing.T) {
 	s2.restoreGitHub()
 	if r := s2.github["acme"]; r == nil || r.State != api.GitHubRemoving || !r.forget {
 		t.Fatalf("restored %+v", r)
+	}
+}
+
+// A pool at --max 1 whose last job finished claims the next offer: the poll's own count decides.
+func TestGitHubClaimsWithCurrentCount(t *testing.T) {
+	s, p, f := newGitHubServer(t)
+	p.Max, p.Assigned = 1, 1
+	offer := &scaleset.RunnerScaleSetMessage{JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 3}}},
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 0}}
+	if err := (&githubScaler{s: s, p: p, session: f}).Scale(context.Background(), offer); err != nil || len(f.acquired) != 1 {
+		t.Fatalf("claimed %v: %v", f.acquired, err)
 	}
 }

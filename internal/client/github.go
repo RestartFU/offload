@@ -29,7 +29,7 @@ type GitHubOptions struct {
 	Max       int
 	On        []string
 	Resources api.Resources
-	Shared    bool // --shared-cache
+	Shared    *bool // --shared-cache, when given
 }
 
 // githubToken resolves the token to hand runners, and where it came from ("gh" or "token").
@@ -279,7 +279,7 @@ func GitHubAdd(o GitHubOptions) error {
 		return errors.New("no runner is taking GitHub jobs yet (they keep retrying; offload github ls shows why)")
 	}
 	fmt.Printf("\nWorkflows in %s run here with:\n\n    runs-on: %s\n\n", owner, runsOn(o.Labels))
-	if !strings.Contains(owner, "/") && !o.Shared {
+	if !strings.Contains(owner, "/") && o.Shared == nil && !githubSharedNow(ctx, hosts, owner) {
 		fmt.Printf("Each job starts with clean caches, because %s's repositories would otherwise share checkouts,\n"+
 			"dependency caches and docker images. If they all trust each other, keep them warm with:\n\n"+
 			"    offload github add %s --shared-cache\n\n", owner, owner)
@@ -396,14 +396,24 @@ func GitHubRemove(raw string, on []string, forget bool) error {
 	}
 	key := api.GitHubKey(owner)
 	var targets []*Host
+	var unchecked []string
 	for _, h := range hosts {
-		if pools, err := githubPools(ctx, h); err == nil && githubFind(pools, key) != nil {
+		pools, err := githubPools(ctx, h)
+		switch {
+		case err != nil:
+			unchecked = append(unchecked, fmt.Sprintf("%s (%v)", h.Name, err))
+		case githubFind(pools, key) != nil:
 			targets = append(targets, h)
 		}
 	}
-	if len(targets) == 0 {
+	if len(targets) == 0 && len(unchecked) == 0 {
 		return fmt.Errorf("no runner takes GitHub jobs for %s (see offload github ls)", owner)
 	}
+	defer func() {
+		if len(unchecked) > 0 {
+			fmt.Printf("\nCouldn't check %s: run this again once they answer, or they keep taking %s's jobs.\n", strings.Join(unchecked, ", "), owner)
+		}
+	}()
 	fmt.Printf("Removing GitHub jobs for %s from %s. Running jobs are stopped.\n\n", owner, joinNames(targets))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -454,5 +464,21 @@ func GitHubRemove(raw string, on []string, forget bool) error {
 		}()
 	}
 	wg.Wait()
+	if failed == nil && len(unchecked) > 0 {
+		failed = errors.New("some runners couldn't be checked")
+	}
 	return failed
+}
+
+// githubSharedNow reports whether a runner already keeps owner with shared caches (the choice is
+// fixed when an organization is added, so re-adding it for a new token keeps it).
+func githubSharedNow(ctx context.Context, hosts []*Host, owner string) bool {
+	for _, h := range hosts {
+		if pools, err := githubPools(ctx, h); err == nil {
+			if p := githubFind(pools, api.GitHubKey(owner)); p != nil && p.Shared {
+				return true
+			}
+		}
+	}
+	return false
 }
