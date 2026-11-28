@@ -303,10 +303,11 @@ func candidates(hosts []*Host, on, profile string, want api.JobSpec, defined boo
 }
 
 // anyBusy reports whether a paired runner is temporarily refusing work (below its memory
-// reserve, upgrading, reconciling): worth waiting for rather than giving up.
+// reserve, upgrading, reconciling): worth waiting for rather than giving up. A paused runner
+// stays paused until someone resumes it.
 func anyBusy(hosts []*Host) bool {
 	for _, h := range hosts {
-		if h.Status != nil && !h.Status.Accepting && !(h.derived && h.Token == "") {
+		if h.Status != nil && !h.Status.Accepting && !h.Status.Paused && !(h.derived && h.Token == "") {
 			return true
 		}
 	}

@@ -79,11 +79,12 @@ function icon(kind) {
     neutral: [s("circle", { cx: 8, cy: 8, r: 6, fill: "none", stroke: "currentColor", "stroke-width": 2 })],
     info: [s("circle", { cx: 8, cy: 8, r: 7, fill: "currentColor" }), s("path", { d: "M8 7.2v4.2", stroke: "#fff", "stroke-width": 1.8, "stroke-linecap": "round" }), s("circle", { cx: 8, cy: 4.7, r: 1, fill: "#fff" })],
     running: [s("circle", { cx: 8, cy: 8, r: 7, fill: "currentColor" }), s("path", { d: "M6.4 5v6l4.6-3z", fill: "#fff" })],
+    paused: [s("circle", { cx: 8, cy: 8, r: 7, fill: "currentColor" }), s("path", { d: "M6.2 5.2v5.6M9.8 5.2v5.6", stroke: "#fff", "stroke-width": 1.8, "stroke-linecap": "round" })],
   }[kind] || [];
   return s("svg", { viewBox: "0 0 16 16", "aria-hidden": "true" }, p);
 }
 function chip(kind, label) {
-  const cls = kind === "running" ? "info" : kind;
+  const cls = kind === "running" ? "info" : kind === "paused" ? "neutral" : kind;
   return h("span", { class: "chip " + cls }, icon(kind), label);
 }
 function stateChip(state, reason) {
@@ -154,6 +155,7 @@ const state = {
   cfilter: { state: store("cstate") || "active", kind: "", runner: "", q: "" },
   sel: null, // {runner, id}
   stopping: new Map(), // "runner/id" -> "" while stopping, or the error
+  pausing: new Map(), // runner name -> "" while pausing or resuming, or the error
   usage: new Map(), // "runner/id" -> [{t, cpu, mem}]
 };
 const RANGES = [["1h", 3600], ["6h", 6 * 3600], ["24h", 86400], ["7d", 7 * 86400]];
@@ -288,7 +290,10 @@ function alertsFor(runners, version) {
     const st = r.status;
     if (!st) continue;
     if (r.error) out.push(["warning", [h("b", {}, r.name), ": ", r.error]]);
-    if (!st.accepting) out.push(["warning", [h("b", {}, r.name), " is not accepting work: ", st.reason || "unknown reason"]]);
+    const perr = state.pausing.get(r.name);
+    if (perr) out.push(["critical", [h("b", {}, r.name), ": ", perr]]);
+    if (st.paused) out.push(["info", [h("b", {}, r.name), " is paused: it starts no new jobs or sessions until you resume it"]]);
+    else if (!st.accepting) out.push(["warning", [h("b", {}, r.name), " is not accepting work: ", st.reason || "unknown reason"]]);
     if (st.mem_available < st.mem_reserve * 1.25) out.push(["serious", [h("b", {}, r.name), ": host memory is close to the reserve (", fmtBytes(st.mem_available), " available, reserve ", fmtBytes(st.mem_reserve), ")"]]);
     for (const d of r.metrics?.disk || []) {
       const free = d.total ? d.free / d.total : 1;
@@ -418,7 +423,8 @@ const truncate = (t, n) => (t.length > n ? t.slice(0, n - 1) + "…" : t);
 function runnerCard(r) {
   const st = r.status;
   const head = h("div", { class: "runner-head" }, h("h3", {}, r.name),
-    !r.online ? chip("critical", "Offline") : st && !st.accepting ? chip("warning", "Not accepting") : chip("good", "Accepting"));
+    !r.online ? chip("critical", "Offline") : st?.paused ? chip("paused", "Paused") : st && !st.accepting ? chip("warning", "Not accepting") : chip("good", "Accepting"),
+    r.online && st ? pauseBtn(r) : null);
   if (!st) return h("div", { class: "card" }, head, h("p", { class: "muted" }, r.error || "No status yet"));
   const meta = [st.hostname, st.os + "/" + st.arch, st.version, st.runtime === "container" ? "containers" : "host runtime"];
   if (st.started && st.metrics) meta.push("up " + fmtDur(since(st.started)));
@@ -469,6 +475,27 @@ function runnerCard(r) {
     h("span", {}, h("b", {}, (st.warm_keys || []).length), " warm workspaces"),
     (st.features || []).length ? h("span", {}, "cgroups: " + st.features.join(", ")) : null);
   return h("div", { class: "card" }, head, h("div", { class: "runner-meta" }, meta.filter(Boolean).join(" · ")), cores, rows, foot);
+}
+
+function pauseBtn(r) {
+  const paused = !!r.status.paused, busy = state.pausing.get(r.name) === "";
+  const label = (paused ? "Resume " : "Pause ") + r.name;
+  const glyph = paused ? s("path", { d: "M5.5 3.5v9l7-4.5z", fill: "currentColor", "stroke-linejoin": "round" })
+    : s("path", { d: "M5.5 3.5v9M10.5 3.5v9", stroke: "currentColor", "stroke-width": 2.2, "stroke-linecap": "round" });
+  return h("button", { class: "icon-btn", type: "button", "aria-label": label, title: paused ? label : label + ": start no new work, let running work finish", disabled: busy, onclick: async () => {
+    state.pausing.set(r.name, ""); render();
+    try {
+      const res = await api("/api/pause", { method: "POST", headers: { "Content-Type": "application/json", "X-Offload-Dashboard": "1" }, body: JSON.stringify({ host: r.name, paused: !paused }) });
+      state.pausing.delete(r.name);
+      const cur = state.fleet?.runners.find((x) => x.name === r.name);
+      if (cur) cur.status = { ...res, allocated: { cpu: 0, mem: 0, ...res.allocated } };
+    } catch (e) {
+      const msg = `couldn't ${paused ? "resume" : "pause"} it: ${e.message}`;
+      state.pausing.set(r.name, msg);
+      setTimeout(() => { if (state.pausing.get(r.name) === msg) { state.pausing.delete(r.name); render(); } }, 10000);
+    }
+    render();
+  } }, s("svg", { viewBox: "0 0 16 16", width: 16, height: 16, "aria-hidden": "true" }, glyph));
 }
 
 function renderQueue(runners) {

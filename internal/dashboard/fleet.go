@@ -315,3 +315,13 @@ func (f *fleet) ledgerHosts() (map[string]*client.Host, map[string]string) {
 	}
 	return out, missing
 }
+
+// setStatus records a status the runner just answered with, so the page shows a change it
+// made at once rather than on the next poll.
+func (f *fleet) setStatus(name string, h *client.Host, st *api.Status) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r := f.byNameLocked(name); r != nil && r.host == h {
+		r.Status = st
+	}
+}

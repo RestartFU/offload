@@ -193,6 +193,10 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		out.err(503, "runner is upgrading; try again in a few seconds")
 		return
 	}
+	if s.paused {
+		out.err(403, "runner is paused (resume it in offload dashboard)")
+		return
+	}
 	if why := s.neverFitsLocked(res); why != "" { // not a matter of waiting
 		out.err(http.StatusUnprocessableEntity, why)
 		return

@@ -152,6 +152,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/ledger", s.handleLedger)
 	mux.HandleFunc("GET /api/logs", s.handleLogs)
 	mux.HandleFunc("POST /api/stop", s.handleStop)
+	mux.HandleFunc("POST /api/pause", s.handlePause)
 	return s.guard(mux)
 }
 
@@ -498,4 +499,35 @@ func (s *server) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 	s.fleet.poke()
 	writeJSON(w, map[string]string{"status": "stopping"})
+}
+
+// handlePause pauses or resumes a runner.
+func (s *server) handlePause(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Host   string `json:"host"`
+		Paused bool   `json:"paused"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	h := s.fleet.host(req.Host)
+	if h == nil {
+		writeErr(w, 404, "no such runner")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	var st api.Status
+	if err := h.Do(ctx, "POST", "/v1/admin/pause", map[string]bool{"paused": req.Paused}, &st); err != nil {
+		var ae *client.APIError
+		if errors.As(err, &ae) && ae.Code == 404 {
+			writeErr(w, 409, "this runner is too old to pause; upgrade it with offload host upgrade")
+			return
+		}
+		writeErr(w, 502, err.Error())
+		return
+	}
+	s.fleet.setStatus(req.Host, h, &st)
+	writeJSON(w, st)
 }
