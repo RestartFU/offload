@@ -282,35 +282,45 @@ func (f *fleet) snapshot(version string) fleetView {
 	return v
 }
 
-// currentHosts are the runners answering on this protocol, each with its latest status.
-func (f *fleet) currentHosts() []*client.Host {
+// rowHosts are the named rows' runners, current ones only, each with its latest status and the
+// name the page shows (unique here, unlike runners' own names). missing lists the others.
+func (f *fleet) rowHosts(names []string) (hosts []*client.Host, missing []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out []*client.Host
-	for _, r := range f.runners {
-		if r.currentLocked() {
-			h, st := *r.host, *r.Status
-			h.Status = &st
-			out = append(out, &h)
+	for _, n := range names {
+		r := f.byNameLocked(n)
+		if r == nil || !r.currentLocked() {
+			missing = append(missing, n)
+			continue
 		}
+		h, st := *r.host, *r.Status
+		h.Status, h.Name = &st, r.Name
+		hosts = append(hosts, &h)
 	}
-	return out
+	return hosts, missing
 }
 
-// githubHolders are the runners that take GitHub jobs for owner, as they last reported.
-func (f *fleet) githubHolders(owner string) []*client.Host {
+// githubHolders are the rows whose runner last reported a GitHub pool for owner, split into
+// those answering now and those that aren't.
+func (f *fleet) githubHolders(owner string) (online []*client.Host, offline []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out []*client.Host
 	for _, r := range f.runners {
 		for _, p := range r.GitHub {
-			if r.Online && strings.EqualFold(p.Owner, owner) {
-				out = append(out, r.host)
-				break
+			if !strings.EqualFold(p.Owner, owner) {
+				continue
 			}
+			if r.Online {
+				h := *r.host
+				h.Name = r.Name
+				online = append(online, &h)
+			} else {
+				offline = append(offline, r.Name)
+			}
+			break
 		}
 	}
-	return out
+	return online, offline
 }
 
 func (f *fleet) host(name string) *client.Host {

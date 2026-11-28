@@ -1060,11 +1060,11 @@ function armedBtn(key, label, confirmLabel, run) {
   } }, state.ghBusyKey === key ? "Working…" : armed ? confirmLabel : label);
 }
 
-async function ghRemove(owner, forget) {
+async function ghRemove(owner, forget, on) {
   const key = (forget ? "forget:" : "rm:") + owner;
   state.ghBusyKey = key; render();
   try {
-    const res = await api("/api/github/remove", { method: "POST", headers: { "Content-Type": "application/json", "X-Offload-Dashboard": "1" }, body: JSON.stringify({ owner, forget }) });
+    const res = await api("/api/github/remove", { method: "POST", headers: { "Content-Type": "application/json", "X-Offload-Dashboard": "1" }, body: JSON.stringify({ owner, forget, on }) });
     const bad = res.results.filter((x) => x.error);
     ghNotice(bad.length ? "critical" : "info", bad.length
       ? `Couldn't remove ${owner} from ${bad.map((x) => `${x.runner} (${x.error})`).join(", ")}`
@@ -1088,8 +1088,8 @@ function ownerCard(owner, list) {
   const finished = sum(list, ([, p]) => p.runs);
   const last = list.map(([, p]) => p.last_run).filter(Boolean).sort().pop();
   const per = first.resources;
-  const removing = list.some(([, p]) => p.state === "removing");
-  const stuck = list.some(([, p]) => p.state === "removing" && (p.detail || "").startsWith("couldn't"));
+  const left = list.filter(([, p]) => p.state !== "removing").map(([r]) => r.name);
+  const stuck = list.filter(([, p]) => p.state === "removing" && (p.detail || "").startsWith("couldn't")).map(([r]) => r.name);
   return h("div", { class: "card gh-owner" },
     h("div", { class: "gh-owner-head" },
       h("h3", {}, owner),
@@ -1106,8 +1106,8 @@ function ownerCard(owner, list) {
       h("span", {}, first.shared ? "Warm caches shared by its jobs" : "Clean caches every job"),
       h("span", {}, first.token_from === "gh" ? "With your gh login" : "With a token"),
       h("span", { class: "gh-actions" },
-        stuck ? armedBtn("forget:" + owner, "Remove here only", "Confirm: GitHub keeps its scale sets", () => ghRemove(owner, true)) : null,
-        removing ? null : armedBtn("rm:" + owner, "Remove", "Confirm remove: stops its running jobs", () => ghRemove(owner, false)))));
+        stuck.length ? armedBtn("forget:" + owner, "Remove here only", `Confirm: GitHub keeps ${stuck.join(", ")}'s scale set`, () => ghRemove(owner, true, stuck)) : null,
+        left.length ? armedBtn("rm:" + owner, "Remove", "Confirm remove: stops its running jobs", () => ghRemove(owner, false, left)) : null)));
 }
 
 function ghOnboarding() {
@@ -1171,6 +1171,7 @@ function ghFormEl() {
 
 function openGhForm() {
   state.ghFormOpen = true; state.ghFormMsg = null;
+  if (ghForm) { ghForm.picks = null; ghForm.runnerKey = null; ghForm.lastOwner = null; }
   render();
   ghForm.root.scrollIntoView({ block: "nearest", behavior: "smooth" });
   ghForm.owner.focus();
@@ -1196,20 +1197,32 @@ function renderGhForm(owners) {
   f.preview.textContent = "runs-on: " + runsOn(labels);
   const existing = owners && [...owners.keys()].find((o) => o.toLowerCase() === owner.toLowerCase());
   const repo = owner.includes("/");
-  const existingShared = existing && owners.get(existing)[0][1].shared;
+  if (owner !== f.lastOwner) {
+    // A connected one shows its settings; any other starts from the defaults, so sharing caches
+    // is always chosen for the organization at hand, never carried over from another.
+    const pool = existing && owners.get(existing)[0][1];
+    f.cacheClean.checked = !pool?.shared;
+    f.cacheShared.checked = !!pool?.shared;
+    if (pool) { f.labels.value = (pool.labels || []).join(", "); f.max.value = pool.max ? pool.max : ""; }
+    else if (f.lastExisting) { f.labels.value = "offload"; f.max.value = ""; }
+    f.lastOwner = owner; f.lastExisting = !!pool;
+    f.preview.textContent = "runs-on: " + runsOn(f.labels.value.split(",").map((x) => x.trim()).filter(Boolean));
+  }
   f.cacheChoices.hidden = repo;
   f.cacheClean.disabled = f.cacheShared.disabled = !!existing;
-  if (existing) (existingShared ? f.cacheShared : f.cacheClean).checked = true;
   f.cacheNote.textContent = repo ? "A repository's jobs keep warm caches: they are all the same repository's code."
     : existing ? `Chosen when ${existing} was added; remove it to change this.` : "";
   f.tokenRow.hidden = !f.authToken.checked;
   const runners = ghRunners();
+  // Choices last as long as the form: a runner that drops out and comes back keeps its own, and
+  // one that appears after the form opened starts unchosen.
+  if (!f.picks && runners.length) f.picks = new Map(runners.map((r) => [r.name, true]));
   const key = runners.map((r) => r.name).join("\n");
   if (key !== f.runnerKey) {
-    const was = new Map([...f.runners.querySelectorAll("input")].map((i) => [i.value, i.checked]));
     f.runnerKey = key;
     f.runners.replaceChildren(...(runners.length ? runners.map((r) => {
-      const input = h("input", { type: "checkbox", value: r.name, checked: was.has(r.name) ? was.get(r.name) : true });
+      if (!f.picks.has(r.name)) f.picks.set(r.name, false);
+      const input = h("input", { type: "checkbox", value: r.name, checked: f.picks.get(r.name), onchange: (e) => f.picks.set(r.name, e.target.checked) });
       return h("label", { class: "choice" }, input, h("span", {}, h("b", {}, r.name), h("span", { class: "muted" }, ` ${fmtCores(r.status.capacity.cpu)} cores`)));
     }) : [h("span", { class: "muted" }, "No runner can take GitHub jobs: they need podman, and must be up to date.")]));
   }
@@ -1245,6 +1258,7 @@ async function submitGhForm() {
   const max = f.max.value === "" ? 0 : Number(f.max.value);
   if (!Number.isInteger(max) || max < 0) return fail("Most jobs at once is a whole number, or empty.", f.max);
   const body = { owner, token, on, max, labels: f.labels.value.split(",").map((x) => x.trim()).filter(Boolean) };
+  if (!body.labels.length) body.labels = ["offload"];
   if (!owner.includes("/") && !f.cacheShared.disabled) body.shared = f.cacheShared.checked;
   state.ghFormBusy = true; state.ghFormMsg = null; render();
   try {

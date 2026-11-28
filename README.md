@@ -160,7 +160,8 @@ room and holds it while none has any. Every job gets a one-job runner as an ordi
 admission, CPU and memory limits (the runner's default CPU guarantee and 8G unless `--cpu`,
 `--cpu-max` or `--mem` say otherwise), memory booked from earlier runs, the ledger and the
 dashboard's GitHub tab. `--max N` caps how many run at once on each runner, `--labels` sets what
-`runs-on` matches, and `--on` picks runners.
+`runs-on` matches, and `--on` picks runners. Adding it again, to give it a new token for example,
+keeps the settings you don't give.
 
 The container is new for every job. Docker works through podman inside it (`docker build`,
 `run`, `login`, `push`; not `buildx` or `compose`). A repository's jobs keep checkouts, the

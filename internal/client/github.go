@@ -24,9 +24,9 @@ import (
 // GitHubOptions are the flags of `offload github add`.
 type GitHubOptions struct {
 	Owner     string
-	Token     string // a token or a cmd:/env:/file: source; empty uses the gh login
-	Labels    []string
-	Max       int
+	Token     string   // a token or a cmd:/env:/file: source; empty uses the gh login
+	Labels    []string // nil keeps a connected pool's (a new one gets "offload")
+	Max       *int     // nil keeps a connected pool's
 	On        []string
 	Resources api.Resources
 	Shared    *bool // --shared-cache, when given
@@ -254,17 +254,24 @@ func GitHubAdd(o GitHubOptions) error {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	ok := 0
+	var labels []string // what the runners say workflows use
 	for _, h := range hosts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			req := api.GitHubAdd{URL: owner, Token: token, TokenFrom: from, Labels: o.Labels, Max: o.Max, Resources: o.Resources, SharedCache: o.Shared}
-			if _, err := GitHubAddTo(ctx, h, req); err != nil {
+			p, err := GitHubAddTo(ctx, h, req)
+			if err != nil {
 				mu.Lock()
 				line(h, "failed", err.Error())
 				mu.Unlock()
 				return
 			}
+			mu.Lock()
+			if labels == nil {
+				labels = p.Labels
+			}
+			mu.Unlock()
 			last := ""
 			for {
 				pools, err := githubPools(ctx, h)
@@ -311,7 +318,7 @@ func GitHubAdd(o GitHubOptions) error {
 	if ok == 0 {
 		return errors.New("no runner is taking GitHub jobs yet (they keep retrying; offload github ls shows why)")
 	}
-	fmt.Printf("\nWorkflows in %s run here with:\n\n    runs-on: %s\n\n", owner, runsOn(o.Labels))
+	fmt.Printf("\nWorkflows in %s run here with:\n\n    runs-on: %s\n\n", owner, runsOn(labels))
 	if !strings.Contains(owner, "/") && o.Shared == nil && !githubSharedNow(ctx, hosts, owner) {
 		fmt.Printf("Each job starts with clean caches, because %s's repositories would otherwise share checkouts,\n"+
 			"dependency caches and docker images. If they all trust each other, keep them warm with:\n\n"+

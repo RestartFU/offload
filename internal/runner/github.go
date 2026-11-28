@@ -857,16 +857,13 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "a GitHub token is required (offload github add uses your gh login by default)")
 		return
 	}
-	if len(req.Labels) == 0 {
-		req.Labels = []string{"offload"}
-	}
 	for _, l := range req.Labels {
 		if !validKey(l) {
 			writeErr(w, 400, "invalid label "+strconv.Quote(l)+": use letters, digits, '.', '_' and '-'")
 			return
 		}
 	}
-	if req.Max < 0 {
+	if req.Max != nil && *req.Max < 0 {
 		writeErr(w, 400, "--max can't be negative")
 		return
 	}
@@ -916,6 +913,24 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	case p != nil:
 		name, shared = p.ScaleSet, p.Shared
 	}
+	labels, maxJobs := req.Labels, 0
+	if req.Max != nil {
+		maxJobs = *req.Max
+	}
+	if p != nil { // what the request leaves out stays as it was
+		if len(labels) == 0 {
+			labels = p.Labels
+		}
+		if req.Max == nil {
+			maxJobs = p.Max
+		}
+		if req.Resources == (api.Resources{}) {
+			res = p.Resources
+		}
+	}
+	if len(labels) == 0 {
+		labels = []string{"offload"}
+	}
 	s.mu.Unlock()
 	if problem != "" {
 		writeErr(w, code, problem)
@@ -925,7 +940,7 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	var ss *scaleset.RunnerScaleSet
 	if err == nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		ss, err = ensureScaleSet(ctx, c, name, req.Labels)
+		ss, err = ensureScaleSet(ctx, c, name, labels)
 		cancel()
 	}
 	if err != nil {
@@ -948,7 +963,7 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	if p != nil {
 		rec = p.record()
 	}
-	rec.Labels, rec.Max, rec.Resources, rec.TokenFrom, rec.Shared = req.Labels, req.Max, res, req.TokenFrom, shared
+	rec.Labels, rec.Max, rec.Resources, rec.TokenFrom, rec.Shared = labels, maxJobs, res, req.TokenFrom, shared
 	if ss != nil && ss.Name == name {
 		rec.ScaleSetID = ss.ID
 	}

@@ -371,9 +371,9 @@ func cmdGitHub(args []string) error {
 		fs := flag.NewFlagSet("github add", flag.ExitOnError)
 		o := client.GitHubOptions{Owner: args[1]}
 		fs.StringVar(&o.Token, "token", "", "token, or cmd:…, env:…, file:… (default: your gh login)")
-		labels := fs.String("labels", "offload", "labels workflows use in runs-on, comma-separated")
+		labels := fs.String("labels", "", "labels workflows use in runs-on, comma-separated (default offload)")
 		on := fs.String("on", "", "runners to use, comma-separated (default: all)")
-		fs.IntVar(&o.Max, "max", 0, "most GitHub jobs at once per runner (default: as many as fit)")
+		maxJobs := fs.Int("max", 0, "most GitHub jobs at once per runner (default: as many as fit)")
 		shared := fs.Bool("shared-cache", false, "let the organization's repositories share warm caches")
 		res := resourceFlags(fs)
 		_ = fs.Parse(args[2:])
@@ -384,6 +384,8 @@ func cmdGitHub(args []string) error {
 			switch f.Name {
 			case "shared-cache":
 				o.Shared = shared
+			case "max":
+				o.Max = maxJobs
 			case "on":
 				if len(list(*on)) == 0 {
 					die("offload github add: --on needs runner names")

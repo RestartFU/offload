@@ -282,12 +282,14 @@ type Session struct {
 // GitHubAdd is the body of POST /v1/github: run GitHub Actions jobs for an organization or
 // repository on this runner. The token must be able to manage its self-hosted runners.
 type GitHubAdd struct {
-	URL       string    `json:"url"`                  // https://github.com/OWNER or https://github.com/OWNER/REPO
-	Token     string    `json:"token"`                // kept on the runner to talk to GitHub
-	TokenFrom string    `json:"token_from,omitempty"` // "gh" (the client's gh login) or "token", for listings
-	Labels    []string  `json:"labels,omitempty"`     // what workflows put in runs-on; default "offload"
-	Max       int       `json:"max,omitempty"`        // most GitHub jobs at once here; 0 is as many as fit
-	Resources Resources `json:"resources"`            // for each GitHub job
+	URL       string `json:"url"`                  // https://github.com/OWNER or https://github.com/OWNER/REPO
+	Token     string `json:"token"`                // kept on the runner to talk to GitHub
+	TokenFrom string `json:"token_from,omitempty"` // "gh" (the client's gh login) or "token", for listings
+	// Settings a request leaves out (nil labels or max, zero resources) keep an existing pool's,
+	// so re-adding to refresh a token changes nothing else. A new pool gets the defaults.
+	Labels    []string  `json:"labels,omitempty"` // what workflows put in runs-on; default "offload"
+	Max       *int      `json:"max,omitempty"`    // most GitHub jobs at once here; 0 is as many as fit
+	Resources Resources `json:"resources"`        // for each GitHub job
 	// SharedCache lets an organization's repositories share warm checkouts, caches and images.
 	// Without it each of its jobs starts clean; a repository's jobs always share them.
 	// Nil keeps an existing pool's choice (it is fixed once the pool exists).
