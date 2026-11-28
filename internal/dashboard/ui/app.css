@@ -264,7 +264,10 @@ td.gh-job { min-width: 260px; }
 .icon-link svg, .subtle-link svg, .btn svg { width: 14px; height: 14px; flex: none; }
 .grid.gh-owners { grid-template-columns: repeat(auto-fill, minmax(min(100%, 500px), 1fr)); }
 .gh-owner-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; }
-.gh-owner-head h3 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
+.gh-owner-head h3 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -0.01em; display: flex; align-items: center; gap: 9px; min-width: 0; }
+.gh-owner-head h3 .login { font-size: 13px; font-weight: 450; color: var(--ink-2); letter-spacing: 0; }
+.gh-avatar { width: 24px; height: 24px; border-radius: 6px; flex: none; box-shadow: 0 0 0 1px var(--border); background: var(--surface-2); }
+.gh-avatar.initial { display: inline-grid; place-items: center; font-size: 12px; font-weight: 650; color: var(--ink-2); }
 .subtle-link { display: inline-flex; align-items: center; gap: 4px; color: var(--ink-2); font-size: 12.5px; text-decoration: none; }
 .subtle-link:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
 .runs-on { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
@@ -273,6 +276,8 @@ td.gh-job { min-width: 260px; }
 .btn.copy { padding: 3px 9px; font-size: 12.5px; color: var(--ink-2); }
 .btn.copy:hover { color: var(--ink); }
 .btn.copy.done { color: var(--good-ink); }
+.gh-also { font-size: 12.5px; margin-top: 12px; }
+.gh-also code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; color: var(--ink); }
 .gh-runners { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); align-items: center; gap: 10px 14px; margin-top: 14px; }
 .gh-runner { display: contents; }
 .gh-runner .n { font-weight: 600; }

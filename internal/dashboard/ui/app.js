@@ -873,7 +873,7 @@ function renderTable() {
 
 // ---------- GitHub ----------
 const workloadHash = (r, id) => `#/${r.jobs.some((j) => j.id === id && j.spec.github) ? "github" : "containers"}/${encodeURIComponent(r.name)}/${encodeURIComponent(id)}`;
-const ghPool = (r, owner) => (r.github || []).find((p) => p.owner === owner);
+const ghPool = (r, owner) => (r.github || []).find((p) => p.owner.toLowerCase() === (owner || "").toLowerCase());
 const ghSettings = (owner) => owner.includes("/") ? `https://github.com/${owner}/settings/actions/runners` : `https://github.com/organizations/${owner}/settings/actions/runners`;
 const agoCoarse = (t) => { const x = since(t); return x < 60 ? "just now" : x < 3600 ? Math.round(x / 60) + "m ago" : fmtDur(x) + " ago"; };
 const runsOn = (labels) => (!labels?.length ? "offload" : labels.length === 1 ? labels[0] : "[" + labels.join(", ") + "]");
@@ -1087,11 +1087,25 @@ function ghNotice(kind, text) {
   if (kind !== "critical") ghNoticeTimer = setTimeout(() => { state.ghNotice = null; render(); }, 10000);
 }
 
+// An owner's avatar (a data: URL from the runner) or, without one, its initial.
+function ghAvatar(list) {
+  const src = list.map(([, p]) => p.avatar).find((a) => /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(a || ""));
+  const owner = list[0][1].owner;
+  return src ? h("img", { class: "gh-avatar", src, alt: "", width: 24, height: 24 })
+    : h("span", { class: "gh-avatar initial", "aria-hidden": "true" }, owner.slice(0, 1).toUpperCase());
+}
+
 function ownerCard(owner, list) {
   const first = list[0][1];
+  const display = list.map(([, p]) => p.name).find(Boolean);
   const snippet = "runs-on: " + runsOn(first.labels);
   const sameLabels = list.every(([, p]) => runsOn(p.labels) === runsOn(first.labels));
   const sameCaches = list.every(([, p]) => !!p.shared === !!first.shared);
+  // GitHub's default labels: the ones every runner has here; the rest (an architecture) per runner.
+  const sys = list.map(([, p]) => p.system_labels || []);
+  const shared = sys[0].filter((l) => sys.every((x) => x.includes(l)));
+  const own = (p) => (p.system_labels || []).filter((l) => !shared.includes(l));
+  const sharedAll = list.every(([, p]) => !own(p).length);
   const finished = sum(list, ([, p]) => p.runs);
   const last = list.map(([, p]) => p.last_run).filter(Boolean).sort().pop();
   const per = first.resources;
@@ -1100,7 +1114,7 @@ function ownerCard(owner, list) {
   const stuck = stuckRows.map(([r]) => r.status?.id).filter(Boolean);
   return h("div", { class: "card gh-owner" },
     h("div", { class: "gh-owner-head" },
-      h("h3", {}, owner),
+      h("h3", {}, ghAvatar(list), display || owner, display && display.toLowerCase() !== owner.toLowerCase() ? h("span", { class: "login" }, owner) : null),
       h("a", { class: "subtle-link", href: ghSettings(owner), target: "_blank", rel: "noopener noreferrer" }, "Runner settings", extIcon()),
       sameLabels ? h("div", { class: "runs-on" }, h("code", {}, snippet), copyBtn(snippet, snippet))
         : h("div", { class: "runs-on muted" }, "Runners match different labels")),
@@ -1110,7 +1124,10 @@ function ownerCard(owner, list) {
         poolChip(p),
         h("div", { class: "room" }, slots(p), h("span", { class: p.state === "failed" ? "crit-text" : "muted" }, roomText(p)),
           sameLabels ? null : h("span", { class: "runs-on-row" }, h("code", {}, "runs-on: " + runsOn(p.labels)), copyBtn("runs-on: " + runsOn(p.labels))),
-          sameCaches ? null : h("span", { class: p.shared ? "" : "muted" }, p.shared ? "shared caches" : "clean caches"))))),
+          sameCaches ? null : h("span", { class: p.shared ? "" : "muted" }, p.shared ? "shared caches" : "clean caches"),
+          own(p).length ? h("span", { class: "muted" }, "also ", ...own(p).map((l, i) => [i ? ", " : "", h("code", {}, l)]).flat()) : null)))),
+    shared.length ? h("div", { class: "gh-also muted" }, "Also matches GitHub's self-hosted labels: ",
+      ...shared.map((l, i) => [i ? ", " : "", h("code", {}, l)]).flat(), sharedAll ? "" : " (and each runner's own, below)") : null,
     h("div", { class: "runner-foot gh-foot" },
       h("span", {}, "Each job ", h("b", {}, `${fmtCores(per.cpu)}–${fmtCores(per.cpu_max)} cores`), " · ", h("b", {}, fmtBytes(per.mem))),
       h("span", {}, h("b", {}, finished), " finished", last ? " · last one " + agoCoarse(last) : ""),
@@ -1171,7 +1188,8 @@ function ghFormEl() {
       h("button", { type: "button", class: "icon-btn", "aria-label": "Close", onclick: closeGhForm }, s("svg", { viewBox: "0 0 16 16", width: 16, height: 16, "aria-hidden": "true" }, s("path", { d: "M4 4l8 8M12 4l-8 8", stroke: "currentColor", "stroke-width": 1.8, "stroke-linecap": "round" })))),
     field("Organization or repository", "gh-f-owner", f.owner, h("span", { id: "gh-f-owner-hint" }, "As on GitHub, like ", h("code", {}, "acme"), " or ", h("code", {}, "acme/app"), ".")),
     f.exists,
-    field("Workflows use", "gh-f-labels", f.labels, ["Labels, comma-separated. Workflows then say ", f.preview]),
+    field("Workflows use", "gh-f-labels", f.labels, ["Labels, comma-separated. Workflows then say ", f.preview,
+      ". The runners also have GitHub's usual self-hosted labels, like ", h("code", {}, "self-hosted"), ", ", h("code", {}, "linux"), " and ", h("code", {}, "x64"), "."]),
     f.labelsNote,
     h("fieldset", { class: "gh-field" }, h("legend", {}, "Caches"), h("div", { class: "control" }, f.cacheChoices, f.cacheNote)),
     h("fieldset", { class: "gh-field" }, h("legend", {}, "Connect with"), h("div", { class: "control" }, h("div", { class: "choices" }, authGh, c), f.tokenRow)),

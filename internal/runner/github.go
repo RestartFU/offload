@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,23 +60,26 @@ type githubPool struct {
 	dir   string
 	token string
 
-	gh         githubAPI
-	cancel     context.CancelFunc
-	done       chan struct{} // closed when its listener goroutine has returned
-	restarting bool          // a restart waits for the old listener to let go of its session
-	forget     bool          // remove without deleting the scale set on GitHub (rm --forget)
-	slots      map[int]string
-	failures   int       // runner jobs in a row that ended without taking a GitHub job
-	pauseTil   time.Time // after repeated failures: accept no jobs until then
-	envFail    string    // why the environment build failed, until envRetry
-	envRetry   time.Time
-	listener   *listener.Listener
+	gh           githubAPI
+	cancel       context.CancelFunc
+	done         chan struct{} // closed when its listener goroutine has returned
+	restarting   bool          // a restart waits for the old listener to let go of its session
+	systemLabels bool          // see githubPoolRecord.SystemLabels
+	forget       bool          // remove without deleting the scale set on GitHub (rm --forget)
+	slots        map[int]string
+	failures     int       // runner jobs in a row that ended without taking a GitHub job
+	pauseTil     time.Time // after repeated failures: accept no jobs until then
+	envFail      string    // why the environment build failed, until envRetry
+	envRetry     time.Time
+	listener     *listener.Listener
 }
 
 // githubPoolRecord is what pool.json keeps (0600, in a 0700 directory), the token included: one
 // atomic write keeps settings and token together.
 type githubPoolRecord struct {
 	Owner      string        `json:"owner"`
+	Name       string        `json:"name,omitempty"`
+	Avatar     string        `json:"avatar,omitempty"`
 	URL        string        `json:"url"`
 	ScaleSet   string        `json:"scale_set"`
 	ScaleSetID int           `json:"scale_set_id,omitempty"`
@@ -89,6 +94,10 @@ type githubPoolRecord struct {
 	Removing   bool          `json:"removing,omitempty"`
 	Forget     bool          `json:"forget,omitempty"`
 	Token      string        `json:"token"`
+	// SystemLabels: the scale set also carries GitHub's default self-hosted labels. Pools from
+	// before they existed get them only when added again: widening which workflows reach a pool
+	// is the operator's choice.
+	SystemLabels bool `json:"system_labels,omitempty"`
 }
 
 func (s *Server) githubDir() string { return filepath.Join(s.cfg.StateDir, "github") }
@@ -113,9 +122,10 @@ func githubScaleSetName(runner, id string) string {
 }
 
 func (p *githubPool) record() githubPoolRecord {
-	return githubPoolRecord{Owner: p.Owner, URL: p.URL, ScaleSet: p.ScaleSet, ScaleSetID: p.ScaleSetID, Labels: p.Labels,
+	return githubPoolRecord{Owner: p.Owner, Name: p.Name, Avatar: p.Avatar, URL: p.URL, ScaleSet: p.ScaleSet, ScaleSetID: p.ScaleSetID, Labels: p.Labels,
 		Max: p.Max, Resources: p.Resources, TokenFrom: p.TokenFrom, Shared: p.Shared, CreatedAt: p.CreatedAt, Runs: p.Runs,
-		LastRun: p.LastRun, Removing: p.State == api.GitHubRemoving, Forget: p.forget, Token: p.token}
+		LastRun: p.LastRun, Removing: p.State == api.GitHubRemoving, Forget: p.forget, Token: p.token,
+		SystemLabels: p.systemLabels}
 }
 
 func (p *githubPool) save() error {
@@ -157,8 +167,8 @@ func (s *Server) restoreGitHub() {
 }
 
 func (s *Server) newPool(key, dir string, rec githubPoolRecord, token string) *githubPool {
-	return &githubPool{key: key, dir: dir, token: token, slots: map[int]string{}, GitHubPool: api.GitHubPool{
-		Owner: rec.Owner, URL: rec.URL, ScaleSet: rec.ScaleSet, ScaleSetID: rec.ScaleSetID, Labels: rec.Labels, Max: rec.Max,
+	return &githubPool{key: key, dir: dir, token: token, slots: map[int]string{}, systemLabels: rec.SystemLabels, GitHubPool: api.GitHubPool{
+		Owner: rec.Owner, Name: rec.Name, Avatar: rec.Avatar, URL: rec.URL, ScaleSet: rec.ScaleSet, ScaleSetID: rec.ScaleSetID, Labels: rec.Labels, Max: rec.Max,
 		Resources: rec.Resources, TokenFrom: rec.TokenFrom, Shared: rec.Shared, CreatedAt: rec.CreatedAt, Runs: rec.Runs, LastRun: rec.LastRun,
 		State: api.GitHubPreparing, Detail: "connecting to GitHub",
 	}}
@@ -220,9 +230,9 @@ func (s *Server) runPool(ctx context.Context, p *githubPool, done chan struct{})
 		started := time.Now()
 		err := s.listenPool(ctx, p, done)
 		s.mu.Lock()
-		current := p.done == done && p.State != api.GitHubRemoving
+		current, owner := p.done == done && p.State != api.GitHubRemoving, p.Owner
 		if current && ctx.Err() == nil {
-			p.State, p.Detail = api.GitHubFailed, githubProblem(err, p.Owner)
+			p.State, p.Detail = api.GitHubFailed, githubProblem(err, owner)
 		}
 		s.mu.Unlock()
 		if !current || ctx.Err() != nil {
@@ -231,7 +241,7 @@ func (s *Server) runPool(ctx context.Context, p *githubPool, done chan struct{})
 		if time.Since(started) > 10*time.Minute {
 			delay = 5 * time.Second
 		}
-		log.Printf("github %s: %v (retrying in %s)", p.Owner, err, delay)
+		log.Printf("github %s: %v (retrying in %s)", owner, err, delay)
 		select {
 		case <-ctx.Done():
 			return
@@ -249,6 +259,10 @@ func githubProblem(err error, owner string) string {
 		return "GitHub rejected the token: add the runner again with a fresh one (offload github add " + owner + ")"
 	case errors.Is(err, scaleset.NotFoundError) || strings.Contains(msg, "403") || strings.Contains(msg, "404"):
 		return "the token can't manage self-hosted runners of " + owner + ": a gh login needs admin:org (gh auth refresh -s admin:org); a fine-grained token needs Self-hosted runners: write"
+	case strings.Contains(msg, `unsupported protocol scheme ""`):
+		// GitHub created the listener's session without saying where its messages are
+		// ("messageQueueUrl": null), so no job can reach this runner until it does.
+		return "GitHub's runner service gives this runner no message queue right now, so it can't receive jobs; retrying until GitHub does"
 	case errors.Is(err, scaleset.ConflictError):
 		return "another listener holds this scale set (an older runner process, or a runner with the same name); retrying"
 	}
@@ -299,7 +313,7 @@ func (s *Server) listenPool(ctx context.Context, p *githubPool, done chan struct
 		return errors.New("replaced")
 	}
 	p.State, p.Detail = api.GitHubPreparing, "connecting to GitHub"
-	url, token, name, labels := p.URL, p.token, p.ScaleSet, append([]string(nil), p.Labels...)
+	url, token, name, labels, owner := p.URL, p.token, p.ScaleSet, p.scaleSetLabels(), p.Owner
 	s.mu.Unlock()
 	c, err := s.githubClient(url, token)
 	if err != nil {
@@ -309,6 +323,19 @@ func (s *Server) listenPool(ctx context.Context, p *githubPool, done chan struct
 	if err != nil {
 		return err
 	}
+	go func() { // the name and avatar are for show: jobs never wait for them
+		login, display, avatar, err := githubProfile(ctx, token, owner)
+		if err != nil {
+			log.Printf("github %s: its name and avatar on GitHub: %v", owner, err)
+			return
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if p.done == done && p.State != api.GitHubRemoving && strings.EqualFold(login, p.Owner) { // same key; only the spelling changes
+			p.Owner, p.Name, p.Avatar = login, display, avatar
+			p.save()
+		}
+	}()
 	s.mu.Lock()
 	if p.done == done {
 		p.ScaleSetID, p.gh = ss.ID, c
@@ -826,7 +853,41 @@ func downloadActionsRunner(ctx context.Context, ver, dir string) error {
 func (s *Server) githubViewLocked(p *githubPool) api.GitHubPool {
 	v := p.GitHubPool
 	v.Labels = append([]string(nil), p.Labels...)
+	if p.systemLabels {
+		v.SystemLabels = githubSystemLabels()
+	}
 	return v
+}
+
+// scaleSetLabels are the labels the pool's scale set carries.
+func (p *githubPool) scaleSetLabels() []string {
+	if p.systemLabels {
+		return scaleSetLabels(p.Labels)
+	}
+	return append([]string(nil), p.Labels...)
+}
+
+// githubSystemLabels are the labels GitHub gives every self-hosted runner unless told otherwise.
+// Workflows written for self-hosted runners ask for them, so every scale set carries them too.
+func githubSystemLabels() []string {
+	arch := map[string]string{"amd64": "x64", "arm64": "arm64", "arm": "arm"}[runtime.GOARCH]
+	if arch == "" {
+		arch = runtime.GOARCH
+	}
+	return []string{"self-hosted", "linux", arch}
+}
+
+// scaleSetLabels are a pool's labels plus GitHub's defaults, once each (GitHub ignores case).
+func scaleSetLabels(labels []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, l := range append(githubSystemLabels(), labels...) {
+		if k := strings.ToLower(l); !seen[k] {
+			seen[k] = true
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 func (s *Server) handleGitHubList(w http.ResponseWriter, r *http.Request) {
@@ -935,6 +996,10 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	if len(labels) == 0 {
 		labels = []string{"offload"}
 	}
+	systemOn := p == nil || p.systemLabels // a new pool takes GitHub's defaults; an existing one keeps its choice
+	if req.SystemLabels != nil {
+		systemOn = *req.SystemLabels
+	}
 	if problem == "" && res.CPUMax > 0 && res.CPU > res.CPUMax {
 		problem, code = fmt.Sprintf("%.1f cpu per job would be more than its %.1f cpu ceiling: give --cpu-max too", res.CPU, res.CPUMax), 400
 	}
@@ -954,7 +1019,11 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	var ss *scaleset.RunnerScaleSet
 	if err == nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		ss, err = ensureScaleSet(ctx, c, name, labels)
+		want := labels
+		if systemOn {
+			want = scaleSetLabels(labels)
+		}
+		ss, err = ensureScaleSet(ctx, c, name, want)
 		cancel()
 	}
 	if err != nil {
@@ -981,7 +1050,7 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	if ss != nil && ss.Name == name {
 		rec.ScaleSetID = ss.ID
 	}
-	rec.Token = req.Token
+	rec.Token, rec.SystemLabels = req.Token, systemOn
 	if err := writeFileJSON(filepath.Join(dir, "pool.json"), rec); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -991,6 +1060,7 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		s.github[key] = p
 	} else {
 		p.token, p.Labels, p.Max, p.Resources, p.TokenFrom, p.Shared, p.ScaleSetID = req.Token, rec.Labels, rec.Max, rec.Resources, rec.TokenFrom, rec.Shared, rec.ScaleSetID
+		p.systemLabels = rec.SystemLabels
 	}
 	p.State, p.Detail = api.GitHubPreparing, "connecting to GitHub"
 	s.restartPoolLocked(p)
@@ -1121,4 +1191,75 @@ func (s *Server) deleteScaleSet(p *githubPool) error {
 		return err
 	}
 	return nil
+}
+
+// githubProfile looks up how GitHub spells owner (an organization, a user, or OWNER/REPO), its
+// display name and its avatar, which it returns as a small data: URL.
+func githubProfile(ctx context.Context, token, owner string) (login, name, avatar string, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	get := func(path string, out any) (int, error) {
+		req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/"+path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return resp.StatusCode, fmt.Errorf("GitHub answered %s for %s", resp.Status, path)
+		}
+		return 200, json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
+	}
+	var acct struct {
+		Login     string `json:"login"`
+		Name      string `json:"name"`
+		AvatarURL string `json:"avatar_url"`
+	}
+	if strings.Contains(owner, "/") {
+		var repo struct {
+			FullName string `json:"full_name"`
+			Owner    struct {
+				AvatarURL string `json:"avatar_url"`
+			} `json:"owner"`
+		}
+		if _, err := get("repos/"+owner, &repo); err != nil {
+			return "", "", "", err
+		}
+		acct.Login, acct.AvatarURL = repo.FullName, repo.Owner.AvatarURL
+	} else if code, err := get("orgs/"+owner, &acct); code == 404 {
+		if _, err := get("users/"+owner, &acct); err != nil {
+			return "", "", "", err
+		}
+	} else if err != nil {
+		return "", "", "", err
+	}
+	if acct.Login == "" {
+		return "", "", "", errors.New("GitHub returned no name")
+	}
+	return acct.Login, acct.Name, githubAvatar(ctx, acct.AvatarURL), nil
+}
+
+// githubAvatar fetches a GitHub avatar at 64 pixels as a data: URL ("" if it can't).
+func githubAvatar(ctx context.Context, raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host != "avatars.githubusercontent.com" {
+		return ""
+	}
+	q := u.Query()
+	q.Set("s", "64")
+	u.RawQuery = q.Encode()
+	req, _ := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	ct := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10+1))
+	if resp.StatusCode != 200 || err != nil || len(b) > 64<<10 || (ct != "image/png" && ct != "image/jpeg" && ct != "image/gif" && ct != "image/webp") {
+		return ""
+	}
+	return "data:" + ct + ";base64," + base64.StdEncoding.EncodeToString(b)
 }
