@@ -324,7 +324,7 @@ input[type="number"] { max-width: 180px; }
 .choice input { margin: 3px 0 0; accent-color: var(--accent); flex: none; }
 .choice b { font-weight: 550; }
 .choice .muted { font-size: 12.5px; }
-.choices:has(input:disabled) .choice { cursor: default; opacity: .6; }
+.choice:has(input:disabled) { cursor: default; opacity: .6; }
 .token-row input { max-width: 420px; font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace; }
 .gh-form-result { display: grid; gap: 8px; }
 .gh-form-result:not(:empty) { margin: 6px 0 4px; }

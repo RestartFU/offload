@@ -294,6 +294,8 @@ type GitHubAdd struct {
 	// Without it each of its jobs starts clean; a repository's jobs always share them.
 	// Nil keeps an existing pool's choice (it is fixed once the pool exists).
 	SharedCache *bool `json:"shared_cache,omitempty"`
+	// CreateOnly refuses the request if the runner already has the pool (the dashboard only adds).
+	CreateOnly bool `json:"create_only,omitempty"`
 }
 
 // GitHub runner pool states.

@@ -600,7 +600,7 @@ func (s *server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, strings.Join(bad, ", ")+" can't take GitHub jobs (not paired with this machine, no podman, or another version)")
 		return
 	}
-	add := api.GitHubAdd{URL: owner, Token: token, TokenFrom: from, Labels: req.Labels, Max: req.Max, SharedCache: req.Shared}
+	add := api.GitHubAdd{URL: owner, Token: token, TokenFrom: from, Labels: req.Labels, Max: req.Max, SharedCache: req.Shared, CreateOnly: true}
 	results := make([]githubResult, len(hosts))
 	var wg sync.WaitGroup
 	for i, h := range hosts {

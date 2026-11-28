@@ -320,9 +320,8 @@ func GitHubAdd(o GitHubOptions) error {
 	} else {
 		fmt.Printf("\nThe runners match different labels (each kept its own):\n\n")
 		for l, names := range ready {
-			fmt.Printf("    runs-on: %-30s %s\n", l, strings.Join(names, ", "))
+			fmt.Printf("    # %s\n    runs-on: %s\n\n", strings.Join(names, ", "), l)
 		}
-		fmt.Println()
 	}
 	if !strings.Contains(owner, "/") && o.Shared == nil && !githubSharedNow(ctx, hosts, owner) {
 		fmt.Printf("Each job starts with clean caches, because %s's repositories would otherwise share checkouts,\n"+

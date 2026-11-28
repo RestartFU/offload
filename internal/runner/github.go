@@ -901,6 +901,8 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case s.serveCtx == nil:
 		problem, code = "runner is starting; try again in a few seconds", 503
+	case p != nil && req.CreateOnly:
+		problem, code = "this runner already takes "+owner+"'s jobs", http.StatusConflict
 	case p != nil && p.State == api.GitHubRemoving:
 		problem, code = owner+" is still being removed here; try again in a minute", http.StatusConflict
 	case p != nil && !repo && req.SharedCache != nil && *req.SharedCache != p.Shared:
@@ -935,6 +937,9 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	if problem == "" && res.CPUMax > 0 && res.CPU > res.CPUMax {
 		problem, code = fmt.Sprintf("%.1f cpu per job would be more than its %.1f cpu ceiling: give --cpu-max too", res.CPU, res.CPUMax), 400
+	}
+	if problem == "" && res.Mem > s.cfg.memCap { // a pool's limit from before the cap was lowered
+		problem, code = fmt.Sprintf("its %s per job is more than this runner hands out (%s): give a smaller --mem", units.FormatSize(res.Mem), units.FormatSize(s.cfg.memCap)), 400
 	}
 	if res.Mem == 0 {
 		res.Mem = min(githubDefaultMem, s.cfg.memCap)

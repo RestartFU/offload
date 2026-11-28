@@ -1206,29 +1206,40 @@ function renderGhForm() {
     f.cacheClean.checked = true;
   }
   const existing = [...owners.keys()].find((o) => o.toLowerCase() === owner.toLowerCase());
+  const holders = new Set(existing ? owners.get(existing).map(([r]) => r.status?.id) : []); // runners that already have it
+  const holderNames = existing ? owners.get(existing).map(([r]) => r.name) : [];
   const repo = owner.includes("/");
   f.cacheChoices.hidden = repo;
-  f.cacheNote.textContent = repo ? "A repository's jobs keep warm caches: they are all the same repository's code." : "";
+  const policy = existing ? !!owners.get(existing)[0][1].shared : null; // more runners follow the one it has
+  f.cacheClean.disabled = f.cacheShared.disabled = policy !== null;
+  if (policy !== null) { f.cacheShared.checked = policy; f.cacheClean.checked = !policy; }
+  f.cacheNote.textContent = repo ? "A repository's jobs keep warm caches: they are all the same repository's code."
+    : policy !== null ? `As ${existing} has on its other runners.` : "";
   f.exists.hidden = !existing;
-  if (existing) f.exists.replaceChildren(ghAlert("info", existing, " is already connected. To give it a new token or change its settings, run ",
-    h("code", {}, "offload github add " + existing), " with the new values, or remove it below and add it again."));
+  if (existing) {
+    const cmd = `offload github add ${existing} --on ${holderNames.join(",")}`;
+    f.exists.replaceChildren(ghAlert("info", h("div", {}, `${existing} is already connected on ${holderNames.join(", ")}; you can add it to other runners here. `,
+      "To give it a new token or change its settings, run this with the new values (or remove it below and add it again):"), h("div", { class: "snippet" }, h("code", {}, cmd), copyBtn(cmd))));
+  }
   f.tokenRow.hidden = !f.authToken.checked;
   // Runners are chosen by their ID for as long as the form is open: a runner that drops out and
   // comes back keeps its choice, one that appears later starts unchosen, and a replacement under
   // the same name is a different runner.
   const runners = ghRunners();
   if (!f.picks && runners.length) f.picks = new Map(runners.map((r) => [r.status.id, true]));
-  const key = runners.map((r) => r.status.id + "=" + r.name).join("\n");
+  const key = runners.map((r) => r.status.id + "=" + r.name).join("\n") + "|" + [...holders].join(",");
   if (key !== f.runnerKey) {
     f.runnerKey = key;
     f.runners.replaceChildren(...(runners.length ? runners.map((r) => {
       const id = r.status.id;
       if (!f.picks.has(id)) f.picks.set(id, false);
-      const input = h("input", { type: "checkbox", value: id, checked: f.picks.get(id), onchange: (e) => f.picks.set(id, e.target.checked) });
-      return h("label", { class: "choice" }, input, h("span", {}, h("b", {}, r.name), h("span", { class: "muted" }, ` ${fmtCores(r.status.capacity.cpu)} cores`)));
+      const has = holders.has(id);
+      const input = h("input", { type: "checkbox", value: id, checked: !has && f.picks.get(id), disabled: has, onchange: (e) => f.picks.set(id, e.target.checked) });
+      return h("label", { class: "choice" + (has ? " off" : "") }, input, h("span", {}, h("b", {}, r.name),
+        h("span", { class: "muted" }, has ? " already connected" : ` ${fmtCores(r.status.capacity.cpu)} cores`)));
     }) : [h("span", { class: "muted" }, "No runner can take GitHub jobs: they need podman, and must be up to date.")]));
   }
-  f.submit.disabled = !!state.ghFormBusy || !!existing;
+  f.submit.disabled = !!state.ghFormBusy || (existing && ghRunners().every((r) => holders.has(r.status.id)));
   f.submit.textContent = state.ghFormBusy ? "Adding…" : "Add";
   const m = state.ghFormMsg;
   f.result.replaceChildren(...(m ? ghFormMessage(m) : []));
@@ -1253,7 +1264,7 @@ async function submitGhForm() {
   const owner = ghOwnerInput();
   const fail = (error, el) => { state.ghFormMsg = { error }; render(); el?.focus(); };
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)?$/.test(owner)) return fail("Enter an organization (acme) or a repository (acme/app).", f.owner);
-  const on = [...f.runners.querySelectorAll("input:checked")].map((i) => i.value); // runner IDs
+  const on = [...f.runners.querySelectorAll("input:checked:not(:disabled)")].map((i) => i.value); // runner IDs
   if (!on.length) return fail("Pick at least one runner.", f.runners.querySelector("input"));
   const token = f.authToken.checked ? f.token.value.trim() : "";
   if (f.authToken.checked && !token) return fail("Paste the token, or connect with your GitHub CLI login.", f.token);
