@@ -65,6 +65,7 @@ func newGitHubServer(t *testing.T) (*Server, *githubPool, *fakeGitHub) {
 		ScaleSet: "offload-box", ScaleSetID: 7, Labels: []string{"offload"}, Resources: api.Resources{CPU: 2, CPUMax: 8, Mem: 8 << 30}, Shared: true}, "TOKEN")
 	f := &fakeGitHub{}
 	p.gh = f
+	p.usable = true
 	_ = os.MkdirAll(p.dir, 0o700)
 	s.github[key] = p
 	return s, p, f
@@ -427,22 +428,43 @@ func TestGitHubRelabelDrains(t *testing.T) {
 	}
 }
 
-// A runner whose podman can't give a job its own network says so instead of taking jobs it
-// can't start.
-func TestPrivateNetNeedsAHelper(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("PATH", t.TempDir())
-	defer func(d []string) { podmanHelperDirs = d }(podmanHelperDirs)
-	podmanHelperDirs = []string{dir}
-	if msg := privateNetMissing(); !strings.Contains(msg, "install passt") {
-		t.Fatalf("no pasta or slirp4netns, yet: %q", msg)
+// A pool takes no GitHub jobs until podman has started the image with the network jobs get,
+// and while that fails it claims nothing, not even offers answering an earlier poll.
+func TestGitHubWaitsForItsNetwork(t *testing.T) {
+	s, p, f := newGitHubServer(t)
+	tag, _, _ := envPlan(githubEnv())
+	s.readyImages = map[string]bool{tag: true}
+	s.readyChecked = map[string]time.Time{tag: time.Now()}
+	defer func(probe func(context.Context, string, string, string) error) { githubNetProbe = probe }(githubNetProbe)
+	s.githubNet = githubNet{tag: tag, running: true} // the check is under way
+	s.tickGitHub()
+	if p.usable || p.Capacity != 0 {
+		t.Fatalf("before the check: usable %v, capacity %d", p.usable, p.Capacity)
 	}
-	_ = os.WriteFile(filepath.Join(dir, "pasta"), nil, 0o644)
-	if privateNetMissing() == "" {
-		t.Fatal("a pasta that isn't executable counted")
+	githubNetProbe = func(context.Context, string, string, string) error { return errors.New(`could not find "pasta"`) }
+	s.checkGitHubNet(tag)
+	s.tickGitHub()
+	if p.State != api.GitHubFailed || !strings.Contains(p.Detail, `could not find "pasta"`) || p.Capacity != 0 {
+		t.Fatalf("failed check: %s %q capacity %d", p.State, p.Detail, p.Capacity)
 	}
-	_ = os.Chmod(filepath.Join(dir, "pasta"), 0o755)
-	if msg := privateNetMissing(); msg != "" {
-		t.Fatalf("pasta in podman's helper directory: %q", msg)
+	offer := &scaleset.RunnerScaleSetMessage{JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 9}}}}
+	if err := (&githubScaler{s: s, p: p, session: f}).Scale(context.Background(), offer); err != nil || len(f.acquired) != 0 {
+		t.Fatalf("claimed %v without a working network: %v", f.acquired, err)
+	}
+	githubNetProbe = func(context.Context, string, string, string) error { return nil }
+	s.checkGitHubNet(tag)
+	s.tickGitHub()
+	if !p.usable || p.Capacity == 0 {
+		t.Fatalf("after a good check: usable %v capacity %d", p.usable, p.Capacity)
+	}
+
+	// A new image (a runner upgrade) is checked again, by starting it.
+	probed := make(chan string, 1)
+	githubNetProbe = func(_ context.Context, _, _, tag string) error { probed <- tag; return nil }
+	s.mu.Lock()
+	ok, _ := s.githubNetLocked("localhost/offload/env:new")
+	s.mu.Unlock()
+	if got := <-probed; ok || got != "localhost/offload/env:new" {
+		t.Fatalf("new image: ok %v before its check, probed %q", ok, got)
 	}
 }

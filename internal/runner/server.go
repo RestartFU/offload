@@ -65,6 +65,7 @@ type Server struct {
 	readyImages  map[string]bool
 	readyChecked map[string]time.Time // when readyImages was last confirmed against podman
 	imageUse     map[string]time.Time
+	githubNet    githubNet // whether GitHub jobs can get their network here (github.go)
 
 	tokensLock func() // releases the lifetime lock on the tokens file
 	upgrading  bool   // a new binary is being swapped in: start nothing

@@ -74,6 +74,7 @@ type githubPool struct {
 	pauseTil     time.Time // after repeated failures: accept no jobs until then
 	envFail      string    // why the environment build failed, until envRetry
 	envRetry     time.Time
+	usable       bool // its image is built and podman starts it with a network of its own
 	listener     *listener.Listener
 }
 
@@ -426,27 +427,34 @@ func (s *Server) tickGitHub() {
 				p.Starting++
 			}
 		}
-		ready := false
+		ready, tag := false, ""
 		if time.Now().After(p.envRetry) {
 			var err error
-			if _, ready, err = s.sessionImageLocked(githubEnv()); err != nil {
+			if tag, ready, err = s.sessionImageLocked(githubEnv()); err != nil {
 				p.envFail, p.envRetry = err.Error(), time.Now().Add(5*time.Minute)
 			} else {
 				p.envFail = ""
 			}
 		}
+		netOK, netProblem := false, ""
+		if ready {
+			netOK, netProblem = s.githubNetLocked(tag)
+		}
+		p.usable = ready && netOK
 		capNow := s.githubCapacityLocked(p)
-		netMissing := privateNetMissing()
 		switch {
-		case netMissing != "":
-			p.State, p.Detail, capNow = api.GitHubFailed, netMissing, p.Running+p.Starting
 		case p.envFail != "":
-			p.State, p.Detail, capNow = api.GitHubFailed, "building the GitHub runner environment failed (retrying in a few minutes): "+p.envFail, p.Running+p.Starting
+			p.State, p.Detail = api.GitHubFailed, "building the GitHub runner environment failed (retrying in a few minutes): "+p.envFail
 		case !ready:
 			if p.listener != nil {
 				p.State, p.Detail = api.GitHubPreparing, "building the GitHub runner environment (first time on this runner, a few minutes)"
 			}
-			capNow = p.Running + p.Starting
+		case netProblem != "":
+			p.State, p.Detail = api.GitHubFailed, "podman can't start GitHub jobs in a network of their own (install passt; retrying in a few minutes): "+netProblem
+		case !netOK:
+			if p.listener != nil {
+				p.State, p.Detail = api.GitHubPreparing, "checking that podman can give GitHub jobs a network of their own"
+			}
 		case p.listener != nil && time.Now().Before(p.pauseTil):
 			p.State, p.Detail = api.GitHubFailed, fmt.Sprintf("runners keep failing to start; paused until %s", p.pauseTil.Format(time.TimeOnly))
 			capNow = p.Running + p.Starting
@@ -462,6 +470,51 @@ func (s *Server) tickGitHub() {
 		p.Capacity = capNow
 		if p.listener != nil {
 			p.listener.SetMaxRunners(capNow)
+		}
+	}
+}
+
+// githubNet is whether podman starts the GitHub image with the network jobs get
+// (--network=private). It is found out by starting it once: which helper that takes (pasta,
+// slirp4netns) and where podman finds it depend on its version and configuration.
+type githubNet struct {
+	tag, err string
+	ok       bool
+	at       time.Time
+	running  bool
+}
+
+var githubNetProbe = func(ctx context.Context, name, label, tag string) error {
+	out, err := podman(ctx, "run", "--rm", "--name", name, "--label", label, "--pull=never",
+		"--network=private", "--entrypoint", "true", tag)
+	if err != nil && out != "" {
+		return errors.New(out)
+	}
+	return err
+}
+
+// githubNetLocked reports whether GitHub jobs can start from image tag, and why not when the
+// check failed. It starts the check the first time and again a few minutes after a failure.
+func (s *Server) githubNetLocked(tag string) (ok bool, problem string) {
+	n := &s.githubNet
+	if n.tag != tag {
+		*n = githubNet{tag: tag}
+	}
+	if !n.ok && !n.running && (n.at.IsZero() || time.Since(n.at) > 5*time.Minute) {
+		n.running = true
+		go s.checkGitHubNet(tag)
+	}
+	return n.ok, n.err
+}
+
+func (s *Server) checkGitHubNet(tag string) {
+	err := githubNetProbe(context.Background(), newID("offload-netcheck-"), s.ownerLabel(), tag)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n := &s.githubNet; n.tag == tag {
+		n.running, n.at, n.ok, n.err = false, time.Now(), err == nil, ""
+		if err != nil {
+			n.err = err.Error()
 		}
 	}
 }
@@ -487,7 +540,7 @@ func githubSpec(p *githubPool) api.JobSpec {
 // books its learned peak but counts its whole limit against mem_overcommit).
 func (s *Server) githubCapacityLocked(p *githubPool) int {
 	active := len(s.githubJobsLocked(p))
-	if s.retireErr != "" || s.upgrading || s.paused || p.relabel {
+	if !p.usable || s.retireErr != "" || s.upgrading || s.paused || p.relabel {
 		return active
 	}
 	a := s.allocatedLocked()

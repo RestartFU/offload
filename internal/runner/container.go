@@ -77,26 +77,6 @@ func (s *Server) containersAvailable() bool {
 	return err == nil
 }
 
-// podmanHelperDirs is where podman looks for pasta and slirp4netns besides PATH (its
-// helper_binaries_dir default).
-var podmanHelperDirs = []string{"/usr/local/libexec/podman", "/usr/local/lib/podman", "/usr/libexec/podman", "/usr/lib/podman"}
-
-// privateNetMissing says why containers can't get a network namespace of their own
-// (--network=private), which rootless podman builds with pasta or slirp4netns; "" when they can.
-func privateNetMissing() string {
-	for _, name := range []string{"pasta", "slirp4netns"} {
-		if _, err := exec.LookPath(name); err == nil {
-			return ""
-		}
-		for _, dir := range podmanHelperDirs {
-			if fi, err := os.Stat(filepath.Join(dir, name)); err == nil && fi.Mode()&0o111 != 0 {
-				return ""
-			}
-		}
-	}
-	return "GitHub jobs run in a network of their own, and podman can't make one here: install passt (or slirp4netns)"
-}
-
 // baseTag is the image tag of the built-in base environment for this runner's offload version.
 func baseTag() string { return imageRepo + "/base:" + hash12(baseContainerfile) }
 

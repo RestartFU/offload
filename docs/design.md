@@ -207,9 +207,12 @@ keepalive doesn't wake it. Server state, such as a running game, doesn't survive
   those capabilities hold, and a separate PID namespace doesn't fence them: a unix socket peer
   hands out a pidfd. So a GitHub job gets its own network namespace (rootless podman's pasta)
   with outbound access only. Its abstract sockets, ports and broadcasts stay inside the job,
-  and so do its inner containers and build steps, which share it. The runner's loopback is out
-  of reach; services on its other addresses are reachable as from any machine on its network.
-  A runner without pasta or slirp4netns takes no GitHub jobs and says why.
+  and so do its inner containers and build steps, which share it. With podman's default settings
+  the runner's loopback is out of reach; services on its other addresses are reachable as from
+  any machine on its network. Which helper podman uses for that, and where it finds it, depend on
+  its version and configuration, so the runner starts the GitHub image that way once before a
+  pool takes jobs. If that fails, the pool offers no room, even to an offer answering an earlier
+  poll, and shows podman's error.
 
 ## Client networking
 
