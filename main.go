@@ -381,8 +381,13 @@ func cmdGitHub(args []string) error {
 			die("offload github add: unexpected " + strings.Join(fs.Args(), " ") + " (flags go after ORG[/REPO])")
 		}
 		fs.Visit(func(f *flag.Flag) {
-			if f.Name == "shared-cache" {
+			switch f.Name {
+			case "shared-cache":
 				o.Shared = shared
+			case "on":
+				if len(list(*on)) == 0 {
+					die("offload github add: --on needs runner names")
+				}
 			}
 		})
 		var err error
@@ -404,6 +409,11 @@ func cmdGitHub(args []string) error {
 		if fs.NArg() > 0 {
 			die("offload github rm: unexpected " + strings.Join(fs.Args(), " ") + " (one ORG[/REPO], then flags)")
 		}
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "on" && len(list(*on)) == 0 {
+				die("offload github rm: --on needs runner names")
+			}
+		})
 		return client.GitHubRemove(args[1], list(*on), *forget)
 	}
 	die(usage)
