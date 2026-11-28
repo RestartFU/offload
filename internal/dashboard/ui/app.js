@@ -862,7 +862,7 @@ function renderTable() {
         h("td", { class: "nowrap" }, h("span", { class: "kind" }, w.github ? "GitHub" : w.kind === "job" ? "Job" : "Session"), h("span", { class: "mono" }, w.id)),
         h("td", {}, h("span", { class: "cmd mono", title: w.cmd }, w.cmd)),
         showRunner && h("td", { class: "nowrap" }, w.runner),
-        h("td", {}, exitChip(w)),
+        h("td", {}, w.github ? ghStatus(w) : exitChip(w)),
         h("td", {}, live(w) ? usageCell(w.use?.cpu, w.res.cpu, fmtCores, " guaranteed") : h("span", { class: "muted num" }, w.raw.cpu_seconds ? fmtDur(w.raw.cpu_seconds) + " CPU" : "–")),
         h("td", {}, live(w) ? usageCell(w.use?.mem, w.res.mem, fmtBytes, " limit", true) : h("span", { class: "muted num" }, w.raw.peak_mem ? "peak " + fmtBytes(w.raw.peak_mem) : "–")),
         showCPUs && h("td", { class: "mono nowrap" }, w.cpus || "–"),
