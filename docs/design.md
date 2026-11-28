@@ -160,7 +160,9 @@ keepalive doesn't wake it. Server state, such as a running game, doesn't survive
 
 ## GitHub Actions
 
-- **Scale sets, one per runner.** GitHub's runner scale sets hand out jobs to a listener that
+- **Scale sets, one per runner.** Their names carry the runner's ID, because a removal deletes
+  the scale set: two runners of the same name must never share one. GitHub's runner scale sets
+  hand out jobs to a listener that
   says how many it can take (`maxCapacity` on each poll). Each runner registers its own scale set
   per owner with the same labels and advertises what fits there now. GitHub then routes across
   runners itself: no runner knows another, there is no leader, and a dead runner only takes its
@@ -179,8 +181,16 @@ keepalive doesn't wake it. Server state, such as a running game, doesn't survive
   extra steps; a fine-grained token with only the runners permission is the narrow option.
 - **Shared, read-only actions runner.** The runner installs the release itself (checked daily)
   and mounts it into jobs as an overlay, so a job can't plant anything in the next one's runner.
-  What does persist is per owner and per slot: the work directory, the inner podman's image
-  store and a rustup layer. A slot is held by one job at a time.
+- **Warm state only within one trust domain.** A runner is started before GitHub picks its job,
+  so its mounts can't depend on the repository. Writable state (work directory with checkouts and
+  tool cache, the inner image store, dependency caches, a rustup layer) therefore persists only
+  where every job is the same trust domain: a repository's pool, or an organization added with
+  `--shared-cache`. There it lives in slots, one job at a time; otherwise each job gets its own,
+  deleted when it ends. The slot and paths come from the runner's own job record: a client's job
+  can't name a GitHub pool.
+- **A removal finishes only once GitHub confirms it** (or the scale set is already gone), so a
+  timeout never leaves a scale set nobody knows about. A token that no longer works would block
+  it forever, so `rm --forget` is the way out.
 - **Nested podman, not a docker daemon.** Inner containers share the job container's
   namespaces and cgroup, so offload's limits cover them and nothing needs real privileges. The
   job container gets the `nested_sandbox` permissions, as flatpak sessions do.

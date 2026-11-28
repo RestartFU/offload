@@ -58,15 +58,17 @@ type githubPool struct {
 	dir   string
 	token string
 
-	gh       githubAPI
-	cancel   context.CancelFunc
-	done     chan struct{} // closed when its listener goroutine has returned
-	slots    map[int]string
-	failures int       // runner jobs in a row that ended without taking a GitHub job
-	pauseTil time.Time // after repeated failures: accept no jobs until then
-	envFail  string    // why the environment build failed, until envRetry
-	envRetry time.Time
-	listener *listener.Listener
+	gh         githubAPI
+	cancel     context.CancelFunc
+	done       chan struct{} // closed when its listener goroutine has returned
+	restarting bool          // a restart waits for the old listener to let go of its session
+	forget     bool          // remove without deleting the scale set on GitHub (rm --forget)
+	slots      map[int]string
+	failures   int       // runner jobs in a row that ended without taking a GitHub job
+	pauseTil   time.Time // after repeated failures: accept no jobs until then
+	envFail    string    // why the environment build failed, until envRetry
+	envRetry   time.Time
+	listener   *listener.Listener
 }
 
 // githubPoolRecord is what pool.json keeps; the token lives in its own 0600 file.
@@ -79,6 +81,7 @@ type githubPoolRecord struct {
 	Max        int           `json:"max,omitempty"`
 	Resources  api.Resources `json:"resources"`
 	TokenFrom  string        `json:"token_from,omitempty"`
+	Shared     bool          `json:"shared,omitempty"`
 	CreatedAt  time.Time     `json:"created_at"`
 	Runs       int           `json:"runs"`
 	LastRun    *time.Time    `json:"last_run,omitempty"`
@@ -91,19 +94,23 @@ func githubScope(key string) string { return "github-" + key }
 
 var scaleSetNameRE = regexp.MustCompile(`[^a-z0-9-]+`)
 
-// githubScaleSetName is this runner's scale set name: unique per runner within an owner.
-func githubScaleSetName(runner string) string {
+// githubScaleSetName is this runner's scale set name, unique per runner within an owner: two
+// runners of the same name must never share one (removing either would delete it).
+func githubScaleSetName(runner, id string) string {
 	n := strings.Trim(scaleSetNameRE.ReplaceAllString(strings.ToLower(runner), "-"), "-")
 	if n == "" {
 		n = "runner"
 	}
-	return "offload-" + n
+	if len(id) > 6 {
+		id = id[:6]
+	}
+	return "offload-" + n + "-" + id
 }
 
 func (p *githubPool) record() githubPoolRecord {
 	return githubPoolRecord{Owner: p.Owner, URL: p.URL, ScaleSet: p.ScaleSet, ScaleSetID: p.ScaleSetID, Labels: p.Labels,
-		Max: p.Max, Resources: p.Resources, TokenFrom: p.TokenFrom, CreatedAt: p.CreatedAt, Runs: p.Runs, LastRun: p.LastRun,
-		Removing: p.State == api.GitHubRemoving}
+		Max: p.Max, Resources: p.Resources, TokenFrom: p.TokenFrom, Shared: p.Shared, CreatedAt: p.CreatedAt, Runs: p.Runs,
+		LastRun: p.LastRun, Removing: p.State == api.GitHubRemoving}
 }
 
 func (p *githubPool) save() error {
@@ -148,7 +155,7 @@ func (s *Server) restoreGitHub() {
 func (s *Server) newPool(key, dir string, rec githubPoolRecord, token string) *githubPool {
 	return &githubPool{key: key, dir: dir, token: token, slots: map[int]string{}, GitHubPool: api.GitHubPool{
 		Owner: rec.Owner, URL: rec.URL, ScaleSet: rec.ScaleSet, ScaleSetID: rec.ScaleSetID, Labels: rec.Labels, Max: rec.Max,
-		Resources: rec.Resources, TokenFrom: rec.TokenFrom, CreatedAt: rec.CreatedAt, Runs: rec.Runs, LastRun: rec.LastRun,
+		Resources: rec.Resources, TokenFrom: rec.TokenFrom, Shared: rec.Shared, CreatedAt: rec.CreatedAt, Runs: rec.Runs, LastRun: rec.LastRun,
 		State: api.GitHubPreparing, Detail: "connecting to GitHub",
 	}}
 }
@@ -168,10 +175,36 @@ func (s *Server) startGitHub(ctx context.Context) {
 
 func (s *Server) startPoolLocked(ctx context.Context, p *githubPool) {
 	pctx, cancel := context.WithCancel(ctx)
-	p.cancel, p.done = cancel, make(chan struct{})
+	done := make(chan struct{})
+	p.cancel, p.done = cancel, done
 	go func() {
-		defer close(p.done)
+		defer close(done)
 		s.runPool(pctx, p)
+	}()
+}
+
+// restartPoolLocked reconnects a pool with new settings once its listener has let go of its
+// session (GitHub allows one per scale set). One restart at a time; a pending one uses the newest
+// settings.
+func (s *Server) restartPoolLocked(p *githubPool) {
+	if p.restarting {
+		return
+	}
+	if p.cancel == nil {
+		s.startPoolLocked(s.serveCtx, p)
+		return
+	}
+	cancel, done := p.cancel, p.done
+	p.cancel, p.restarting = nil, true
+	go func() {
+		cancel()
+		<-done
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		p.restarting = false
+		if p.State != api.GitHubRemoving {
+			s.startPoolLocked(s.serveCtx, p)
+		}
 	}()
 }
 
@@ -286,7 +319,7 @@ func (s *Server) listenPool(ctx context.Context, p *githubPool) error {
 	s.mu.Lock()
 	p.listener = l
 	s.mu.Unlock()
-	err = l.Run(ctx, &githubScaler{s: s, p: p})
+	err = l.Run(ctx, &githubScaler{s: s, p: p, session: session})
 	s.mu.Lock()
 	if p.listener == l {
 		p.listener = nil
@@ -362,7 +395,8 @@ func githubSpec(p *githubPool) api.JobSpec {
 }
 
 // githubCapacityLocked is how many GitHub jobs the pool can have at once right now: its runners,
-// plus as many more of its size as would be admitted now.
+// plus as many more of its size as would be admitted now, each budget in its own unit (a job
+// books its learned peak but counts its whole limit against mem_overcommit).
 func (s *Server) githubCapacityLocked(p *githubPool) int {
 	active := len(s.githubJobsLocked(p))
 	if s.retireErr != "" || s.upgrading || s.paused {
@@ -370,23 +404,35 @@ func (s *Server) githubCapacityLocked(p *githubPool) int {
 	}
 	a := s.allocatedLocked()
 	var pend api.Resources
+	var pendLimits int64
 	for _, j := range s.jobs {
 		if (j.State == api.StateQueued || j.State == api.StateUploading) && !j.StopRequested {
 			pend.CPU += j.Resources.CPU
 			pend.Mem += j.booked()
+			pendLimits += j.Resources.Mem
 		}
 	}
 	cpu := s.cfg.Capacity.CPU - a.CPU - pend.CPU
 	if idle, ok := s.cpuIdleLocked(); ok && s.cfg.Policy.CPUOvercommit > 1 {
 		cpu = max(cpu, min(s.cfg.Capacity.CPU*s.cfg.Policy.CPUOvercommit-a.CPU-pend.CPU, idle-pend.CPU))
 	}
-	mem := s.memRoomLocked() - pend.Mem
-	book := s.bookMemLocked(githubSpec(p), p.Resources.Mem)
-	more := 0
-	if p.Resources.CPU > 0 && book > 0 && cpu > 0 && mem > 0 {
-		more = int(math.Floor(min(cpu/p.Resources.CPU, float64(mem)/float64(book))))
+	book := float64(s.bookMemLocked(githubSpec(p), p.Resources.Mem))
+	per := func(room, each float64) float64 {
+		if each <= 0 {
+			return math.Inf(1)
+		}
+		return room / each
 	}
-	n := active + max(more, 0)
+	more := min(
+		per(cpu, p.Resources.CPU),
+		per(float64(s.cfg.memCap-a.Mem-pend.Mem), book),
+		per(float64(s.cfg.memCap)*s.cfg.Policy.MemOvercommit-float64(s.memLimitsLocked()+pendLimits), float64(p.Resources.Mem)),
+		per(float64(memAvailable()-s.memGrowthLocked()-s.cfg.memReserve-pend.Mem), book),
+	)
+	n := active
+	if more >= 1 && !math.IsInf(more, 1) {
+		n += int(math.Floor(more))
+	}
 	if p.Max > 0 {
 		n = min(n, max(p.Max, active))
 	}
@@ -394,60 +440,73 @@ func (s *Server) githubCapacityLocked(p *githubPool) int {
 }
 
 type githubScaler struct {
-	s *Server
-	p *githubPool
+	s       *Server
+	p       *githubPool
+	session interface {
+		AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64, error)
+	}
 }
 
-// Scale handles one message from GitHub: it records which runner took which job, and starts or
-// drops runners so there is one for every job GitHub assigned to this scale set.
+// Scale handles one poll of GitHub's message queue (m is nil when nothing happened): it claims
+// the jobs GitHub offers, records which runner took which job, and starts or drops runners so
+// there is one for every job GitHub assigned to this scale set.
 func (sc *githubScaler) Scale(ctx context.Context, m *scaleset.RunnerScaleSetMessage) error {
-	if m == nil {
-		return nil
-	}
 	s, p := sc.s, sc.p
-	s.mu.Lock()
-	for _, js := range m.JobStartedMessages {
-		if j := s.githubJobByRunnerLocked(p, js.RunnerName); j != nil {
-			g := *j.GitHub
-			g.Repo, g.Job, g.RunID, g.Event = js.OwnerName+"/"+js.RepositoryName, js.JobDisplayName, js.WorkflowRunID, js.EventName
-			g.Workflow = githubWorkflowFile(js.JobWorkflowRef)
-			if js.WorkflowRunID != 0 {
-				g.URL = fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", js.OwnerName, js.RepositoryName, js.WorkflowRunID)
-			}
-			j.GitHub = &g
-			p.failures = 0
-			j.save()
+	if m != nil && len(m.JobAvailableMessages) > 0 {
+		ids := make([]int64, 0, len(m.JobAvailableMessages))
+		for _, ja := range m.JobAvailableMessages {
+			ids = append(ids, ja.RunnerRequestID)
+		}
+		// Left unacknowledged on failure (the listener reconnects), so GitHub offers them again.
+		if _, err := sc.session.AcquireJobs(ctx, ids); err != nil {
+			return fmt.Errorf("claiming jobs GitHub offered: %w", err)
 		}
 	}
-	for _, jc := range m.JobCompletedMessages {
-		if jc.RunnerName == "" {
-			continue // assigned, then cancelled before a runner took it
+	s.mu.Lock()
+	fresh := false
+	if m != nil {
+		for _, js := range m.JobStartedMessages {
+			if j := s.githubJobByRunnerLocked(p, js.RunnerName); j != nil {
+				g := *j.GitHub
+				g.Repo, g.Job, g.RunID, g.Event = js.OwnerName+"/"+js.RepositoryName, js.JobDisplayName, js.WorkflowRunID, js.EventName
+				g.Workflow = githubWorkflowFile(js.JobWorkflowRef)
+				if js.WorkflowRunID != 0 {
+					g.URL = fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", js.OwnerName, js.RepositoryName, js.WorkflowRunID)
+				}
+				j.GitHub = &g
+				p.failures = 0
+				j.save()
+			}
 		}
-		if j := s.githubJobByRunnerLocked(p, jc.RunnerName); j != nil {
+		for _, jc := range m.JobCompletedMessages {
+			j := s.githubJobByRunnerLocked(p, jc.RunnerName)
+			if jc.RunnerName == "" || j == nil || j.GitHub.Result != "" {
+				continue // cancelled before a runner took it, not ours, or a redelivered message
+			}
 			g := *j.GitHub
 			g.Result = jc.Result
 			j.GitHub = &g
 			j.save()
+			now := time.Now()
+			p.Runs, p.LastRun = p.Runs+1, &now
+			p.save()
 		}
-		now := time.Now()
-		p.Runs, p.LastRun = p.Runs+1, &now
-		p.save()
+		if st := m.Statistics; st != nil {
+			p.Assigned, fresh = st.TotalAssignedJobs, true
+		}
 	}
-	need, drop := 0, []*job(nil)
-	if st := m.Statistics; st != nil {
-		p.Assigned = st.TotalAssignedJobs
-		live := s.githubJobsLocked(p)
-		need = st.TotalAssignedJobs - len(live)
-		if need < 0 {
-			for _, j := range live {
-				if len(drop) < -need && (j.GitHub == nil || j.GitHub.Job == "") {
-					drop = append(drop, j)
-				}
+	live := s.githubJobsLocked(p)
+	need := p.Assigned - len(live)
+	var drop []*job
+	if need < 0 && fresh {
+		for _, j := range live {
+			if len(drop) < -need && (j.GitHub == nil || j.GitHub.Job == "") {
+				drop = append(drop, j)
 			}
 		}
-		if time.Now().Before(p.pauseTil) {
-			need = 0
-		}
+	}
+	if time.Now().Before(p.pauseTil) || p.State == api.GitHubRemoving {
+		need = 0
 	}
 	for _, j := range drop {
 		s.cancelJobLocked(j, "GitHub no longer has a job for this runner")
@@ -481,48 +540,65 @@ func (s *Server) githubJobByRunnerLocked(p *githubPool, runner string) *job {
 }
 
 // startGitHubRunner queues a one-job runner. Its config is a credential: it lives only in the
-// job's secrets (memory, then tmpfs), never in the job record.
+// job's secrets (memory, then tmpfs), never in the job record. A pool whose jobs share state
+// (one repository, or --shared-cache) gives it a free slot; otherwise it starts from nothing
+// in its own job directory.
 func (s *Server) startGitHubRunner(ctx context.Context, p *githubPool) error {
+	id := newID("j-")
 	s.mu.Lock()
-	slot := 0
-	for p.slots[slot] != "" {
-		slot++
+	slot, dir := -1, filepath.Join(s.jobDir(id), "github")
+	if p.Shared {
+		slot = 0
+		for p.slots[slot] != "" {
+			slot++
+		}
+		p.slots[slot], dir = id, p.slotDir(slot)
 	}
-	work := filepath.Join(p.slotDir(slot), "work")
-	p.slots[slot] = "pending"
 	s.mu.Unlock()
-	release := func() {
-		s.mu.Lock()
-		if p.slots[slot] == "pending" {
+	releaseLocked := func() {
+		if slot >= 0 && p.slots[slot] == id {
 			delete(p.slots, slot)
 		}
-		s.mu.Unlock()
 	}
-	for _, d := range []string{work, filepath.Join(p.slotDir(slot), "containers"), filepath.Join(p.slotDir(slot), "rustup")} {
+	work := filepath.Join(dir, "work")
+	for _, d := range []string{work, filepath.Join(dir, "containers"), filepath.Join(dir, "rustup")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
-			release()
+			s.mu.Lock()
+			releaseLocked()
+			s.mu.Unlock()
 			return err
 		}
 	}
-	name := fmt.Sprintf("%s-%s", p.ScaleSet, strings.TrimPrefix(newID(""), "-"))
+	name := p.ScaleSet + "-" + strings.TrimPrefix(id, "j-")
 	jit, err := p.gh.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{Name: name, WorkFolder: work}, p.ScaleSetID)
-	if err != nil {
-		release()
-		return fmt.Errorf("creating a runner on GitHub: %w", err)
-	}
-	install, err := s.actionsRunner(ctx, p.token)
-	if err != nil {
-		release()
-		return err
+	var install string
+	if err == nil {
+		install, err = s.actionsRunner(ctx, p.token)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err == nil && (ctx.Err() != nil || p.State == api.GitHubRemoving) {
+		err = errors.New("the pool is stopping")
+	}
+	if err != nil {
+		releaseLocked()
+		if slot < 0 {
+			go removeAll(s.jobDir(id))
+		}
+		if jit != nil && jit.Runner != nil {
+			go func(gh githubAPI, rid int64) { _ = gh.RemoveRunner(context.Background(), rid) }(p.gh, int64(jit.Runner.ID))
+		}
+		if ctx.Err() != nil || p.State == api.GitHubRemoving {
+			return nil
+		}
+		return fmt.Errorf("starting a runner: %w", err)
+	}
 	spec := githubSpec(p)
 	now := time.Now()
 	j := &job{Job: api.Job{
-		ID: newID("j-"), Runner: s.cfg.Name, State: api.StateQueued, Spec: spec, Caller: "github",
+		ID: id, Runner: s.cfg.Name, State: api.StateQueued, Spec: spec, Caller: "github",
 		Resources: p.Resources, CreatedAt: now, Runtime: "container", Proto: api.Proto, MemFrom: "requested",
-		GitHub: &api.GitHubJob{Owner: p.Owner, Runner: name},
+		GitHub: &api.GitHubJob{Owner: p.Owner, Runner: name, Slot: slot, Dir: dir, Install: install},
 	}, queuedAt: now}
 	if jit.Runner != nil {
 		j.GitHub.RunnerID = jit.Runner.ID
@@ -531,11 +607,10 @@ func (s *Server) startGitHubRunner(ctx context.Context, p *githubPool) error {
 	j.dir = s.jobDir(j.ID)
 	j.secrets = map[string]string{githubJITEnv: jit.EncodedJITConfig}
 	j.Spec.SecretNames = []string{githubJITEnv}
-	j.Spec.Env = map[string]string{"OFFLOAD_GITHUB_SLOT": strconv.Itoa(slot), "OFFLOAD_GITHUB_INSTALL": install}
 	j.MemBooked = s.bookMemLocked(j.Spec, j.Resources.Mem)
 	fail := func(err error) error {
-		_ = os.RemoveAll(j.dir)
-		delete(p.slots, slot)
+		releaseLocked()
+		go removeAll(j.dir)
 		return err
 	}
 	if err := os.MkdirAll(filepath.Join(j.dir, "tmp"), 0o700); err != nil {
@@ -550,22 +625,29 @@ func (s *Server) startGitHubRunner(ctx context.Context, p *githubPool) error {
 		return fail(err)
 	}
 	s.jobs[j.ID] = j
-	p.slots[slot] = j.ID
-	marker := s.cacheDir("scoped", githubScope(p.key), ".used")
-	_ = os.MkdirAll(filepath.Dir(marker), 0o755)
-	_ = os.WriteFile(marker, nil, 0o644)
+	if slot >= 0 {
+		marker := s.cacheDir("scoped", githubScope(p.key), ".used")
+		_ = os.MkdirAll(filepath.Dir(marker), 0o755)
+		_ = os.WriteFile(marker, nil, 0o644)
+	}
 	s.kick()
 	return nil
 }
 
 func githubSlotOf(j *job) (int, bool) {
-	n, err := strconv.Atoi(j.Spec.Env["OFFLOAD_GITHUB_SLOT"])
-	return n, err == nil && n >= 0
+	if j.GitHub == nil || j.GitHub.Slot < 0 {
+		return 0, false
+	}
+	return j.GitHub.Slot, true
 }
 
-// githubFinishedLocked frees a finished runner job's slot. A runner that never took a GitHub job
-// counts as a failure; several in a row pause the pool so a broken setup doesn't spin.
+// githubFinishedLocked frees a finished runner job's slot, or deletes its own state (a container
+// image store can be large). A runner that never took a GitHub job counts as a failure; several
+// in a row pause the pool so a broken setup doesn't spin.
 func (s *Server) githubFinishedLocked(j *job) {
+	if j.GitHub != nil && j.GitHub.Slot < 0 && j.GitHub.Dir == filepath.Join(j.dir, "github") {
+		go removeAll(j.GitHub.Dir)
+	}
 	p := s.github[j.Spec.GitHub]
 	if p == nil {
 		return
@@ -771,12 +853,18 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "can't use "+owner)
 		return
 	}
-	name := githubScaleSetName(s.cfg.Name)
+	name := githubScaleSetName(s.cfg.Name, runnerID(s.cfg.StateDir))
+	s.mu.Lock()
+	if p := s.github[key]; p != nil {
+		name = p.ScaleSet
+	}
+	s.mu.Unlock()
 	probe := &githubPool{GitHubPool: api.GitHubPool{URL: canonical, Owner: owner}, token: req.Token}
 	c, err := s.githubClient(probe)
+	var ss *scaleset.RunnerScaleSet
 	if err == nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		_, err = ensureScaleSet(ctx, c, name, req.Labels)
+		ss, err = ensureScaleSet(ctx, c, name, req.Labels)
 		cancel()
 	}
 	if err != nil {
@@ -804,33 +892,21 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "storing the token: "+err.Error())
 		return
 	}
-	restart := p != nil
 	if p == nil {
 		p = s.newPool(key, dir, githubPoolRecord{Owner: owner, URL: canonical, ScaleSet: name, CreatedAt: time.Now()}, req.Token)
 		s.github[key] = p
 	}
 	p.token, p.Labels, p.Max, p.Resources, p.TokenFrom = req.Token, req.Labels, req.Max, res, req.TokenFrom
+	p.Shared = req.SharedCache || strings.Contains(owner, "/")
+	if ss != nil && p.ScaleSet == ss.Name {
+		p.ScaleSetID = ss.ID
+	}
 	p.State, p.Detail = api.GitHubPreparing, "connecting to GitHub"
 	if err := p.save(); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if restart && p.cancel != nil {
-		// Reconnect with the new settings once the old listener has let go of its session.
-		cancel, done := p.cancel, p.done
-		p.cancel = nil
-		go func() {
-			cancel()
-			<-done
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			if p.State != api.GitHubRemoving && p.cancel == nil {
-				s.startPoolLocked(s.serveCtx, p)
-			}
-		}()
-	} else {
-		s.startPoolLocked(s.serveCtx, p)
-	}
+	s.restartPoolLocked(p)
 	log.Printf("github %s: taking jobs labeled %s as scale set %s", owner, strings.Join(p.Labels, ","), name)
 	writeJSON(w, s.githubViewLocked(p))
 }
@@ -844,7 +920,8 @@ func writeSecretFile(path, value string) error {
 }
 
 // handleGitHubRemove stops taking an owner's jobs here: it stops the runners, deletes this
-// runner's scale set on GitHub, then the pool's files.
+// runner's scale set on GitHub, then the pool's files. ?forget=1 skips GitHub (a revoked token
+// can't delete it), so a removal can always finish.
 func (s *Server) handleGitHubRemove(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -852,6 +929,9 @@ func (s *Server) handleGitHubRemove(w http.ResponseWriter, r *http.Request) {
 	if p == nil {
 		writeErr(w, 404, "this runner doesn't take GitHub jobs for that owner")
 		return
+	}
+	if r.URL.Query().Get("forget") == "1" {
+		p.forget = true
 	}
 	if p.State != api.GitHubRemoving {
 		p.State, p.Detail = api.GitHubRemoving, "stopping its runners"
@@ -873,27 +953,48 @@ func (s *Server) finishRemoval(p *githubPool) {
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if done != nil {
 		<-done
 	}
 	for {
 		s.mu.Lock()
-		left := len(s.githubJobsLocked(p))
+		left := s.githubJobsLocked(p)
+		for _, j := range left { // runners created while the listener was stopping too
+			if !j.StopRequested {
+				s.cancelJobLocked(j, "GitHub runners removed for "+p.Owner)
+			}
+		}
 		s.mu.Unlock()
-		if left == 0 {
+		if len(left) == 0 {
 			break
 		}
 		time.Sleep(time.Second)
 	}
-	problem := ""
-	if c, err := s.githubClient(p); err == nil && p.ScaleSetID != 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if err := c.DeleteRunnerScaleSet(ctx, p.ScaleSetID); err != nil && !errors.Is(err, scaleset.NotFoundError) {
-			problem = err.Error()
+	for wait := 10 * time.Second; ; wait = min(wait*2, 10*time.Minute) {
+		s.mu.Lock()
+		forget := p.forget
+		s.mu.Unlock()
+		if forget {
+			break
 		}
-		cancel()
-	}
-	if problem != "" {
-		log.Printf("github %s: deleting scale set %s on GitHub: %s (delete it under Settings → Actions → Runners)", p.Owner, p.ScaleSet, problem)
+		err := s.deleteScaleSet(p)
+		if err == nil {
+			break
+		}
+		s.mu.Lock()
+		p.Detail = fmt.Sprintf("couldn't delete scale set %s on GitHub (%s); retrying. If the token no longer works, delete it under Settings → Actions → Runners and run: offload github rm %s --forget",
+			p.ScaleSet, githubProblem(err, p.Owner), p.Owner)
+		s.mu.Unlock()
+		log.Printf("github %s: %s", p.Owner, p.Detail)
+		for end := time.Now().Add(wait); time.Now().Before(end); time.Sleep(time.Second) {
+			s.mu.Lock()
+			forget := p.forget
+			s.mu.Unlock()
+			if forget {
+				break
+			}
+		}
 	}
 	err := removeAll(p.dir)
 	if err == nil {
@@ -908,4 +1009,26 @@ func (s *Server) finishRemoval(p *githubPool) {
 	}
 	delete(s.github, p.key)
 	log.Printf("github %s: removed", p.Owner)
+}
+
+// deleteScaleSet deletes this runner's scale set for the pool on GitHub (done if it's gone).
+func (s *Server) deleteScaleSet(p *githubPool) error {
+	c, err := s.githubClient(p)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	id := p.ScaleSetID
+	if id == 0 {
+		ss, err := c.GetRunnerScaleSet(ctx, 1, p.ScaleSet)
+		if err != nil || ss == nil {
+			return err
+		}
+		id = ss.ID
+	}
+	if err := c.DeleteRunnerScaleSet(ctx, id); err != nil && !errors.Is(err, scaleset.NotFoundError) {
+		return err
+	}
+	return nil
 }

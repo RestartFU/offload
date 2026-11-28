@@ -268,6 +268,10 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		out.err(400, "argv is empty")
 		return
 	}
+	if spec.GitHub != "" {
+		out.err(400, "github is set by the runner for its own GitHub jobs, not by clients")
+		return
+	}
 	if spec.Dir != "" {
 		if _, err := cleanRel(spec.Dir); err != nil && spec.Dir != "." {
 			out.err(400, err.Error())

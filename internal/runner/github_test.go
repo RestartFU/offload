@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,9 +16,17 @@ import (
 )
 
 type fakeGitHub struct {
-	mu      sync.Mutex
-	made    []scaleset.RunnerScaleSetJitRunnerSetting
-	removed []int64
+	mu       sync.Mutex
+	made     []scaleset.RunnerScaleSetJitRunnerSetting
+	removed  []int64
+	acquired []int64
+}
+
+func (f *fakeGitHub) AcquireJobs(_ context.Context, ids []int64) ([]int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.acquired = append(f.acquired, ids...)
+	return ids, nil
 }
 
 func (f *fakeGitHub) GenerateJitRunnerConfig(_ context.Context, set *scaleset.RunnerScaleSetJitRunnerSetting, _ int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
@@ -51,7 +60,7 @@ func newGitHubServer(t *testing.T) (*Server, *githubPool, *fakeGitHub) {
 	_ = os.WriteFile(filepath.Join(s.cacheDir("actions-runner"), "checked"), nil, 0o644)
 	key := api.GitHubKey("acme")
 	p := s.newPool(key, filepath.Join(s.githubDir(), key), githubPoolRecord{Owner: "acme", URL: "https://github.com/acme",
-		ScaleSet: "offload-box", ScaleSetID: 7, Labels: []string{"offload"}, Resources: api.Resources{CPU: 2, CPUMax: 8, Mem: 8 << 30}}, "TOKEN")
+		ScaleSet: "offload-box", ScaleSetID: 7, Labels: []string{"offload"}, Resources: api.Resources{CPU: 2, CPUMax: 8, Mem: 8 << 30}, Shared: true}, "TOKEN")
 	f := &fakeGitHub{}
 	p.gh = f
 	_ = os.MkdirAll(p.dir, 0o700)
@@ -67,7 +76,7 @@ func stats(assigned int) *scaleset.RunnerScaleSetMessage {
 // reaches only the job's secrets, never a record on disk.
 func TestGitHubRunnerPerAssignedJob(t *testing.T) {
 	s, p, f := newGitHubServer(t)
-	sc := &githubScaler{s: s, p: p}
+	sc := &githubScaler{s: s, p: p, session: f}
 	if err := sc.Scale(context.Background(), stats(2)); err != nil {
 		t.Fatal(err)
 	}
@@ -83,9 +92,9 @@ func TestGitHubRunnerPerAssignedJob(t *testing.T) {
 		if b, _ := os.ReadFile(filepath.Join(j.dir, "job.json")); strings.Contains(string(b), "JIT-SECRET") || len(b) == 0 {
 			t.Fatalf("job record holds the runner config: %s", b)
 		}
-		slots[j.Spec.Env["OFFLOAD_GITHUB_SLOT"]] = true
+		slots[j.GitHub.Dir] = true
 	}
-	if len(slots) != 2 || !strings.HasPrefix(f.made[0].WorkFolder, p.slotDir(0)) && !strings.HasPrefix(f.made[0].WorkFolder, p.slotDir(1)) {
+	if len(slots) != 2 || !strings.HasPrefix(f.made[0].WorkFolder, p.slotDir(0)) && !strings.HasPrefix(f.made[0].WorkFolder, p.slotDir(1)) || live[0].GitHub.Slot < 0 {
 		t.Fatalf("slots %v, work folder %q", slots, f.made[0].WorkFolder)
 	}
 	if err := sc.Scale(context.Background(), stats(2)); err != nil || len(s.githubJobsLocked(p)) != 2 {
@@ -122,6 +131,9 @@ func TestGitHubRunnerPerAssignedJob(t *testing.T) {
 	if p.Runs != 1 || p.LastRun == nil || busy.GitHub.Result != "succeeded" {
 		t.Fatalf("runs %d, result %q", p.Runs, busy.GitHub.Result)
 	}
+	if err := sc.Scale(context.Background(), &scaleset.RunnerScaleSetMessage{JobCompletedMessages: []*scaleset.JobCompleted{done}}); err != nil || p.Runs != 1 {
+		t.Fatalf("a redelivered completion counted again: runs %d, %v", p.Runs, err)
+	}
 	if got := ledgerCommand(busy); got != "GitHub acme/app · test (linux)" {
 		t.Fatalf("ledger command %q", got)
 	}
@@ -129,7 +141,7 @@ func TestGitHubRunnerPerAssignedJob(t *testing.T) {
 
 // Capacity is the pool's runners plus as many more of its size as would be admitted now.
 func TestGitHubCapacity(t *testing.T) {
-	s, p, _ := newGitHubServer(t)
+	s, p, f := newGitHubServer(t)
 	if n := s.githubCapacityLocked(p); n != 4 {
 		t.Fatalf("empty 8-core runner, 2 cores a job: capacity %d, want 4", n)
 	}
@@ -139,7 +151,7 @@ func TestGitHubCapacity(t *testing.T) {
 	if n := s.githubCapacityLocked(p); n != 1 {
 		t.Fatalf("with 5 cores taken: capacity %d, want 1", n)
 	}
-	sc := &githubScaler{s: s, p: p}
+	sc := &githubScaler{s: s, p: p, session: f}
 	if err := sc.Scale(context.Background(), stats(1)); err != nil {
 		t.Fatal(err)
 	}
@@ -152,6 +164,15 @@ func TestGitHubCapacity(t *testing.T) {
 		t.Fatalf("paused runner: capacity %d, want only its own runner", n)
 	}
 	s.paused = false
+	s.history = map[string]*histEntry{histKey(githubSpec(p)): {Peaks: []int64{1 << 30}}}
+	if n := s.githubCapacityLocked(p); n != 4 {
+		t.Fatalf("1G learned peak, 8G limits, 32G with 2x overbooking: capacity %d, want 4 (8 limits fit, 4 by cores)", n)
+	}
+	s.cfg.Capacity.CPU = 64
+	if n := s.githubCapacityLocked(p); n != 8 {
+		t.Fatalf("64 cores: capacity %d, want 8 (the limits budget)", n)
+	}
+	s.cfg.Capacity.CPU, s.history = 8, nil
 	p.Max = 2
 	if n := s.githubCapacityLocked(p); n != 2 {
 		t.Fatalf("--max 2: capacity %d", n)
@@ -160,8 +181,8 @@ func TestGitHubCapacity(t *testing.T) {
 
 // Runners that keep ending without a job pause the pool instead of spinning.
 func TestGitHubFailingRunnersPause(t *testing.T) {
-	s, p, _ := newGitHubServer(t)
-	sc := &githubScaler{s: s, p: p}
+	s, p, f := newGitHubServer(t)
+	sc := &githubScaler{s: s, p: p, session: f}
 	for i := 0; i < 3; i++ {
 		if err := sc.Scale(context.Background(), stats(1)); err != nil {
 			t.Fatal(err)
@@ -181,11 +202,11 @@ func TestGitHubFailingRunnersPause(t *testing.T) {
 
 // Pools and their runners' slots come back after a restart.
 func TestGitHubRestore(t *testing.T) {
-	s, p, _ := newGitHubServer(t)
+	s, p, f := newGitHubServer(t)
 	if err := writeSecretFile(filepath.Join(p.dir, "token"), "TOKEN"); err != nil || p.save() != nil {
 		t.Fatal(err)
 	}
-	if err := (&githubScaler{s: s, p: p}).Scale(context.Background(), stats(1)); err != nil {
+	if err := (&githubScaler{s: s, p: p, session: f}).Scale(context.Background(), stats(1)); err != nil {
 		t.Fatal(err)
 	}
 	j := s.githubJobsLocked(p)[0]
@@ -204,9 +225,50 @@ func TestGitHubRestore(t *testing.T) {
 }
 
 func TestGitHubScaleSetName(t *testing.T) {
-	for in, want := range map[string]string{"vps-2": "offload-vps-2", "Big Box_1": "offload-big-box-1", "∆": "offload-runner"} {
-		if got := githubScaleSetName(in); got != want {
+	for in, want := range map[string]string{"vps-2": "offload-vps-2-abc123", "Big Box_1": "offload-big-box-1-abc123", "∆": "offload-runner-abc123"} {
+		if got := githubScaleSetName(in, "abc123def"); got != want {
 			t.Errorf("%q: %q, want %q", in, got, want)
 		}
+	}
+}
+
+// Jobs GitHub offers are claimed; a quiet poll still replaces a runner that went away.
+func TestGitHubAcquiresAndReconciles(t *testing.T) {
+	s, p, f := newGitHubServer(t)
+	sc := &githubScaler{s: s, p: p, session: f}
+	offer := &scaleset.RunnerScaleSetMessage{JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 9}}},
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1}}
+	if err := sc.Scale(context.Background(), offer); err != nil || len(f.acquired) != 1 || f.acquired[0] != 9 {
+		t.Fatalf("acquired %v: %v", f.acquired, err)
+	}
+	j := s.githubJobsLocked(p)[0]
+	code := 1
+	j.State = api.StateRunning
+	s.finishLocked(j, api.StateFailed, &code, "killed")
+	if err := sc.Scale(context.Background(), nil); err != nil || len(s.githubJobsLocked(p)) != 1 {
+		t.Fatalf("a quiet poll didn't replace the lost runner: %v", err)
+	}
+}
+
+// An organization's jobs start from their own state unless it shares it; ordinary jobs can't
+// claim to be GitHub runners.
+func TestGitHubOrgJobsStartClean(t *testing.T) {
+	s, p, f := newGitHubServer(t)
+	p.Shared = false
+	if err := (&githubScaler{s: s, p: p, session: f}).Scale(context.Background(), stats(1)); err != nil {
+		t.Fatal(err)
+	}
+	j := s.githubJobsLocked(p)[0]
+	if j.GitHub.Slot != -1 || j.GitHub.Dir != filepath.Join(j.dir, "github") || len(p.slots) != 0 {
+		t.Fatalf("org job state: slot %d dir %s slots %v", j.GitHub.Slot, j.GitHub.Dir, p.slots)
+	}
+	argv := strings.Join(s.containerArgv(j, map[string]string{}, j.dir, ""), " ")
+	if strings.Contains(argv, "/opt/offload/go/pkg/mod") || !strings.Contains(argv, j.GitHub.Dir+"/containers:/var/lib/containers") {
+		t.Fatalf("org job mounts shared caches or misses its own store: %s", argv)
+	}
+	w := httptest.NewRecorder()
+	s.handleCreateJob(w, httptest.NewRequest("POST", "/v1/jobs", strings.NewReader(`{"argv":["true"],"github":"acme"}`)))
+	if w.Code != 400 {
+		t.Fatalf("a client job claiming a GitHub pool: %d %s", w.Code, w.Body)
 	}
 }

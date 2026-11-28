@@ -958,9 +958,11 @@ function renderGitHubView() {
   const owners = new Map();
   for (const r of state.fleet.runners) for (const p of r.github || []) (owners.get(p.owner) || owners.set(p.owner, []).get(p.owner)).push([r, p]);
   if (!owners.size) {
+    // Recent jobs stay reachable (their logs) after the last organization is removed.
+    const recent = ghWorkloads().length > 0;
     $("#gh-alerts").replaceChildren();
-    $("#gh-owners").replaceChildren();
-    $("#gh-jobs").replaceChildren(ghOnboarding());
+    if (recent) renderGitHubJobs([]); else $("#gh-jobs").replaceChildren();
+    $("#gh-owners").replaceChildren(ghOnboarding());
     return;
   }
   const alerts = [];
@@ -1047,6 +1049,7 @@ function ownerCard(owner, list) {
     h("div", { class: "runner-foot" },
       h("span", {}, "Each job ", h("b", {}, `${fmtCores(per.cpu)}–${fmtCores(per.cpu_max)} cores`), " · ", h("b", {}, fmtBytes(per.mem))),
       h("span", {}, h("b", {}, finished), " finished", last ? " · last one " + agoCoarse(last) : ""),
+      h("span", {}, first.shared ? "Warm caches shared by its jobs" : "Clean caches every job"),
       h("span", {}, first.token_from === "gh" ? "With your gh login" : "With a token")));
 }
 

@@ -288,6 +288,9 @@ type GitHubAdd struct {
 	Labels    []string  `json:"labels,omitempty"`     // what workflows put in runs-on; default "offload"
 	Max       int       `json:"max,omitempty"`        // most GitHub jobs at once here; 0 is as many as fit
 	Resources Resources `json:"resources"`            // for each GitHub job
+	// SharedCache lets an organization's repositories share warm checkouts, caches and images.
+	// Without it each of its jobs starts clean; a repository's jobs always share them.
+	SharedCache bool `json:"shared_cache,omitempty"`
 }
 
 // GitHub runner pool states.
@@ -309,6 +312,7 @@ type GitHubPool struct {
 	Max        int        `json:"max,omitempty"`
 	Resources  Resources  `json:"resources"`
 	TokenFrom  string     `json:"token_from,omitempty"`
+	Shared     bool       `json:"shared"` // jobs reuse warm state (a repository, or --shared-cache)
 	CreatedAt  time.Time  `json:"created_at"`
 	State      string     `json:"state"`
 	Detail     string     `json:"detail,omitempty"` // what preparing waits for, or why it failed
@@ -332,6 +336,11 @@ type GitHubJob struct {
 	Event    string `json:"event,omitempty"`
 	URL      string `json:"url,omitempty"`    // the workflow run on GitHub
 	Result   string `json:"result,omitempty"` // GitHub's verdict: succeeded, failed, cancelled…
+	// Where the runner keeps the job's state: a shared slot of the pool (Slot >= 0) or the job's
+	// own directory (-1), and the actions runner it mounts. Set by the runner only.
+	Slot    int    `json:"slot"`
+	Dir     string `json:"dir,omitempty"`
+	Install string `json:"install,omitempty"`
 }
 
 // ProfileInfo summarizes a runner profile in /v1/status.

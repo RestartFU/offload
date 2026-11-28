@@ -958,22 +958,24 @@ func (s *Server) containerArgv(j *job, env map[string]string, workdir, secrets s
 		// two mounts, and a slot runs one job at a time.
 		r.RustupLayer = j.slot.rustupLayer()
 	}
-	if key := j.Spec.GitHub; key != "" && validKey(key) {
-		// A slot (checkouts and tool cache, nested podman's image store, rustup layer) is kept
-		// for the next job of the same owner; the actions runner is shared and read-only.
-		slot, ok := githubSlotOf(j)
-		install := j.Spec.Env["OFFLOAD_GITHUB_INSTALL"]
-		if ok && filepath.Dir(install) == s.cacheDir("actions-runner") {
-			dir := filepath.Join(s.githubDir(), key, "slots", strconv.Itoa(slot))
-			r.Same = append(r.Same, filepath.Join(dir, "work"))
-			r.Volumes = append(r.Volumes, install+":"+githubRunnerDir+":O", filepath.Join(dir, "containers")+":/var/lib/containers")
-			r.RustupLayer = filepath.Join(dir, "rustup")
+	if g := j.GitHub; g != nil && j.Spec.GitHub != "" && validKey(j.Spec.GitHub) {
+		// The job's state lives in a slot of its pool (kept for the next job) or in its own
+		// directory; the actions runner is shared and read-only. Both come from the runner's
+		// own record of the job, never from what a client submitted.
+		ownDir := g.Slot < 0 && g.Dir == filepath.Join(j.dir, "github")
+		slotDir := g.Slot >= 0 && g.Dir == filepath.Join(s.githubDir(), j.Spec.GitHub, "slots", strconv.Itoa(g.Slot))
+		if (ownDir || slotDir) && filepath.Dir(g.Install) == s.cacheDir("actions-runner") {
+			r.Same = append(r.Same, filepath.Join(g.Dir, "work"))
+			r.Volumes = append(r.Volumes, g.Install+":"+githubRunnerDir+":O", filepath.Join(g.Dir, "containers")+":/var/lib/containers")
+			r.RustupLayer = filepath.Join(g.Dir, "rustup")
 		}
 		r.NestedSandbox = true
 		if _, err := os.Stat("/dev/fuse"); err == nil {
 			r.Devices = append(r.Devices, "/dev/fuse")
 		}
-		r.CacheScope = githubScope(key)
+		if slotDir {
+			r.CacheScope = githubScope(j.Spec.GitHub)
+		}
 	}
 	return s.podmanRun(r)
 }

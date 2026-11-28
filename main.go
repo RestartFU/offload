@@ -92,14 +92,17 @@ Secrets can also come from the environment (e.g. an MCP entry's "env"):
   offload host pair NAME [--code C]  let this client use a runner (C from "offload runner pair-code" on it)
 
 GitHub Actions (every GitHub job runs as an offload job on a runner with room for it):
-  offload github add ORG[/REPO] [--labels offload] [--max N] [--on RUNNER,…]
+  offload github add ORG[/REPO] [--labels offload] [--max N] [--on RUNNER,…] [--shared-cache]
                      [--token SRC] [--cpu N] [--cpu-max N] [--mem SIZE (default 8G)]
                                      take ORG's jobs on every runner (or --on); workflows
                                      use "runs-on: offload" (or --labels). Uses your gh
-                                     login unless --token gives a token or cmd:/env:/file:
+                                     login unless --token gives a token or cmd:/env:/file:.
+                                     An org's jobs start with clean caches unless
+                                     --shared-cache (its repos trust each other)
   offload github ls                  organizations and repositories, per runner
-  offload github rm ORG[/REPO] [--on RUNNER,…]
-                                     stop taking its jobs (and delete them on GitHub)
+  offload github rm ORG[/REPO] [--on RUNNER,…] [--forget]
+                                     stop taking its jobs and delete them on GitHub
+                                     (--forget: only here, when GitHub can't be told)
 
 Environments (jobs run in containers; agents are root inside and can install anything):
   offload env show [--environment N]            the environment a job here would use
@@ -371,6 +374,7 @@ func cmdGitHub(args []string) error {
 		labels := fs.String("labels", "offload", "labels workflows use in runs-on, comma-separated")
 		on := fs.String("on", "", "runners to use, comma-separated (default: all)")
 		fs.IntVar(&o.Max, "max", 0, "most GitHub jobs at once per runner (default: as many as fit)")
+		fs.BoolVar(&o.Shared, "shared-cache", false, "let the organization's repositories share warm caches")
 		res := resourceFlags(fs)
 		_ = fs.Parse(args[2:])
 		var err error
@@ -387,8 +391,9 @@ func cmdGitHub(args []string) error {
 		}
 		fs := flag.NewFlagSet("github rm", flag.ExitOnError)
 		on := fs.String("on", "", "runners, comma-separated (default: all)")
+		forget := fs.Bool("forget", false, "remove here even if GitHub can't be told (a revoked token)")
 		_ = fs.Parse(args[2:])
-		return client.GitHubRemove(args[1], list(*on))
+		return client.GitHubRemove(args[1], list(*on), *forget)
 	}
 	die(usage)
 	return nil

@@ -154,7 +154,7 @@ how to grant it when it's missing (`gh auth refresh -h github.com -s admin:org`)
 credential, pass `--token` a fine-grained token with only "Self-hosted runners: write", as a
 value or a `cmd:`, `env:` or `file:` source.
 
-Each runner keeps its own runner scale set on GitHub (`offload-<runner>`) and tells GitHub how
+Each runner keeps its own runner scale set on GitHub (`offload-<runner>-<id>`) and tells GitHub how
 many jobs fit there right now. Scale sets share labels, so GitHub hands each job to a runner with
 room and holds it while none has any. Every job gets a one-job runner as an ordinary offload job:
 admission, CPU and memory limits (the runner's default CPU guarantee and 8G unless `--cpu`,
@@ -163,9 +163,15 @@ dashboard's GitHub tab. `--max N` caps how many run at once on each runner, `--l
 `runs-on` matches, and `--on` picks runners.
 
 The container is new for every job. Docker works through podman inside it (`docker build`,
-`run`, `login`, `push`; not `buildx` or `compose`). Checkouts and the `actions/setup-*` tool
-cache, Go, cargo and npm caches, and the inner image store stay warm per organization, so
-parallel jobs each reuse a warm copy.
+`run`, `login`, `push`; not `buildx` or `compose`). A repository's jobs keep checkouts, the
+`actions/setup-*` tool cache, Go, cargo and npm caches and the inner image store warm between
+runs, each parallel job in a warm copy of its own. An organization's jobs start clean every time,
+because its repositories would otherwise share what one leaves for the next; `--shared-cache`
+keeps them warm when they all trust each other.
+
+`github rm` stops the jobs and deletes the scale sets on GitHub. If GitHub can't be reached or the
+token no longer works, it keeps retrying and says so; `--forget` removes it locally anyway (then
+delete the scale set under Settings → Actions → Runners).
 
 The token stays on each runner (mode 0600 in its state directory) so it can keep talking to
 GitHub. Workflows can't read it; anything running directly on the runner host as its user,

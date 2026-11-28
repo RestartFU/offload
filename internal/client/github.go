@@ -29,6 +29,7 @@ type GitHubOptions struct {
 	Max       int
 	On        []string
 	Resources api.Resources
+	Shared    bool // --shared-cache
 }
 
 // githubToken resolves the token to hand runners, and where it came from ("gh" or "token").
@@ -104,6 +105,12 @@ func githubHosts(hosts []*Host, on []string, forAdd bool) ([]*Host, error) {
 			if err != nil {
 				return nil, err
 			}
+			if err := checkProto(h); err != nil {
+				return nil, err
+			}
+			if h.derived && h.Token == "" { // discovered isn't paired: it must never see the token
+				return nil, fmt.Errorf("%s isn't paired with this machine: offload host pair %s --code CODE", h.Name, h.Name)
+			}
 			out = append(out, h)
 		}
 		return out, nil
@@ -175,6 +182,8 @@ func GitHubAdd(o GitHubOptions) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancelWait := context.WithTimeout(ctx, 20*time.Minute)
+	defer cancelWait()
 	token, from, err := githubToken(ctx, owner, o.Token)
 	if err != nil {
 		return err
@@ -207,7 +216,7 @@ func GitHubAdd(o GitHubOptions) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req := api.GitHubAdd{URL: owner, Token: token, TokenFrom: from, Labels: o.Labels, Max: o.Max, Resources: o.Resources}
+			req := api.GitHubAdd{URL: owner, Token: token, TokenFrom: from, Labels: o.Labels, Max: o.Max, Resources: o.Resources, SharedCache: o.Shared}
 			var p api.GitHubPool
 			if err := h.do(ctx, "POST", "/v1/github", req, &p); err != nil {
 				var ae *APIError
@@ -244,7 +253,8 @@ func GitHubAdd(o GitHubOptions) error {
 							}
 							mu.Unlock()
 						}
-						if p.State == api.GitHubListening {
+						// Ready, or not getting there without help: report it and stop waiting.
+						if p.State == api.GitHubListening || p.State == api.GitHubFailed || strings.Contains(p.Detail, "paused") {
 							return
 						}
 					}
@@ -263,9 +273,14 @@ func GitHubAdd(o GitHubOptions) error {
 		return nil
 	}
 	if ok == 0 {
-		return errors.New("no runner is taking GitHub jobs")
+		return errors.New("no runner is taking GitHub jobs yet (they keep retrying; offload github ls shows why)")
 	}
 	fmt.Printf("\nWorkflows in %s run here with:\n\n    runs-on: %s\n\n", owner, runsOn(o.Labels))
+	if !strings.Contains(owner, "/") && !o.Shared {
+		fmt.Printf("Each job starts with clean caches, because %s's repositories would otherwise share checkouts,\n"+
+			"dependency caches and docker images. If they all trust each other, keep them warm with:\n\n"+
+			"    offload github add %s --shared-cache\n\n", owner, owner)
+	}
 	return nil
 }
 
@@ -334,7 +349,11 @@ func GitHubList() error {
 		if first.TokenFrom == "gh" {
 			token = "your gh login"
 		}
-		fmt.Fprintf(tw, "%s\truns-on: %s · with %s\n", first.Owner, runsOn(first.Labels), token)
+		caches := "clean caches every job"
+		if first.Shared {
+			caches = "shared warm caches"
+		}
+		fmt.Fprintf(tw, "%s\truns-on: %s · with %s · %s\n", first.Owner, runsOn(first.Labels), token, caches)
 		fmt.Fprintln(tw, "  RUNNER\tSTATE\tNOW\tDONE\tLAST JOB\tEACH JOB")
 		for _, r := range rows {
 			p := r.p
@@ -357,7 +376,7 @@ func GitHubList() error {
 }
 
 // GitHubRemove stops taking an owner's GitHub jobs on runners and deletes their scale sets.
-func GitHubRemove(raw string, on []string) error {
+func GitHubRemove(raw string, on []string, forget bool) error {
 	owner, _, err := api.GitHubOwner(raw)
 	if err != nil {
 		return err
@@ -395,18 +414,27 @@ func GitHubRemove(raw string, on []string) error {
 				fmt.Printf("  %s: "+format+"\n", append([]any{h.Name}, a...)...)
 				mu.Unlock()
 			}
-			if err := h.do(ctx, "DELETE", "/v1/github/"+key, nil, nil); err != nil {
+			path := "/v1/github/" + key
+			if forget {
+				path += "?forget=1"
+			}
+			if err := h.do(ctx, "DELETE", path, nil, nil); err != nil {
 				report("%v", err)
 				mu.Lock()
 				failed = err
 				mu.Unlock()
 				return
 			}
+			last := ""
 			for deadline := time.Now().Add(2 * time.Minute); time.Now().Before(deadline); {
 				pools, err := githubPools(ctx, h)
 				if err == nil && githubFind(pools, key) == nil {
 					report("removed")
 					return
+				}
+				if p := githubFind(pools, key); err == nil && p.Detail != last && strings.HasPrefix(p.Detail, "couldn't") {
+					last = p.Detail
+					report("%s", p.Detail)
 				}
 				select {
 				case <-ctx.Done():
@@ -414,7 +442,12 @@ func GitHubRemove(raw string, on []string) error {
 				case <-time.After(time.Second):
 				}
 			}
-			report("still removing (its jobs are stopping); `offload github ls` shows when it's done")
+			report("still removing; `offload github ls` shows when it's done")
+			mu.Lock()
+			if failed == nil && last != "" {
+				failed = errors.New("GitHub hasn't confirmed the removal yet")
+			}
+			mu.Unlock()
 		}()
 	}
 	wg.Wait()
