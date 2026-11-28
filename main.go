@@ -75,7 +75,7 @@ Client:
                        (no write-back; --get outputs land in offload-shards/<i>/)
       --detach, -d     print the job id and return
       --quiet, -q      no offload status lines
-  offload attach ID...               follow jobs to the end (Ctrl-C detaches)
+  offload attach ID                  follow a job to the end (Ctrl-C detaches)
   offload cancel ID                  stop a job or session
   offload get ID [DIR]               download a job's --get artifacts
   offload ps [--all]                 jobs and sessions on every runner
@@ -142,14 +142,10 @@ func main() {
 	case "run":
 		code, err = cmdRun(args)
 	case "attach", "logs":
-		switch {
-		case len(args) == 0:
-			die("usage: offload attach ID...")
-		case len(args) == 1:
-			code, err = client.Attach(args[0])
-		default:
-			code, err = client.AttachAll(args)
+		if len(args) != 1 {
+			die("usage: offload attach ID")
 		}
+		code, err = client.Attach(args[0])
 	case "cancel", "stop":
 		if len(args) != 1 {
 			die("usage: offload cancel ID")

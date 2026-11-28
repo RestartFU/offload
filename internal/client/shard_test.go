@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/RestartFU/offload/internal/api"
@@ -27,7 +26,7 @@ func TestMain(m *testing.M) {
 }
 
 // shardTestChild stands in for a shard's `offload run`: it reports a runner of its own and
-// prints what it learned about the earlier shards.
+// prints, as a shard's job output, what it learned about the earlier shards.
 func shardTestChild() {
 	i, n, ok := shardChild()
 	if !ok {
@@ -35,8 +34,11 @@ func shardTestChild() {
 	}
 	openShardReport()
 	reportPlaced(&Host{URL: fmt.Sprintf("http://r%d", i)})
-	fmt.Printf("shard %d of %d after [%s]\npartial", i, n, os.Getenv(shardPlacedEnv))
-	fmt.Fprintln(os.Stderr, "status")
+	w := &lineWriter{w: os.Stdout, prefix: fmt.Sprintf("[%d/%d] ", i, n)}
+	fmt.Fprintf(w, "shard %d of %d after [%s]\npartial", i, n, os.Getenv(shardPlacedEnv))
+	if w.flush() != nil {
+		os.Exit(98)
+	}
 	if i == 2 {
 		os.Exit(3)
 	}
@@ -44,26 +46,20 @@ func shardTestChild() {
 }
 
 func TestFanOutPlacesShardsInTurn(t *testing.T) {
-	var children []child
-	for i := 1; i <= 3; i++ {
-		children = append(children, child{
-			label: fmt.Sprintf("%d/3", i),
-			args:  []string{"-test.run=^$"},
-			env:   []string{"OFFLOAD_TEST_SHARD_CHILD=1", fmt.Sprintf("%s=%d/3", shardOfEnv, i)},
-		})
+	t.Setenv("OFFLOAD_TEST_SHARD_CHILD", "1")
+	out, err := os.Create(filepath.Join(t.TempDir(), "out"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	var out, errOut bytes.Buffer
-	codes, err := fanOut(context.Background(), os.Args[0], children, &out, &errOut, true, true)
+	codes, err := fanOut(context.Background(), os.Args[0], []string{"-test.run=^$"}, 3, out, os.Stderr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fmt.Sprint(codes) != "[0 3 0]" {
 		t.Fatalf("codes %v", codes)
 	}
-	if worst(codes, children) != 3 {
-		t.Fatal("the failed shard's code must win")
-	}
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	b, _ := os.ReadFile(out.Name())
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
 	sort.Strings(lines)
 	want := []string{
 		"[1/3] partial", "[1/3] shard 1 of 3 after []",
@@ -71,10 +67,7 @@ func TestFanOutPlacesShardsInTurn(t *testing.T) {
 		"[3/3] partial", "[3/3] shard 3 of 3 after [http://r1 http://r2]",
 	}
 	if fmt.Sprint(lines) != fmt.Sprint(want) {
-		t.Fatalf("stdout:\n%s", out.String())
-	}
-	if strings.Count(errOut.String(), "] status\n") != 3 {
-		t.Fatalf("stderr:\n%s", errOut.String())
+		t.Fatalf("stdout:\n%s", b)
 	}
 }
 
@@ -93,8 +86,13 @@ func TestAsShard(t *testing.T) {
 	if !s.NoWriteBack || s.Shards != 0 || s.ArtifactDir != "offload-shards/2" {
 		t.Fatalf("got %+v", s)
 	}
-	if one := asShard(RunOptions{Argv: []string{"x"}}, 1, 1); one.ArtifactDir != "" {
-		t.Fatal("a single shard's outputs belong where they always go")
+	for _, p := range []string{"offload-shards/1/out.txt", "sub/offload-shards/2/x"} {
+		if !inShardsDir(p) {
+			t.Fatalf("%s is synced", p)
+		}
+	}
+	if inShardsDir("offload-shards.go") || inShardsDir("src/offload-shardsx/a") {
+		t.Fatal("other paths must stay synced")
 	}
 }
 
@@ -118,6 +116,11 @@ func TestPickSpreadsShards(t *testing.T) {
 	vps.placed = 3
 	if h, _ := pick([]*Host{vps, zeno}, want, "", "repo", "job", nil); h.Name != "vps" {
 		t.Fatalf("picked %s with 3 shards on vps; zeno would queue it", h.Name)
+	}
+	// Even when the queueing one has the higher priority.
+	zeno.Priority = 1
+	if h, _ := pick([]*Host{vps, zeno}, want, "", "repo", "job", nil); h.Name != "vps" {
+		t.Fatalf("picked %s; zeno would queue it", h.Name)
 	}
 }
 
@@ -151,7 +154,7 @@ func TestFetchArtifactsUnderStaysInside(t *testing.T) {
 
 func TestLineWriterBoundsLongLines(t *testing.T) {
 	var buf bytes.Buffer
-	l := &lineWriter{w: &buf, mu: &sync.Mutex{}, prefix: "> "}
+	l := &lineWriter{w: &buf, prefix: "> "}
 	l.Write(bytes.Repeat([]byte("x"), maxLine+10))
 	if len(l.buf) != 10 || buf.Len() != len("> ")+maxLine+1 {
 		t.Fatalf("pending %d, written %d", len(l.buf), buf.Len())
@@ -163,7 +166,7 @@ type failingWriter struct{}
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
 
 func TestLineWriterFlushReportsErrors(t *testing.T) {
-	l := &lineWriter{w: failingWriter{}, mu: &sync.Mutex{}}
+	l := &lineWriter{w: failingWriter{}}
 	l.Write([]byte("last line, no newline"))
 	if l.flush() == nil {
 		t.Fatal("a lost last line must be reported")
@@ -172,7 +175,7 @@ func TestLineWriterFlushReportsErrors(t *testing.T) {
 
 func TestLineWriterKeepsLinesWhole(t *testing.T) {
 	var buf bytes.Buffer
-	l := &lineWriter{w: &buf, mu: &sync.Mutex{}, prefix: "[1/2] "}
+	l := &lineWriter{w: &buf, prefix: "[1/2] "}
 	l.Write([]byte("a\nb"))
 	l.Write([]byte("c\nd\n"))
 	l.Write([]byte("e"))

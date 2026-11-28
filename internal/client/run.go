@@ -55,7 +55,7 @@ type RunOptions struct {
 
 func logf(quiet bool, format string, args ...any) {
 	if !quiet {
-		fmt.Fprintf(os.Stderr, "offload: "+format+"\n", args...)
+		fmt.Fprintf(os.Stderr, outPrefix+"offload: "+format+"\n", args...)
 	}
 }
 
@@ -93,6 +93,7 @@ func runInPlace(argv []string, env map[string]string) (int, error) {
 func Run(o RunOptions) (int, error) {
 	if i, n, ok := shardChild(); ok {
 		openShardReport()
+		outPrefix = fmt.Sprintf("[%d/%d] ", i, n)
 		o = asShard(o, i, n)
 	}
 	if inJob() && o.On == "" {
@@ -488,7 +489,14 @@ func follow(ctx context.Context, h *Host, id string, quiet, cancelOnInterrupt bo
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = streamLog(streamCtx, h, id, s.name, s.w, quiet && s.name == "stderr")
+			w, lw := s.w, &lineWriter{w: s.w, prefix: outPrefix}
+			if outPrefix != "" {
+				w = lw
+			}
+			errs[i] = streamLog(streamCtx, h, id, s.name, w, quiet && s.name == "stderr")
+			if err := lw.flush(); err != nil && errs[i] == nil {
+				errs[i] = fmt.Errorf("writing the job's %s: %w", s.name, err)
+			}
 			if errs[i] != nil {
 				stopStreams() // one stream's terminal error (not paired any more, gone, …) ends both
 			}

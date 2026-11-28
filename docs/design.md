@@ -85,10 +85,13 @@ once with double memory. A nested `offload run` (OFFLOAD_JOB is set) runs in pla
 
 A shard is the same `offload run` started again as a child process, which reads its index from
 the environment. Every child therefore keeps all of a single run's behavior (retries, moves,
-reattach, cancel on interrupt, credential relays) without a second copy of it. A child starts
-only once the previous one has created its job and reported the runner on fd 3: the runner
-counts that job as pending, and pick holds every earlier shard against a runner as much as the
-"can start now" bonus, so shards spread unless only an already used runner can start one now.
+reattach, cancel on interrupt, credential relays, a closed output ending only the following)
+without a second copy of it. Children share the parent's stdout and stderr and prefix their own
+lines, each written whole in one write; a parent copying their output would keep following
+after its own output closed. A child starts only once the previous one has created its job and
+reported the runner (by status ID) on fd 3: the runner counts that job as pending, and pick
+holds each earlier shard against a runner as much as the "can start now" bonus, but never so
+far that a shard queues while some runner could start it.
 
 ## Git
 

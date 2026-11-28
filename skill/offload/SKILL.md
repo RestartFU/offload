@@ -64,7 +64,7 @@ builds the code again, so shard only suites where running the tests takes far lo
 building them. Shards write nothing back; `--get` outputs land in `offload-shards/<i>/`.
 
 Long jobs: run the Bash call in the background, or `offload run -d -- …` and later
-`offload attach <runner:id>` (several IDs follow them all). Killing `offload run` cancels the job; Ctrl-C on `attach` detaches.
+`offload attach <runner:id>`. Killing `offload run` cancels the job; Ctrl-C on `attach` detaches.
 A script that calls `offload run` inside a job runs that command in place.
 
 ## Look around

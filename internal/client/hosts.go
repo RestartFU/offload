@@ -606,19 +606,26 @@ func Pick(hosts []*Host, want api.Resources, profile, key, kind string) (*Host, 
 
 // pick is Pick; with argv and no profile, each runner is judged by the profile it would match
 // for that command (as it will when it gets the job), not by its global defaults.
-// Earlier shards of the run on a runner count against it, unless that would leave a shard
-// queued that one of those runners could start now.
+// Earlier shards of the run on a runner count against it, but never so much that a shard queues
+// while a runner could start it now: then only those runners are considered.
 func pick(hosts []*Host, want api.Resources, profile, key, kind string, argv []string) (*Host, error) {
-	h, startsNow, err := pickScored(hosts, want, profile, key, kind, argv, true)
-	if err == nil && !startsNow && slices.ContainsFunc(hosts, func(x *Host) bool { return x.placed > 0 }) {
-		h, _, err = pickScored(hosts, want, profile, key, kind, argv, false)
+	h, ready, err := pickScored(hosts, want, profile, key, kind, argv)
+	if err == nil && !ready[h] && len(ready) > 0 && slices.ContainsFunc(hosts, func(x *Host) bool { return x.placed > 0 }) {
+		var now []*Host
+		for _, x := range hosts {
+			if ready[x] {
+				now = append(now, x)
+			}
+		}
+		h, _, err = pickScored(now, want, profile, key, kind, argv)
 	}
 	return h, err
 }
 
-func pickScored(hosts []*Host, want api.Resources, profile, key, kind string, argv []string, spread bool) (*Host, bool, error) {
+// pickScored is pick by score alone; it also returns the runners that could start the job now.
+func pickScored(hosts []*Host, want api.Resources, profile, key, kind string, argv []string) (*Host, map[*Host]bool, error) {
 	var best *Host
-	bestNow := false
+	ready := map[*Host]bool{}
 	bestScore := -1e18
 	var reasons []string
 	for _, h := range hosts {
@@ -681,13 +688,10 @@ func pickScored(hosts []*Host, want api.Resources, profile, key, kind string, ar
 		}
 		r.Mem = min(r.Mem, st.Capacity.Mem)
 		f := h.free()
-		score := float64(h.Priority) * 1000
-		if spread {
-			score -= 400 * float64(h.placed)
-		}
+		score := float64(h.Priority)*1000 - 400*float64(h.placed)
 		unbooked := st.Capacity.CPU - st.Allocated.CPU - st.Pending.CPU
-		now := f.CPU >= r.CPU && f.Mem >= r.Mem
-		if now {
+		if f.CPU >= r.CPU && f.Mem >= r.Mem {
+			ready[h] = true
 			score += 400 // can start right away
 			if unbooked >= r.CPU {
 				score += 100 // without overbooking: its guarantee really is free there
@@ -720,16 +724,16 @@ func pickScored(hosts []*Host, want api.Resources, profile, key, kind string, ar
 			score += 50
 		}
 		if score > bestScore {
-			best, bestScore, bestNow = h, score, now
+			best, bestScore = h, score
 		}
 	}
 	if best == nil {
 		if len(hosts) == 0 {
-			return nil, false, errors.New("no runners found (is tailscale up and a runner online?)")
+			return nil, nil, errors.New("no runners found (is tailscale up and a runner online?)")
 		}
-		return nil, false, fmt.Errorf("no runner fits: %s", strings.Join(reasons, "; "))
+		return nil, nil, fmt.Errorf("no runner fits: %s", strings.Join(reasons, "; "))
 	}
-	return best, bestNow, nil
+	return best, ready, nil
 }
 
 // FindHost returns the named runner from hosts.
