@@ -1147,7 +1147,8 @@ function ghFormEl() {
     return [input, h("label", { class: "choice" }, input, h("span", {}, h("b", {}, label), desc ? h("span", { class: "muted" }, desc) : null))];
   };
   f.owner = h("input", { type: "text", id: "gh-f-owner", placeholder: "ORG or ORG/REPO", autocomplete: "off", spellcheck: "false", "aria-describedby": "gh-f-owner-hint", oninput: () => renderGhForm() });
-  f.labels = h("input", { type: "text", id: "gh-f-labels", value: "offload", autocomplete: "off", spellcheck: "false", oninput: () => { f.labelsEdited = true; renderGhForm(); } });
+  f.labels = h("input", { type: "text", id: "gh-f-labels", value: "offload", autocomplete: "off", spellcheck: "false", oninput: () => renderGhForm() });
+  f.labelsNote = h("div", { class: "gh-form-result", hidden: true });
   f.preview = h("code", {});
   let c;
   [f.cacheClean, c] = radio("gh-cache", "clean", "Clean for every job", " Each job starts empty. Safe when the repositories don't all trust each other.", true);
@@ -1171,6 +1172,7 @@ function ghFormEl() {
     field("Organization or repository", "gh-f-owner", f.owner, h("span", { id: "gh-f-owner-hint" }, "As on GitHub, like ", h("code", {}, "acme"), " or ", h("code", {}, "acme/app"), ".")),
     f.exists,
     field("Workflows use", "gh-f-labels", f.labels, ["Labels, comma-separated. Workflows then say ", f.preview]),
+    f.labelsNote,
     h("fieldset", { class: "gh-field" }, h("legend", {}, "Caches"), h("div", { class: "control" }, f.cacheChoices, f.cacheNote)),
     h("fieldset", { class: "gh-field" }, h("legend", {}, "Connect with"), h("div", { class: "control" }, h("div", { class: "choices" }, authGh, c), f.tokenRow)),
     h("fieldset", { class: "gh-field" }, h("legend", {}, "Runners"), h("div", { class: "control" }, f.runners)),
@@ -1184,7 +1186,7 @@ function ghFormEl() {
 
 function openGhForm() {
   state.ghFormOpen = true; state.ghFormMsg = null;
-  if (ghForm) { ghForm.picks = null; ghForm.runnerKey = null; ghForm.lastOwner = null; ghForm.cacheClean.checked = true; ghForm.labelsEdited = false; }
+  if (ghForm) { ghForm.picks = null; ghForm.runnerKey = null; ghForm.lastOwner = null; ghForm.cacheClean.checked = true; ghForm.labels.value = "offload"; }
   render();
   ghForm.root.scrollIntoView({ block: "nearest", behavior: "smooth" });
   ghForm.owner.focus();
@@ -1222,14 +1224,15 @@ function renderGhForm() {
   const pools = existing ? owners.get(existing).map(([, p]) => p) : [];
   f.cacheNote.textContent = repo ? "A repository's jobs keep warm caches: they are all the same repository's code."
     : pools.length ? `${existing} has ${pools.some((p) => p.shared) ? "shared" : "clean"} caches on its other runners; these runners get what you choose here.` : "";
-  // Workflows already target a connected owner's labels, so new runners start from them: the
-  // labels each owner last reported, kept apart from the field, so neither a refresh that briefly
-  // loses the pool nor a cancelled edit changes what is offered.
-  f.reported ||= new Map();
-  if (pools.length) f.reported.set(owner.toLowerCase(), (pools[0].labels || ["offload"]).join(", "));
-  if (!f.labelsEdited) {
-    f.labels.value = f.reported.get(owner.toLowerCase()) || "offload";
-    f.preview.textContent = "runs-on: " + runsOn(f.labels.value.split(",").map((x) => x.trim()).filter(Boolean));
+  // Workflows already target a connected owner's labels: different ones here would leave the new
+  // runners unused, so say so and offer the owner's, rather than filling them in unseen.
+  const mine = runsOn(f.labels.value.split(",").map((x) => x.trim()).filter(Boolean));
+  const theirs = pools.length ? runsOn(pools[0].labels) : null;
+  f.labelsNote.hidden = !theirs || theirs === mine;
+  if (theirs && theirs !== mine) {
+    f.labelsNote.replaceChildren(ghAlert("warning", h("div", {}, `${existing}'s other runners take workflows with `, h("code", {}, "runs-on: " + theirs),
+      ". With different labels, those workflows won't reach these runners."),
+      h("button", { type: "button", class: "btn", onclick: () => { f.labels.value = (pools[0].labels || ["offload"]).join(", "); renderGhForm(); } }, "Use runs-on: " + theirs)));
   }
   f.exists.hidden = !existing;
   if (existing) {
