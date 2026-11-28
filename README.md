@@ -152,9 +152,8 @@ A local web page covering every runner:
   last hour to 7 days. Each runner's CPUs as a grid shaded by how busy they are, with the cores
   pinned to jobs and the ones kept for the system marked. Jobs waiting and why. Warnings for
   runners that are down, short on memory or disk, or on another version. The pause button on
-  a runner's card stops it from starting new jobs and sessions until you resume it. Running
-  work finishes; a job already queued there waits, or moves to another runner if its
-  `offload run` is still attached. A pause survives runner restarts.
+  a runner's card makes it refuse new jobs and sessions until you resume it; work it already
+  took, queued jobs included, finishes. A pause survives runner restarts.
 - **Containers.** Every job and session with live CPU and memory against its guarantee and
   limit. Open one to follow its logs, see its details, or cancel it.
 - **Activity.** Statistics on finished jobs: success rate, out-of-memory kills, wait times,

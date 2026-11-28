@@ -811,8 +811,8 @@ func (s *Server) admit() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.expireBuildsLocked()
-	if s.retireErr != "" || s.upgrading || s.paused {
-		return // paused, or workloads of an older version may still run: start nothing
+	if s.retireErr != "" || s.upgrading {
+		return // workloads of an older version may still run: start nothing until they're gone
 	}
 	var queued []*job
 	for _, j := range s.jobs {

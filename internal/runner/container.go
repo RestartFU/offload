@@ -694,7 +694,7 @@ func (s *Server) prebuildBase() {
 		return
 	}
 	s.mu.Lock()
-	if s.builds[baseTag()] != nil || s.paused || s.upgrading { // a resume starts it again
+	if s.builds[baseTag()] != nil {
 		s.mu.Unlock()
 		return
 	}

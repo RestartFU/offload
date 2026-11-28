@@ -1005,8 +1005,8 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) pausedPath() string { return filepath.Join(s.cfg.StateDir, "paused") }
 
-// handlePause pauses or resumes the runner. Paused, it starts nothing new: queued jobs wait
-// (attached clients move them elsewhere) and sessions are refused. Running work carries on.
+// handlePause pauses or resumes the runner. Paused, it refuses new jobs and sessions; work it
+// already took, queued jobs included, carries on.
 func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Paused bool `json:"paused"`
@@ -1029,9 +1029,6 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		if changed {
 			log.Printf("%s by %s", map[bool]string{true: "paused", false: "resumed"}[req.Paused], callerOf(r))
-			if !req.Paused {
-				go s.prebuildBase()
-			}
 		}
 	}
 	s.pauseMu.Unlock()

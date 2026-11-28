@@ -292,7 +292,7 @@ function alertsFor(runners, version) {
     if (r.error) out.push(["warning", [h("b", {}, r.name), ": ", r.error]]);
     const perr = state.pausing.get(r.name);
     if (perr) out.push(["critical", [h("b", {}, r.name), ": ", perr]]);
-    if (st.paused) out.push(["info", [h("b", {}, r.name), " is paused: it starts no new jobs or sessions until you resume it"]]);
+    if (st.paused) out.push(["info", [h("b", {}, r.name), " is paused: it refuses new jobs and sessions until you resume it"]]);
     else if (!st.accepting) out.push(["warning", [h("b", {}, r.name), " is not accepting work: ", st.reason || "unknown reason"]]);
     if (st.mem_available < st.mem_reserve * 1.25) out.push(["serious", [h("b", {}, r.name), ": host memory is close to the reserve (", fmtBytes(st.mem_available), " available, reserve ", fmtBytes(st.mem_reserve), ")"]]);
     for (const d of r.metrics?.disk || []) {
@@ -484,7 +484,7 @@ function pauseBtn(r) {
   const label = (paused ? "Resume " : "Pause ") + r.name;
   const glyph = paused ? s("path", { d: "M5.5 3.5v9l7-4.5z", fill: "currentColor", "stroke-linejoin": "round" })
     : s("path", { d: "M5.5 3.5v9M10.5 3.5v9", stroke: "currentColor", "stroke-width": 2.2, "stroke-linecap": "round" });
-  return h("button", { class: "icon-btn", type: "button", "data-pause": r.name, "aria-label": label, title: paused ? label : label + ": start no new work, let running work finish", "aria-disabled": busy ? "true" : null, onclick: async () => {
+  return h("button", { class: "icon-btn", type: "button", "data-pause": r.name, "aria-label": label, title: paused ? label : label + ": refuse new jobs and sessions, finish the rest", "aria-disabled": busy ? "true" : null, onclick: async () => {
     if (state.pausing.get(r.name) === "") return;
     state.pausing.set(r.name, ""); render();
     try {
