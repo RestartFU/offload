@@ -547,6 +547,7 @@ func (s *server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		Owner  string   `json:"owner"`
 		Token  string   `json:"token"` // empty: this machine's gh login
 		Labels []string `json:"labels"`
+		System *bool    `json:"system_labels"` // false: the labels are all the runners get
 		Max    *int     `json:"max"`
 		Shared *bool    `json:"shared"`
 		On     []string `json:"on"` // runner IDs, as the page chose them
@@ -600,7 +601,7 @@ func (s *server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, strings.Join(bad, ", ")+" can't take GitHub jobs (not paired with this machine, no podman, or another version)")
 		return
 	}
-	add := api.GitHubAdd{URL: owner, Token: token, TokenFrom: from, Labels: req.Labels, Max: req.Max, SharedCache: req.Shared, CreateOnly: true}
+	add := api.GitHubAdd{URL: owner, Token: token, TokenFrom: from, Labels: req.Labels, SystemLabels: req.System, Max: req.Max, SharedCache: req.Shared, CreateOnly: true}
 	results := make([]githubResult, len(hosts))
 	var wg sync.WaitGroup
 	for i, h := range hosts {

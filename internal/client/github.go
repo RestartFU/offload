@@ -243,6 +243,8 @@ func GitHubAdd(o GitHubOptions) error {
 	if from == "token" {
 		how = "the token you gave"
 	}
+	key := api.GitHubKey(owner)
+	known := githubKnown(ctx, all, key)
 	fmt.Printf("Taking GitHub jobs for %s on %s, with %s.\n\n", owner, joinNames(hosts), how)
 	width := 0
 	for _, h := range hosts {
@@ -251,7 +253,6 @@ func GitHubAdd(o GitHubOptions) error {
 	line := func(h *Host, state, detail string) {
 		fmt.Printf("  %-*s  %-10s %s\n", width, h.Name, state, detail)
 	}
-	key := api.GitHubKey(owner)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	ok, draining := 0, 0
@@ -333,10 +334,11 @@ func GitHubAdd(o GitHubOptions) error {
 		fmt.Print("GitHub can't relabel a runner that has jobs, so a runner still working takes no new jobs\n" +
 			"until they finish, then switches to the new labels.\n\n")
 	}
-	if !strings.Contains(owner, "/") && o.Shared == nil && !githubSharedNow(ctx, hosts, owner) {
+	if !strings.Contains(owner, "/") && o.Shared == nil && !known {
 		fmt.Printf("Each job starts with clean caches, because %s's repositories would otherwise share checkouts,\n"+
-			"dependency caches and docker images. If they all trust each other, keep them warm with:\n\n"+
-			"    offload github add %s --shared-cache\n\n", owner, owner)
+			"dependency caches and docker images. The choice is made when an owner is added, so if they all\n"+
+			"trust each other, start over with warm caches:\n\n"+
+			"    offload github rm %s && offload github add %s --shared-cache\n\n", owner, owner, owner)
 	}
 	return nil
 }
@@ -524,14 +526,11 @@ func GitHubRemove(raw string, on []string, forget bool) error {
 	return failed
 }
 
-// githubSharedNow reports whether a runner already keeps owner with shared caches (the choice is
-// fixed when an organization is added, so re-adding it for a new token keeps it).
-func githubSharedNow(ctx context.Context, hosts []*Host, owner string) bool {
+// githubKnown reports whether any runner already takes the owner's jobs.
+func githubKnown(ctx context.Context, hosts []*Host, key string) bool {
 	for _, h := range hosts {
-		if pools, err := githubPools(ctx, h); err == nil {
-			if p := githubFind(pools, api.GitHubKey(owner)); p != nil && p.Shared {
-				return true
-			}
+		if pools, err := githubPools(ctx, h); err == nil && githubFind(pools, key) != nil {
+			return true
 		}
 	}
 	return false
