@@ -254,7 +254,7 @@ func GitHubAdd(o GitHubOptions) error {
 	key := api.GitHubKey(owner)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	ok := 0
+	ok, draining := 0, 0
 	ready := map[string][]string{} // runs-on line -> runners that are ready with it
 	for _, h := range hosts {
 		wg.Add(1)
@@ -279,8 +279,13 @@ func GitHubAdd(o GitHubOptions) error {
 						if now != last {
 							last = now
 							mu.Lock()
-							switch p.State {
-							case api.GitHubListening:
+							relabel := strings.Contains(p.Detail, "jobs running here finish")
+							switch {
+							case relabel:
+								draining++
+								ready[runsOn(p.Labels)] = append(ready[runsOn(p.Labels)], h.Name)
+								line(h, "waiting", p.Detail)
+							case p.State == api.GitHubListening:
 								ok++
 								ready[runsOn(p.Labels)] = append(ready[runsOn(p.Labels)], h.Name)
 								line(h, "ready", githubRoom(*p))
@@ -290,7 +295,7 @@ func GitHubAdd(o GitHubOptions) error {
 							mu.Unlock()
 						}
 						// Ready, or not getting there without help: report it and stop waiting.
-						if p.State == api.GitHubListening || p.State == api.GitHubFailed || strings.Contains(p.Detail, "paused") {
+						if p.State == api.GitHubListening || p.State == api.GitHubFailed || strings.Contains(p.Detail, "paused") || strings.Contains(p.Detail, "jobs running here finish") {
 							return
 						}
 					}
@@ -304,14 +309,14 @@ func GitHubAdd(o GitHubOptions) error {
 		}()
 	}
 	wg.Wait()
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) && ok == 0 {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && ok+draining == 0 {
 		return errors.New("no runner confirmed it is taking GitHub jobs within 20 minutes: `offload github ls` shows where each one stands")
 	}
 	if ctx.Err() != nil {
 		fmt.Println("\nStill setting up in the background: `offload github ls` shows how far each runner got.")
 		return nil
 	}
-	if ok == 0 {
+	if ok+draining == 0 {
 		return errors.New("no runner is taking GitHub jobs yet (they keep retrying; offload github ls shows why)")
 	}
 	if len(ready) == 1 {
@@ -323,6 +328,10 @@ func GitHubAdd(o GitHubOptions) error {
 		for l, names := range ready {
 			fmt.Printf("    # %s\n    runs-on: %s\n\n", strings.Join(names, ", "), l)
 		}
+	}
+	if draining > 0 {
+		fmt.Print("GitHub can't relabel a runner that has jobs, so a runner still working takes no new jobs\n" +
+			"until they finish, then switches to the new labels.\n\n")
 	}
 	if !strings.Contains(owner, "/") && o.Shared == nil && !githubSharedNow(ctx, hosts, owner) {
 		fmt.Printf("Each job starts with clean caches, because %s's repositories would otherwise share checkouts,\n"+

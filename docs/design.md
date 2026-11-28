@@ -168,6 +168,12 @@ keepalive doesn't wake it. Server state, such as a running game, doesn't survive
   runners itself: no runner knows another, there is no leader, and a dead runner only takes its
   own share offline. This was checked before building it: two scale sets sharing a label never
   got more jobs than they advertised, and the rest waited on GitHub.
+- **A scale set's labels are fixed.** GitHub answers an update to them with success and keeps
+  the old ones (checked with System and User labels alike), so new labels mean deleting the
+  scale set and making a new one under the same name. Deleting it under working runners would
+  strand their jobs, so the runner keeps listening on the old one, claiming nothing new and still
+  starting runners for jobs already assigned to it, and replaces it once nothing is assigned or
+  running there.
 - **A one-job runner per assigned job.** For every job GitHub assigns, the runner generates a
   just-in-time runner config and queues an offload job running the actions runner with it. The
   config is a credential, so it lives only in the job's secrets. When GitHub assigns fewer jobs

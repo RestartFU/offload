@@ -66,6 +66,8 @@ type githubPool struct {
 	restarting   bool          // a restart waits for the old listener to let go of its session
 	systemLabels bool          // see githubPoolRecord.SystemLabels
 	forget       bool          // remove without deleting the scale set on GitHub (rm --forget)
+	relabel      bool          // its scale set has old labels: take no new jobs until it can be replaced
+	drained      bool          // the relabeling listener saw nothing assigned or running here
 	slots        map[int]string
 	failures     int       // runner jobs in a row that ended without taking a GitHub job
 	pauseTil     time.Time // after repeated failures: accept no jobs until then
@@ -229,6 +231,9 @@ func (s *Server) runPool(ctx context.Context, p *githubPool, done chan struct{})
 	for ctx.Err() == nil {
 		started := time.Now()
 		err := s.listenPool(ctx, p, done)
+		if errors.Is(err, errRelabel) && ctx.Err() == nil {
+			continue
+		}
 		s.mu.Lock()
 		current, owner := p.done == done && p.State != api.GitHubRemoving, p.Owner
 		if current && ctx.Err() == nil {
@@ -276,33 +281,57 @@ func (s *Server) githubClient(url, token string) (*scaleset.Client, error) {
 	})
 }
 
+type scaleSets interface {
+	GetRunnerScaleSet(ctx context.Context, runnerGroupID int, name string) (*scaleset.RunnerScaleSet, error)
+	CreateRunnerScaleSet(ctx context.Context, ss *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error)
+	DeleteRunnerScaleSet(ctx context.Context, id int) error
+}
+
+// errRelabel ends a listener whose scale set has nothing left to do, so the next one replaces it.
+var errRelabel = errors.New("scale set drained for new labels")
+
 // ensureScaleSet finds or creates this runner's scale set for the pool, with the pool's labels.
-func ensureScaleSet(ctx context.Context, c *scaleset.Client, name string, labels []string) (*scaleset.RunnerScaleSet, error) {
+// GitHub answers a label update with success and keeps the old labels, so new labels mean a new
+// scale set. replace says the old one may go now; otherwise it comes back with stale set.
+func ensureScaleSet(ctx context.Context, c scaleSets, name string, labels []string, replace bool) (ss *scaleset.RunnerScaleSet, stale bool, err error) {
+	ss, err = c.GetRunnerScaleSet(ctx, 1, name)
+	if err != nil {
+		return nil, false, err
+	}
+	if ss != nil && !sameLabels(ss.Labels, labels) {
+		if !replace {
+			return ss, true, nil
+		}
+		if err := c.DeleteRunnerScaleSet(ctx, ss.ID); err != nil && !errors.Is(err, scaleset.NotFoundError) {
+			return nil, false, err
+		}
+		ss = nil
+	}
+	if ss != nil {
+		return ss, false, nil
+	}
 	want := make([]scaleset.Label, len(labels))
 	for i, l := range labels {
 		want[i] = scaleset.Label{Name: l}
 	}
-	ss, err := c.GetRunnerScaleSet(ctx, 1, name)
-	if err != nil {
-		return nil, err
+	ss, err = c.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{Name: name, RunnerGroupID: 1, Labels: want,
+		RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true}})
+	return ss, false, err
+}
+
+// sameLabels compares like GitHub does: it hands back linux as Linux and x64 as X64.
+func sameLabels(have []scaleset.Label, want []string) bool {
+	set := map[string]bool{}
+	for _, l := range have {
+		set[strings.ToLower(l.Name)] = true
 	}
-	if ss == nil {
-		return c.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{Name: name, RunnerGroupID: 1, Labels: want,
-			RunnerSetting: scaleset.RunnerSetting{DisableUpdate: true}})
-	}
-	have := map[string]bool{}
-	for _, l := range ss.Labels {
-		have[l.Name] = true
-	}
-	same := len(ss.Labels) == len(want)
 	for _, l := range want {
-		same = same && have[l.Name]
+		if !set[strings.ToLower(l)] {
+			return false
+		}
+		delete(set, strings.ToLower(l))
 	}
-	if same {
-		return ss, nil
-	}
-	ss.Labels = want
-	return c.UpdateRunnerScaleSet(ctx, ss.ID, ss)
+	return len(set) == 0
 }
 
 // listenPool runs one connection to GitHub with the settings the pool had when it started.
@@ -319,7 +348,13 @@ func (s *Server) listenPool(ctx context.Context, p *githubPool, done chan struct
 	if err != nil {
 		return err
 	}
-	ss, err := ensureScaleSet(ctx, c, name, labels)
+	// Replacing a scale set waits until a listener on the old one has seen this runner's share
+	// of its work finish, while taking no new jobs: deleting it would strand them.
+	s.mu.Lock()
+	drained := p.drained && p.done == done
+	p.drained = false
+	s.mu.Unlock()
+	ss, stale, err := ensureScaleSet(ctx, c, name, labels, drained)
 	if err != nil {
 		return err
 	}
@@ -338,7 +373,7 @@ func (s *Server) listenPool(ctx context.Context, p *githubPool, done chan struct
 	}()
 	s.mu.Lock()
 	if p.done == done {
-		p.ScaleSetID, p.gh = ss.ID, c
+		p.ScaleSetID, p.gh, p.relabel = ss.ID, c, stale
 		p.save()
 		p.Detail = "installing the GitHub Actions runner"
 	}
@@ -413,6 +448,8 @@ func (s *Server) tickGitHub() {
 		case p.listener != nil && time.Now().Before(p.pauseTil):
 			p.State, p.Detail = api.GitHubFailed, fmt.Sprintf("runners keep failing to start; paused until %s", p.pauseTil.Format(time.TimeOnly))
 			capNow = p.Running + p.Starting
+		case p.listener != nil && p.relabel:
+			p.State, p.Detail = api.GitHubPreparing, fmt.Sprintf("new labels take effect once the jobs running here finish (%d left)", p.Running+p.Starting)
 		case p.listener != nil && s.paused:
 			p.State, p.Detail = api.GitHubPreparing, "this runner is paused: it takes no new GitHub jobs until it is resumed"
 		case p.listener != nil:
@@ -446,7 +483,7 @@ func githubSpec(p *githubPool) api.JobSpec {
 // books its learned peak but counts its whole limit against mem_overcommit).
 func (s *Server) githubCapacityLocked(p *githubPool) int {
 	active := len(s.githubJobsLocked(p))
-	if s.retireErr != "" || s.upgrading || s.paused {
+	if s.retireErr != "" || s.upgrading || s.paused || p.relabel {
 		return active
 	}
 	a := s.allocatedLocked()
@@ -573,6 +610,11 @@ func (sc *githubScaler) Scale(ctx context.Context, m *scaleset.RunnerScaleSetMes
 	}
 	for _, j := range drop {
 		s.cancelJobLocked(j, "GitHub no longer has a job for this runner")
+	}
+	if p.relabel && p.Assigned == 0 && len(live) == 0 {
+		p.drained = true
+		s.mu.Unlock()
+		return errRelabel
 	}
 	s.mu.Unlock()
 	for _, j := range drop {
@@ -1019,11 +1061,15 @@ func (s *Server) handleGitHubAdd(w http.ResponseWriter, r *http.Request) {
 	var ss *scaleset.RunnerScaleSet
 	if err == nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		want := labels
-		if systemOn {
-			want = scaleSetLabels(labels)
+		if p == nil {
+			want := labels
+			if systemOn {
+				want = scaleSetLabels(labels)
+			}
+			ss, _, err = ensureScaleSet(ctx, c, name, want, true)
+		} else { // its listener applies new labels, once the runners working here finish
+			ss, err = c.GetRunnerScaleSet(ctx, 1, name)
 		}
-		ss, err = ensureScaleSet(ctx, c, name, want)
 		cancel()
 	}
 	if err != nil {
